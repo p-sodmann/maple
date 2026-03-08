@@ -1,0 +1,14 @@
+[package]
+name = "maple"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+maple-ui = { path = "../maple-ui" }
+maple-state = { path = "../maple-state" }
+gtk4 = { workspace = true }
+libadwaita = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+anyhow = { workspace = true }

@@ -1,0 +1,10 @@
+[package]
+name = "maple-embed"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+maple-state = { path = "../maple-state" }
+image = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }

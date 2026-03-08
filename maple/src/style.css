@@ -1,0 +1,20 @@
+/* Maple — application-level CSS */
+
+/* Slow down the spinner used in thumbnail placeholders.
+   GTK4 spinner animation is ~1.05s by default; we stretch it to 3s. */
+.maple-slow-spinner {
+    animation-duration: 3s;
+}
+
+/* Filmstrip thumbnail card */
+.maple-strip-thumb {
+    border-radius: 6px;
+    padding: 2px;
+    border: 2px solid transparent;
+    transition: border-color 150ms ease;
+}
+
+/* Currently active thumbnail in the strip */
+.maple-strip-active {
+    border-color: @accent_color;
+}

@@ -1,0 +1,17 @@
+[package]
+name = "maple-ui"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+maple-state = { path = "../maple-state" }
+maple-import = { path = "../maple-import" }
+gtk4 = { workspace = true }
+libadwaita = { workspace = true }
+image = { workspace = true }
+kamadak-exif = { workspace = true }
+tracing = { workspace = true }
+anyhow = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

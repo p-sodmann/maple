@@ -1,0 +1,10 @@
+[package]
+name = "maple-tournament"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+maple-state = { path = "../maple-state" }
+serde = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }

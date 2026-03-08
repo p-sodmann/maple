@@ -1,0 +1,9 @@
+[package]
+name = "maple-cluster"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+maple-state = { path = "../maple-state" }
+anyhow = { workspace = true }
+tracing = { workspace = true }

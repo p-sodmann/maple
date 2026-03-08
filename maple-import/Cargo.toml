@@ -1,0 +1,14 @@
+[package]
+name = "maple-import"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+maple-state = { path = "../maple-state" }
+tokio = { workspace = true }
+blake3 = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
