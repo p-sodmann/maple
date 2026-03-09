@@ -3,6 +3,7 @@
 use std::cell::RefCell;
 use std::path::PathBuf;
 use std::rc::Rc;
+use std::sync::{Arc, Mutex};
 
 use gtk4::prelude::*;
 use gtk4::gio;
@@ -21,6 +22,7 @@ struct PickerState {
 pub fn build_picker_page(
     nav_view: &adw::NavigationView,
     toast_overlay: &adw::ToastOverlay,
+    db: Arc<Mutex<maple_db::Database>>,
 ) -> adw::NavigationPage {
     // Restore previous session (validate that paths still exist)
     let mut session = maple_state::Session::load();
@@ -202,8 +204,12 @@ pub fn build_picker_page(
             };
             drop(st);
 
-            let browser_page =
-                image_browser::build_browser_page(&source, &destination, &toast_overlay);
+            let browser_page = image_browser::build_browser_page(
+                &source,
+                &destination,
+                &toast_overlay,
+                db.clone(),
+            );
             nav_view.push(&browser_page);
         });
     }

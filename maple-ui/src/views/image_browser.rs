@@ -62,7 +62,12 @@ struct FullResMsg {
 /// Message from the background copy worker to the UI thread.
 enum CopyMsg {
     Progress { done: usize, total: usize },
-    Finished { copied: usize, failed: usize },
+    /// Carries the full summary and the (source_path, hash) pairs in the same
+    /// order as the copy results, so the UI thread can insert DB records.
+    Finished {
+        summary: maple_import::CopySummary,
+        source_infos: Vec<(PathBuf, [u8; 32])>,
+    },
     Error(String),
 }
 
@@ -200,8 +205,12 @@ pub fn build_browser_page(
     source: &Path,
     destination: &Path,
     toast_overlay: &adw::ToastOverlay,
+    db: std::sync::Arc<std::sync::Mutex<maple_db::Database>>,
 ) -> adw::NavigationPage {
     let settings = maple_state::Settings::load();
+
+    // Start the background scanner for the destination directory.
+    maple_db::LibraryScanner::new(db.clone(), destination.to_path_buf()).spawn();
     let (fullres_tx, fullres_rx) = mpsc::channel::<FullResMsg>();
     let state = Rc::new(RefCell::new(BrowserState::new(
         fullres_tx,
@@ -549,14 +558,16 @@ pub fn build_browser_page(
         let sel_count_label = sel_count_label.clone();
         let strip_box = strip_box.clone();
 
+        let db = db.clone();
         copy_btn.connect_clicked(move |btn| {
             let st = state.borrow();
             if st.selected.is_empty() {
                 return;
             }
 
-            // Collect the source paths of selected images.
-            let mut sources: Vec<PathBuf> = st
+            // Build (source_path, hash) pairs sorted by path so they align
+            // with the copy results that copy_images produces in source order.
+            let mut source_infos: Vec<(PathBuf, [u8; 32])> = st
                 .selected
                 .iter()
                 .filter_map(|&i| {
@@ -564,21 +575,17 @@ pub fn build_browser_page(
                     if path.as_os_str().is_empty() {
                         None
                     } else {
-                        Some(path.clone())
+                        Some((path.clone(), st.images[i].content_hash))
                     }
                 })
                 .collect();
-            sources.sort();
-            let destination = st.destination.clone();
+            source_infos.sort_by(|a, b| a.0.cmp(&b.0));
+            let sources: Vec<PathBuf> = source_infos.iter().map(|(p, _)| p.clone()).collect();
 
-            // Save hashes & indices so we can mark them as imported after copy.
-            let copied_hashes: Vec<[u8; 32]> = st
-                .selected
-                .iter()
-                .filter(|&&i| st.images[i].content_hash != [0u8; 32])
-                .map(|&i| st.images[i].content_hash)
-                .collect();
+            let destination = st.destination.clone();
             let copied_indices: Vec<usize> = st.selected.iter().copied().collect();
+            // Hashes in the same sorted order as sources (for SeenSet update).
+            let copied_hashes: Vec<[u8; 32]> = source_infos.iter().map(|(_, h)| *h).collect();
             drop(st);
 
             // Disable button during copy.
@@ -597,8 +604,8 @@ pub fn build_browser_page(
                 match result {
                     Ok(summary) => {
                         let _ = copy_tx.send(CopyMsg::Finished {
-                            copied: summary.copied,
-                            failed: summary.failed,
+                            summary,
+                            source_infos,
                         });
                     }
                     Err(e) => {
@@ -614,6 +621,7 @@ pub fn build_browser_page(
             let sel_count_label = sel_count_label.clone();
             let state = state.clone();
             let strip_box = strip_box.clone();
+            let db = db.clone();
             glib::timeout_add_local(Duration::from_millis(32), move || {
                 while let Ok(msg) = copy_rx.try_recv() {
                     match msg {
@@ -625,13 +633,36 @@ pub fn build_browser_page(
                                 )));
                             }
                         }
-                        CopyMsg::Finished { copied, failed } => {
+                        CopyMsg::Finished { summary, source_infos } => {
+                            let (copied, failed) = (summary.copied, summary.failed);
                             let msg = if failed == 0 {
                                 format!("Copied {copied} image{}", if copied == 1 { "" } else { "s" })
                             } else {
                                 format!("Copied {copied}, {failed} failed")
                             };
                             toast_overlay.add_toast(adw::Toast::new(&msg));
+
+                            // Insert successfully copied files into the library DB.
+                            if let Ok(db_guard) = db.lock() {
+                                for ((_, hash), result) in
+                                    source_infos.iter().zip(summary.results.iter())
+                                {
+                                    if let maple_import::CopyResult::Ok(dest_path) = result {
+                                        let file_size = dest_path
+                                            .metadata()
+                                            .map(|m| m.len())
+                                            .unwrap_or(0);
+                                        if let Err(e) =
+                                            db_guard.insert_image(dest_path, hash, file_size)
+                                        {
+                                            tracing::warn!(
+                                                "Failed to insert {} into library DB: {e}",
+                                                dest_path.display()
+                                            );
+                                        }
+                                    }
+                                }
+                            }
 
                             // Mark copied images as imported and persist.
                             {

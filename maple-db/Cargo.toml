@@ -1,0 +1,16 @@
+[package]
+name = "maple-db"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+maple-import = { path = "../maple-import" }
+maple-state = { path = "../maple-state" }
+rusqlite = { workspace = true }
+blake3 = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+kamadak-exif = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

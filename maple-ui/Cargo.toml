@@ -6,6 +6,7 @@ edition.workspace = true
 [dependencies]
 maple-state = { path = "../maple-state" }
 maple-import = { path = "../maple-import" }
+maple-db = { path = "../maple-db" }
 gtk4 = { workspace = true }
 libadwaita = { workspace = true }
 image = { workspace = true }

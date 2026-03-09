@@ -1,4 +1,6 @@
+pub mod home;
 pub mod image_browser;
+pub mod library;
 pub mod source_picker;
 
 #[allow(dead_code)]

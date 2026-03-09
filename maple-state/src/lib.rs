@@ -126,6 +126,10 @@ pub struct Settings {
     /// Defaults to `~/.config/maple/`.
     #[serde(default = "Settings::default_library_dir")]
     pub library_dir: PathBuf,
+    /// Path to the SQLite library database.
+    /// Defaults to `~/.config/maple/library.db`.
+    #[serde(default = "Settings::default_database_path")]
+    pub database_path: PathBuf,
 }
 
 impl Settings {
@@ -135,6 +139,10 @@ impl Settings {
 
     fn default_library_dir() -> PathBuf {
         config_dir()
+    }
+
+    fn default_database_path() -> PathBuf {
+        config_dir().join("library.db")
     }
 
     /// Load settings from the default config path.
@@ -177,6 +185,7 @@ impl Default for Settings {
         Self {
             preview_buffer_size: Self::default_preview_buffer_size(),
             library_dir: Self::default_library_dir(),
+            database_path: Self::default_database_path(),
         }
     }
 }
@@ -279,11 +288,13 @@ mod tests {
         let s = Settings {
             preview_buffer_size: 11,
             library_dir: PathBuf::from("/my/library"),
+            database_path: PathBuf::from("/my/library/library.db"),
         };
         let toml_str = toml::to_string_pretty(&s).unwrap();
         let parsed: Settings = toml::from_str(&toml_str).unwrap();
         assert_eq!(parsed.preview_buffer_size, 11);
         assert_eq!(parsed.library_dir, PathBuf::from("/my/library"));
+        assert_eq!(parsed.database_path, PathBuf::from("/my/library/library.db"));
     }
 
     #[test]
@@ -301,11 +312,13 @@ mod tests {
         let s = Settings {
             preview_buffer_size: 13,
             library_dir: PathBuf::from("/custom/lib"),
+            database_path: PathBuf::from("/custom/lib/library.db"),
         };
         s.save_to(&path).unwrap();
 
         let loaded = Settings::load_from(&path);
         assert_eq!(loaded.preview_buffer_size, 13);
         assert_eq!(loaded.library_dir, PathBuf::from("/custom/lib"));
+        assert_eq!(loaded.database_path, PathBuf::from("/custom/lib/library.db"));
     }
 }

@@ -8,6 +8,7 @@ members = [
     "maple-tournament",
     "maple-import",
     "maple-state",
+    "maple-db",
 ]
 
 [workspace.package]

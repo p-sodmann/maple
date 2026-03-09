@@ -2,7 +2,9 @@
   "permissions": {
     "allow": [
       "Bash(cargo test)",
-      "Bash(cargo build)"
+      "Bash(cargo build)",
+      "Bash(cargo test --workspace)",
+      "Bash(cargo check -p maple-ui)"
     ]
   }
 }
