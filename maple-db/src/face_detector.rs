@@ -126,7 +126,7 @@ pub fn spawn_face_tagger(db: Arc<Mutex<Database>>, detector: FaceDetector) -> Fa
                 let images = match db.lock().unwrap().images_needing_face_detection() {
                     Ok(v) => v,
                     Err(e) => {
-                        warn!("face_tagger: DB query failed: {e}");
+                        warn!("face_tagger: DB query failed: {e:?}");
                         vec![]
                     }
                 };
@@ -162,7 +162,7 @@ pub fn spawn_face_tagger(db: Arc<Mutex<Database>>, detector: FaceDetector) -> Fa
                                 ) {
                                     warn!(
                                         path = %path.display(),
-                                        "face_tagger: insert failed: {e}"
+                                        "face_tagger: insert failed: {e:?}"
                                     );
                                 }
                             }
@@ -182,7 +182,7 @@ pub fn spawn_face_tagger(db: Arc<Mutex<Database>>, detector: FaceDetector) -> Fa
                             );
                         }
                         Err(e) => {
-                            warn!(path = %path.display(), "face_tagger: detection failed: {e}");
+                            warn!(path = %path.display(), "face_tagger: detection failed: {e:?}");
                         }
                     }
                 }

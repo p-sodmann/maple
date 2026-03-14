@@ -2,11 +2,11 @@
 //!
 //! # Model I/O (atksh joined model)
 //!
-//! - Input  `input`           : `[H, W, 3]` float32 — BGR pixel values `[0, 255]`
-//! - Output 0 `scores`        : `[N]`               — confidence per face
-//! - Output 1 `bboxes`        : `[N, 4]`            — `[x1, y1, x2, y2]` in pixels
+//! - Input  `input`           : `[H, W, 3]` uint8   — BGR pixel values `[0, 255]`
+//! - Output 0 `scores`        : `[N]`        f32    — confidence per face
+//! - Output 1 `bboxes`        : `[N, 4]`     i64    — `[x1, y1, x2, y2]` in pixels
 //! - Output 2 `keypoints`     : `[N, 5, 2]`         — 5 facial landmarks (pixels)
-//! - Output 3 `aligned_imgs`  : `[N, 112, 112, 3]`  — pre-aligned BGR `[0, 255]` face crops
+//! - Output 3 `aligned_imgs`  : `[N, 112, 112, 3]` u8 — pre-aligned BGR `[0, 255]` face crops
 //! - Output 4 `landmarks`     : `[N, *, 2]`
 //! - Output 5 `affine_matrices`: `[N, 2, 3]`
 //!
@@ -18,8 +18,10 @@
 use std::path::Path;
 
 use anyhow::{Context, Result};
-use ndarray::{s, Array3, ArrayView2, ArrayView4, Ix3};
+use image::{DynamicImage, ImageDecoder, ImageReader};
+use ndarray::{s, Array3, Array4, ArrayView2, ArrayView4, Ix3};
 use tracing::debug;
+use tracing::info;
 
 use super::{
     device::ModelDevice,
@@ -78,19 +80,41 @@ impl OnnxFaceDetector {
 
 impl DetectionModel for OnnxFaceDetector {
     fn detect(&mut self, path: &Path) -> Result<Vec<DetectedFace>> {
-        // ── Load image and build BGR float tensor ──────────────────────────
-        let img = image::open(path)
-            .with_context(|| format!("opening image: {}", path.display()))?
-            .to_rgb8();
-        let (img_w, img_h) = (img.width() as usize, img.height() as usize);
+        const MAX_DIM: u32 = 1920;
 
-        // Build [H, W, 3] BGR float32 array directly.
-        // atksh expects BGR [0, 255]; image crate gives us RGB, so swap channels.
-        let mut img_arr = Array3::<f32>::zeros((img_h, img_w, 3));
-        for (x, y, p) in img.enumerate_pixels() {
-            img_arr[[y as usize, x as usize, 0]] = p[2] as f32; // B
-            img_arr[[y as usize, x as usize, 1]] = p[1] as f32; // G
-            img_arr[[y as usize, x as usize, 2]] = p[0] as f32; // R
+        // ── Load image and explicitly apply EXIF orientation ───────────────
+        // Keep orientation handling explicit so detector and UI use the same basis.
+        let mut decoder = ImageReader::open(path)
+            .with_context(|| format!("opening image: {}", path.display()))?
+            .into_decoder()
+            .with_context(|| format!("decoding image header: {}", path.display()))?;
+        let orientation = decoder.orientation().context("reading EXIF orientation")?;
+        let mut dyn_img = DynamicImage::from_decoder(decoder).context("decoding image")?;
+        dyn_img.apply_orientation(orientation);
+        let img = dyn_img.to_rgb8();
+        let (orig_w, orig_h) = (img.width(), img.height());
+
+        // ── Optionally resize oversized images, preserving aspect ratio ──
+        let scale = if orig_w > MAX_DIM || orig_h > MAX_DIM {
+            (MAX_DIM as f32 / orig_w as f32).min(MAX_DIM as f32 / orig_h as f32)
+        } else {
+            1.0
+        };
+        let new_w = (orig_w as f32 * scale).round() as u32;
+        let new_h = (orig_h as f32 * scale).round() as u32;
+
+        let resized = if scale < 1.0 {
+            image::imageops::resize(&img, new_w, new_h, image::imageops::FilterType::Triangle)
+        } else {
+            img
+        };
+
+        // ── Build [H, W, 3] BGR uint8 array (no padding — model takes dynamic sizes) ──
+        let mut img_arr = Array3::<u8>::zeros((new_h as usize, new_w as usize, 3));
+        for (x, y, p) in resized.enumerate_pixels() {
+            img_arr[[y as usize, x as usize, 0]] = p[2]; // B
+            img_arr[[y as usize, x as usize, 1]] = p[1]; // G
+            img_arr[[y as usize, x as usize, 2]] = p[0]; // R
         }
 
         // ── Run atksh detector ─────────────────────────────────────────────
@@ -111,29 +135,52 @@ impl DetectionModel for OnnxFaceDetector {
         let (scores_shape, scores_data) = outputs[scores_name.as_str()]
             .try_extract_tensor::<f32>()
             .context("scores")?;
-        let (_, bboxes_data) = outputs[bboxes_name.as_str()]
-            .try_extract_tensor::<f32>()
+        let (_, bboxes_i64) = outputs[bboxes_name.as_str()]
+            .try_extract_tensor::<i64>()
             .context("bboxes")?;
-        let (_, aligned_data) = outputs[aligned_name.as_str()]
-            .try_extract_tensor::<f32>()
+        let (_, aligned_u8) = outputs[aligned_name.as_str()]
+            .try_extract_tensor::<u8>()
             .context("aligned_imgs")?;
 
         let n = scores_shape[0] as usize;
-        let bboxes = ArrayView2::from_shape((n, 4), bboxes_data)
+        let bboxes_data: Vec<f32> = bboxes_i64.iter().map(|&v| v as f32).collect();
+        // Debug: log model input / output shapes and a sample of raw bbox values
+        info!(
+            input_shape = ?img_arr.shape(),
+            orig = %format!("{}x{}", orig_w, orig_h),
+            resized = %format!("{}x{}", new_w, new_h),
+            scale = %scale,
+            scores_shape = ?scores_shape,
+            bboxes_len = bboxes_data.len(),
+            "detector I/O shapes"
+        );
+        if n > 0 {
+            let sample = (
+                bboxes_data.get(0).copied().unwrap_or(f32::NAN),
+                bboxes_data.get(1).copied().unwrap_or(f32::NAN),
+                bboxes_data.get(2).copied().unwrap_or(f32::NAN),
+                bboxes_data.get(3).copied().unwrap_or(f32::NAN),
+            );
+            info!(raw_bbox_first = ?sample, "first raw bbox from model (pixels in input tensor space)");
+        }
+        let bboxes = ArrayView2::from_shape((n, 4), &bboxes_data[..])
             .context("reshaping bboxes to [N, 4]")?;
-        // aligned_imgs shape: [N, 112, 112, 3]
-        let aligned4 = ArrayView4::from_shape((n, 112, 112, 3), aligned_data)
+        // aligned_imgs shape: [N, 112, 112, 3] — model returns u8, convert to f32 for embedder.
+        let aligned_u8_4d = ArrayView4::from_shape((n, 112, 112, 3), aligned_u8)
             .context("reshaping aligned_imgs to [N, 112, 112, 3]")?;
+        let aligned4: Array4<f32> = aligned_u8_4d.mapv(|v| v as f32);
         let mut result = Vec::with_capacity(n);
 
         for i in 0..n {
             let conf = scores_data[i];
 
-            // Normalise pixel bbox → [0, 1].
-            let x1 = (bboxes[[i, 0]] / img_w as f32).clamp(0.0, 1.0);
-            let y1 = (bboxes[[i, 1]] / img_h as f32).clamp(0.0, 1.0);
-            let x2 = (bboxes[[i, 2]] / img_w as f32).clamp(0.0, 1.0);
-            let y2 = (bboxes[[i, 3]] / img_h as f32).clamp(0.0, 1.0);
+            // Map pixel bbox from resized space back to original,
+            // then normalise to [0, 1] relative to original dimensions.
+            // Model outputs [x1, y1, x2, y2] in pixel coords of the input tensor.
+            let x1 = (bboxes[[i, 0]] / scale / orig_w as f32).clamp(0.0, 1.0);
+            let y1 = (bboxes[[i, 1]] / scale / orig_h as f32).clamp(0.0, 1.0);
+            let x2 = (bboxes[[i, 2]] / scale / orig_w as f32).clamp(0.0, 1.0);
+            let y2 = (bboxes[[i, 3]] / scale / orig_h as f32).clamp(0.0, 1.0);
 
             // ── Optional ArcFace embedding pass ───────────────────────────
             // aligned4[i] is [112, 112, 3] BGR [0, 255].
@@ -142,7 +189,7 @@ impl DetectionModel for OnnxFaceDetector {
                     .slice(s![i, .., .., ..])
                     .into_dimensionality::<Ix3>()
                     .context("extracting aligned crop")?;
-                embedder.embed_face_crop(crop.view())?
+                embedder.embed_face_crop(crop.view().reborrow())?
             } else {
                 vec![]
             };
@@ -153,3 +200,5 @@ impl DetectionModel for OnnxFaceDetector {
         Ok(result)
     }
 }
+
+

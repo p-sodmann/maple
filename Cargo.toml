@@ -27,7 +27,7 @@ tokio = { version = "1", features = ["rt-multi-thread", "fs", "sync", "macros"] 
 # With load-dynamic, the onnxruntime shared library is loaded at runtime from
 # ORT_DYLIB_PATH or standard system library paths.  Install a CUDA-enabled
 # onnxruntime release to unlock GPU inference.
-ort = { version = "=2.0.0-rc.12", features = ["ndarray", "load-dynamic"] }
+ort = { version = "=2.0.0-rc.12", features = ["ndarray", "tracing"] }
 
 # Image
 image = "0.25"
