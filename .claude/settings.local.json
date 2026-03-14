@@ -4,7 +4,17 @@
       "Bash(cargo test)",
       "Bash(cargo build)",
       "Bash(cargo test --workspace)",
-      "Bash(cargo check -p maple-ui)"
+      "Bash(cargo check -p maple-ui)",
+      "Bash(cargo build -p maple-ui)",
+      "Bash(cargo check:*)",
+      "Bash(cargo search:*)",
+      "Bash(cargo update:*)",
+      "Bash(find ~/.cargo/registry/src -type d -name tract-hir-0.21*)",
+      "Bash(grep -r \"fn parse_tdim\\\\|pub.*parse_tdim\" /home/eterna/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tract-*)",
+      "Bash(find /home/eterna/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tract-hir-0.21.10 -name *.rs -exec grep -l \"InferenceModel\\\\|with_input_fact\" {})",
+      "Bash(2)",
+      "Bash(find /home/eterna/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tract-core-0.21.10 -name \"framework.rs\" -exec cat {})",
+      "Bash(cargo build:*)"
     ]
   }
 }

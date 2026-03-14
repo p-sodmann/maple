@@ -23,8 +23,11 @@ libadwaita = { version = "0.7", features = ["v1_6"] }
 # Async
 tokio = { version = "1", features = ["rt-multi-thread", "fs", "sync", "macros"] }
 
-# Inference (not wired in phase 0)
-# ort = { version = "2", features = ["load-dynamic"] }
+# ONNX Runtime (ort 2.x — supports CPU, CUDA, TensorRT via execution providers)
+# With load-dynamic, the onnxruntime shared library is loaded at runtime from
+# ORT_DYLIB_PATH or standard system library paths.  Install a CUDA-enabled
+# onnxruntime release to unlock GPU inference.
+ort = { version = "=2.0.0-rc.12", features = ["ndarray", "load-dynamic"] }
 
 # Image
 image = "0.25"
@@ -32,7 +35,7 @@ fast_image_resize = "5"
 kamadak-exif = "0.5"
 
 # Data
-ndarray = "0.16"
+ndarray = "0.17.2"
 rusqlite = { version = "0.32", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -45,6 +48,12 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 # Error handling
 anyhow = "1"
+
+# HTTP (blocking, for AI API calls)
+ureq = { version = "2", features = ["json"] }
+
+# Encoding
+base64 = "0.22"
 
 # Testing
 tempfile = "3"

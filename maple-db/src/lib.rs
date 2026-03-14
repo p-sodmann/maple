@@ -9,9 +9,16 @@
 mod scanner;
 mod schema;
 
+pub mod ai;
+pub mod face_detector;
+pub mod faces;
 pub mod metadata;
+pub mod models;
 pub mod query;
 
+pub use ai::{spawn_ai_tagger, AiDescriber, AiTagger, LmStudioDescriber};
+pub use face_detector::{spawn_face_tagger, DetectedFace, FaceDetector, FaceTagger};
+pub use faces::{best_person_match, cosine_similarity, FaceDetection, Person};
 pub use metadata::{extract_metadata, spawn_metadata_filler, ImageMetadata};
 pub use query::SearchQuery;
 pub use scanner::LibraryScanner;
@@ -185,16 +192,15 @@ impl Database {
     /// Search the library and return matching images with their metadata.
     ///
     /// With no text filter: returns all present images, newest-first.
-    /// With a text filter: uses FTS5 prefix matching across filename, make,
-    ///   model, and lens, ordered by recency.
+    /// With a text filter: each whitespace-delimited token must match at
+    ///   least one of: filename, make, model, lens, any AI description, or
+    ///   any assigned person name.
     pub fn search_images(&self, query: &SearchQuery) -> anyhow::Result<Vec<LibraryImage>> {
         let limit = query.limit.unwrap_or(500) as i64;
         let offset = query.offset.unwrap_or(0) as i64;
 
         let rows: Vec<LibraryImage> = if let Some(ref text) = query.text {
             // Build one LIKE pattern per space-separated token.
-            // Each token must appear as a substring in at least one text field;
-            // all tokens must match (AND).  Backslash is the LIKE escape char.
             let like_patterns: Vec<String> = text
                 .split_whitespace()
                 .map(|t| {
@@ -211,35 +217,48 @@ impl Database {
                 return Ok(vec![]);
             }
 
-            // For each token produce one AND-clause that checks all text fields.
-            let field_expr =
+            // Each token must match somewhere in the combined EXIF fields OR
+            // in any AI description OR in any assigned person name.
+            let exif_expr =
                 "LOWER(COALESCE(i.filename,'') || ' ' || \
                        COALESCE(i.make,'')     || ' ' || \
                        COALESCE(i.model,'')    || ' ' || \
                        COALESCE(i.lens,''))";
+            let ai_expr     = "LOWER(COALESCE(ad.description,''))";
+            let person_expr = "LOWER(COALESCE(p.name,''))";
 
             let token_conditions: String = like_patterns
                 .iter()
-                .map(|_| format!("{field_expr} LIKE ? ESCAPE '\\'"))
+                .map(|_| {
+                    format!(
+                        "({exif_expr} LIKE ? ESCAPE '\\' \
+                          OR {ai_expr} LIKE ? ESCAPE '\\' \
+                          OR {person_expr} LIKE ? ESCAPE '\\')"
+                    )
+                })
                 .collect::<Vec<_>>()
                 .join(" AND ");
 
             let sql = format!(
-                "SELECT i.id, i.path, i.added_at, i.status,
+                "SELECT DISTINCT i.id, i.path, i.added_at, i.status,
                         i.filename, i.taken_at, i.make, i.model, i.lens,
                         i.focal_length, i.aperture, i.iso,
                         i.width, i.height, i.orientation
                  FROM images i
+                 LEFT JOIN ai_descriptions ad ON ad.image_id = i.id
+                 LEFT JOIN face_detections fd ON fd.image_id = i.id
+                 LEFT JOIN persons p ON p.id = fd.person_id
                  WHERE i.status = 'present'
                    AND {token_conditions}
                  ORDER BY i.added_at DESC
                  LIMIT ? OFFSET ?"
             );
 
+            // Each token pattern appears three times: EXIF, AI desc, person name.
             use rusqlite::types::Value;
             let params: Vec<Value> = like_patterns
                 .into_iter()
-                .map(Value::Text)
+                .flat_map(|p| [Value::Text(p.clone()), Value::Text(p.clone()), Value::Text(p)])
                 .chain([Value::Integer(limit), Value::Integer(offset)])
                 .collect();
 
@@ -266,6 +285,91 @@ impl Database {
                 .collect();
             rows
         };
+        Ok(rows)
+    }
+
+    // ── AI description operations ─────────────────────────────────
+
+    /// Return `(id, path)` for all present images that have no description
+    /// from `model_id` yet.  Used by `spawn_ai_tagger`.
+    pub fn images_needing_ai_description(
+        &self,
+        model_id: &str,
+    ) -> anyhow::Result<Vec<(i64, PathBuf)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT i.id, i.path
+             FROM images i
+             WHERE i.status = 'present'
+               AND NOT EXISTS (
+                   SELECT 1 FROM ai_descriptions ad
+                   WHERE ad.image_id = i.id AND ad.model_id = ?1
+               )",
+        )?;
+        let rows = stmt
+            .query_map(params![model_id], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    PathBuf::from(row.get::<_, String>(1)?),
+                ))
+            })?
+            .filter_map(|r| r.ok())
+            .collect();
+        Ok(rows)
+    }
+
+    /// Store (or replace) an AI-generated description for one image/model pair.
+    pub fn insert_ai_description(
+        &self,
+        image_id: i64,
+        model_id: &str,
+        description: &str,
+    ) -> anyhow::Result<()> {
+        let created_at = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as i64;
+        self.conn.execute(
+            "INSERT INTO ai_descriptions(image_id, model_id, description, created_at)
+             VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(image_id, model_id) DO UPDATE SET
+                 description = excluded.description,
+                 created_at  = excluded.created_at",
+            params![image_id, model_id, description, created_at],
+        )?;
+        Ok(())
+    }
+
+    /// Retrieve the AI description for a specific image/model pair, if any.
+    pub fn ai_description_for_image(
+        &self,
+        image_id: i64,
+        model_id: &str,
+    ) -> anyhow::Result<Option<String>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT description FROM ai_descriptions
+             WHERE image_id = ?1 AND model_id = ?2",
+        )?;
+        let mut rows = stmt.query(params![image_id, model_id])?;
+        Ok(rows.next()?.map(|r| r.get::<_, String>(0)).transpose()?)
+    }
+
+    /// Return all `(model_id, description)` pairs for `image_id`, ordered by
+    /// `created_at` ascending.  Used by the detail window info popup.
+    pub fn ai_descriptions_for_image(
+        &self,
+        image_id: i64,
+    ) -> anyhow::Result<Vec<(String, String)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT model_id, description FROM ai_descriptions
+             WHERE image_id = ?1
+             ORDER BY created_at ASC",
+        )?;
+        let rows = stmt
+            .query_map(params![image_id], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?
+            .filter_map(|r| r.ok())
+            .collect();
         Ok(rows)
     }
 

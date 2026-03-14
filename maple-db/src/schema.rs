@@ -3,6 +3,8 @@
 //! Versions are stored in `PRAGMA user_version`:
 //!   0 → 1 : base `images` table + hash index
 //!   1 → 2 : metadata columns + FTS5 index + sync triggers + backfill
+//!   2 → 3 : ai_descriptions table (per-model AI-generated descriptions)
+//!   3 → 4 : persons + face_detections tables (ONNX face recognition)
 
 use rusqlite::Connection;
 
@@ -77,6 +79,50 @@ const V2_FTS_BACKFILL: &str = "
         SELECT id, filename, make, model, lens FROM images;
 ";
 
+// ── V3: AI-generated descriptions ────────────────────────────────
+
+/// One row per (image, model) pair — allows tracking multiple AI models.
+const V3: &str = "
+    CREATE TABLE IF NOT EXISTS ai_descriptions (
+        id          INTEGER PRIMARY KEY,
+        image_id    INTEGER NOT NULL REFERENCES images(id) ON DELETE CASCADE,
+        model_id    TEXT    NOT NULL,
+        description TEXT    NOT NULL,
+        created_at  INTEGER NOT NULL
+    );
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_ai_desc_image_model
+        ON ai_descriptions(image_id, model_id);
+";
+
+// ── V4: persons + face detections ────────────────────────────────
+
+/// Named identities and per-face ONNX embeddings.
+///
+/// `face_detections.embedding` stores 512 × f32 little-endian (2048 bytes).
+/// `face_detections.bbox_*` are normalized [0, 1] coordinates.
+const V4: &str = "
+    CREATE TABLE IF NOT EXISTS persons (
+        id         INTEGER PRIMARY KEY,
+        name       TEXT    NOT NULL UNIQUE,
+        created_at INTEGER NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS face_detections (
+        id         INTEGER PRIMARY KEY,
+        image_id   INTEGER NOT NULL REFERENCES images(id)  ON DELETE CASCADE,
+        bbox_x1    REAL    NOT NULL,
+        bbox_y1    REAL    NOT NULL,
+        bbox_x2    REAL    NOT NULL,
+        bbox_y2    REAL    NOT NULL,
+        embedding  BLOB    NOT NULL,
+        person_id  INTEGER REFERENCES persons(id) ON DELETE SET NULL,
+        confidence REAL    NOT NULL DEFAULT 1.0
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_face_det_image  ON face_detections(image_id);
+    CREATE INDEX IF NOT EXISTS idx_face_det_person ON face_detections(person_id);
+";
+
 // ── Migration runner ─────────────────────────────────────────────
 
 /// Apply all pending schema migrations to `conn`.
@@ -102,6 +148,16 @@ pub fn ensure_schema(conn: &Connection) -> anyhow::Result<()> {
         conn.execute_batch(V2_FTS)?;
         conn.execute_batch(V2_FTS_BACKFILL)?;
         conn.execute_batch("PRAGMA user_version = 2")?;
+    }
+
+    if version < 3 {
+        conn.execute_batch(V3)?;
+        conn.execute_batch("PRAGMA user_version = 3")?;
+    }
+
+    if version < 4 {
+        conn.execute_batch(V4)?;
+        conn.execute_batch("PRAGMA user_version = 4")?;
     }
 
     Ok(())

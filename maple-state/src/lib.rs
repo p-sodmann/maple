@@ -111,6 +111,126 @@ fn settings_path() -> PathBuf {
     config_dir().join("settings.toml")
 }
 
+/// Face detection and recognition settings.
+///
+/// Stored under `[face]` in `settings.toml`.
+///
+/// **Required:** `detector_model` — the atksh joined ONNX model that performs
+/// face detection + landmark detection + aligned-crop extraction in a single
+/// pass.  Download from <https://github.com/atksh/onnx-facial-lmk-detector/releases>.
+///
+/// **Optional:** `embedder_model` — an ArcFace model for 512-dim identity
+/// embeddings and cosine-similarity person grouping.  Download from
+/// <https://github.com/deepinsight/insightface/tree/master/model_zoo>.
+/// Leave empty to run detection-only (no person grouping).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FaceSettings {
+    /// Whether the face tagger starts automatically when the library opens.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Path to the atksh joined ONNX model (required for face detection).
+    #[serde(default)]
+    pub detector_model: PathBuf,
+    /// Path to an ArcFace ONNX embedder (optional — enables person grouping).
+    /// Leave empty to run detection without embedding.
+    #[serde(default)]
+    pub embedder_model: PathBuf,
+    /// Cosine-similarity threshold for suggesting a person match (0.0–1.0).
+    /// ArcFace-R100: same person typically ≥ 0.40.
+    #[serde(default = "FaceSettings::default_similarity_threshold")]
+    pub similarity_threshold: f32,
+    /// Execution device for ONNX inference.
+    /// Accepts: `"cpu"` (default), `"cuda:N"` (NVIDIA GPU index N),
+    /// `"tensorrt:N"` (TensorRT, fastest for fixed-shape models).
+    /// Requires a CUDA-enabled ONNX Runtime on `ORT_DYLIB_PATH` for GPU.
+    #[serde(default = "FaceSettings::default_device")]
+    pub device: String,
+}
+
+impl FaceSettings {
+    fn default_similarity_threshold() -> f32 {
+        0.40
+    }
+
+    fn default_device() -> String {
+        "cpu".into()
+    }
+
+    /// True when the detector model path is set and exists on disk.
+    /// The embedder is optional — its absence disables person similarity only.
+    pub fn models_available(&self) -> bool {
+        !self.detector_model.as_os_str().is_empty() && self.detector_model.exists()
+    }
+
+    /// Return the embedder path if it is configured and exists on disk.
+    pub fn embedder_path(&self) -> Option<&std::path::Path> {
+        if !self.embedder_model.as_os_str().is_empty() && self.embedder_model.exists() {
+            Some(&self.embedder_model)
+        } else {
+            None
+        }
+    }
+}
+
+impl Default for FaceSettings {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            detector_model: PathBuf::new(),
+            embedder_model: PathBuf::new(),
+            similarity_threshold: Self::default_similarity_threshold(),
+            device: Self::default_device(),
+        }
+    }
+}
+
+/// AI model configuration for image description.
+///
+/// Stored under `[ai]` in `settings.toml`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AiSettings {
+    /// Whether the AI tagger should start automatically when the library opens.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Base URL of the OpenAI-compatible server (e.g. `http://localhost:1234`).
+    #[serde(default = "AiSettings::default_server_url")]
+    pub server_url: String,
+    /// Model identifier as the server expects it (e.g. `llava-v1.6`).
+    #[serde(default = "AiSettings::default_model")]
+    pub model: String,
+    /// System prompt sent with every image.
+    #[serde(default = "AiSettings::default_prompt")]
+    pub prompt: String,
+}
+
+impl AiSettings {
+    fn default_server_url() -> String {
+        "http://localhost:1234".into()
+    }
+
+    fn default_model() -> String {
+        "local-model".into()
+    }
+
+    fn default_prompt() -> String {
+        "Describe this image in detail. Include the main subjects, scene, \
+         colors, mood, any text visible, and notable elements. Be thorough \
+         to enable comprehensive search results."
+            .into()
+    }
+}
+
+impl Default for AiSettings {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            server_url: Self::default_server_url(),
+            model: Self::default_model(),
+            prompt: Self::default_prompt(),
+        }
+    }
+}
+
 /// Application settings loaded from `settings.toml`.
 ///
 /// Missing keys fall back to defaults. The file is created with defaults
@@ -130,6 +250,12 @@ pub struct Settings {
     /// Defaults to `~/.config/maple/library.db`.
     #[serde(default = "Settings::default_database_path")]
     pub database_path: PathBuf,
+    /// AI image description settings.
+    #[serde(default)]
+    pub ai: AiSettings,
+    /// Face detection / recognition settings.
+    #[serde(default)]
+    pub face: FaceSettings,
 }
 
 impl Settings {
@@ -186,6 +312,8 @@ impl Default for Settings {
             preview_buffer_size: Self::default_preview_buffer_size(),
             library_dir: Self::default_library_dir(),
             database_path: Self::default_database_path(),
+            ai: AiSettings::default(),
+            face: FaceSettings::default(),
         }
     }
 }
@@ -289,6 +417,7 @@ mod tests {
             preview_buffer_size: 11,
             library_dir: PathBuf::from("/my/library"),
             database_path: PathBuf::from("/my/library/library.db"),
+            ..Settings::default()
         };
         let toml_str = toml::to_string_pretty(&s).unwrap();
         let parsed: Settings = toml::from_str(&toml_str).unwrap();
@@ -313,6 +442,7 @@ mod tests {
             preview_buffer_size: 13,
             library_dir: PathBuf::from("/custom/lib"),
             database_path: PathBuf::from("/custom/lib/library.db"),
+            ..Settings::default()
         };
         s.save_to(&path).unwrap();
 
