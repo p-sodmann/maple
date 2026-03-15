@@ -52,20 +52,30 @@ impl FromStr for ModelDevice {
         if s == "cpu" {
             return Ok(Self::Cpu);
         }
-        if let Some(id_str) = s.strip_prefix("cuda:") {
-            let id: u32 = id_str
-                .parse()
-                .map_err(|_| anyhow::anyhow!("invalid CUDA device index: {id_str:?}"))?;
-            return Ok(Self::Cuda(id));
+        if let Some(device) = parse_indexed_device(&s, "cuda:", "CUDA", Self::Cuda)? {
+            return Ok(device);
         }
-        if let Some(id_str) = s.strip_prefix("tensorrt:") {
-            let id: u32 = id_str
-                .parse()
-                .map_err(|_| anyhow::anyhow!("invalid TensorRT device index: {id_str:?}"))?;
-            return Ok(Self::TensorRt(id));
+        if let Some(device) = parse_indexed_device(&s, "tensorrt:", "TensorRT", Self::TensorRt)? {
+            return Ok(device);
         }
         anyhow::bail!("unknown device {s:?}; valid: 'cpu', 'cuda:N', 'tensorrt:N'")
     }
+}
+
+fn parse_indexed_device(
+    raw: &str,
+    prefix: &str,
+    label: &str,
+    constructor: fn(u32) -> ModelDevice,
+) -> Result<Option<ModelDevice>> {
+    let Some(id_str) = raw.strip_prefix(prefix) else {
+        return Ok(None);
+    };
+
+    let id: u32 = id_str
+        .parse()
+        .map_err(|_| anyhow::anyhow!("invalid {label} device index: {id_str:?}"))?;
+    Ok(Some(constructor(id)))
 }
 
 // String-based serde so settings.toml can use `device = "cuda:0"`.
@@ -77,9 +87,7 @@ impl Serialize for ModelDevice {
 }
 
 impl<'de> Deserialize<'de> for ModelDevice {
-    fn deserialize<D: serde::Deserializer<'de>>(
-        d: D,
-    ) -> std::result::Result<Self, D::Error> {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> std::result::Result<Self, D::Error> {
         let s = String::deserialize(d)?;
         s.parse().map_err(serde::de::Error::custom)
     }
