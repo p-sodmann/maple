@@ -18,7 +18,7 @@ pub mod query;
 
 pub use ai::{spawn_ai_tagger, AiDescriber, AiTagger, LmStudioDescriber};
 pub use face_detector::{spawn_face_tagger, DetectedFace, FaceDetector, FaceTagger};
-pub use faces::{best_person_match, cosine_similarity, FaceDetection, Person};
+pub use faces::{best_person_match, best_person_matches, cosine_similarity, FaceDetection, Person};
 pub use metadata::{extract_metadata, spawn_metadata_filler, ImageMetadata};
 pub use query::SearchQuery;
 pub use scanner::LibraryScanner;
@@ -436,6 +436,20 @@ impl Database {
             .filter_map(|r| r.ok())
             .collect();
         Ok(rows)
+    }
+
+    /// Fetch a single image record by id.
+    pub fn image_by_id(&self, id: i64) -> anyhow::Result<Option<LibraryImage>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, path, added_at, status,
+                    filename, taken_at, make, model, lens,
+                    focal_length, aperture, iso,
+                    width, height, orientation
+             FROM images
+             WHERE id = ?1",
+        )?;
+        let mut rows = stmt.query_map(params![id], row_to_library_image)?;
+        Ok(rows.next().transpose()?)
     }
 
     /// Total number of records in the library.

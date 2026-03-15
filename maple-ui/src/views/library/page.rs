@@ -11,7 +11,7 @@ use libadwaita as adw;
 
 use maple_db::SearchQuery;
 
-use super::{detail_window, grid::LibraryGrid, search_bar};
+use super::{build_face_tagging_page, detail_window, grid::LibraryGrid, search_bar};
 
 /// Build the library browser page.
 ///
@@ -21,7 +21,7 @@ use super::{detail_window, grid::LibraryGrid, search_bar};
 /// If `settings.ai.enabled` is true, the AI tagger starts automatically.
 /// A header button lets the user start or stop it at any time.
 pub fn build_library_page(
-    _nav_view: &adw::NavigationView,
+    nav_view: &adw::NavigationView,
     db: Arc<Mutex<maple_db::Database>>,
 ) -> adw::NavigationPage {
     let settings = maple_state::Settings::load();
@@ -63,12 +63,45 @@ pub fn build_library_page(
     content.append(&search_clamp);
     content.append(&scrolled);
 
-    // ── Header with AI tagger button ──────────────────────────────
+    // ── Header ────────────────────────────────────────────────────
     let header = adw::HeaderBar::new();
 
     let ai_button = gtk4::Button::with_label("Tag with AI");
     ai_button.set_tooltip_text(Some("Describe images with AI to improve search"));
     header.pack_end(&ai_button);
+
+    // ── Face tagger button ────────────────────────────────────────
+    let face_detect_btn = gtk4::Button::with_label("Detect Faces");
+    face_detect_btn.set_tooltip_text(Some("Detect and tag faces in all library images"));
+    if !settings.face.models_available() {
+        face_detect_btn.set_sensitive(false);
+        face_detect_btn.set_tooltip_text(Some(
+            "Face detection unavailable — set face.detector_model to the \
+             atksh ONNX model path in settings.toml",
+        ));
+    }
+    header.pack_end(&face_detect_btn);
+
+    // ── Tag Faces button (opens the tagging wizard) ───────────────
+    let tag_faces_btn = gtk4::Button::with_label("Tag Faces");
+    tag_faces_btn.set_tooltip_text(Some("Step through untagged faces and assign names"));
+    if !settings.face.models_available() {
+        tag_faces_btn.set_sensitive(false);
+    }
+    header.pack_end(&tag_faces_btn);
+
+    tag_faces_btn.connect_clicked({
+        let nav_view = nav_view.clone();
+        let db = db.clone();
+        let settings = settings.clone();
+        move |_| {
+            let page = build_face_tagging_page(
+                db.clone(),
+                settings.face.tagging_top_k,
+            );
+            nav_view.push(&page);
+        }
+    });
 
     let toolbar_view = adw::ToolbarView::new();
     toolbar_view.add_top_bar(&header);
@@ -79,27 +112,13 @@ pub fn build_library_page(
         .child(&toolbar_view)
         .build();
 
-    // ── Face tagger button ────────────────────────────────────────
-    let face_btn = gtk4::Button::with_label("Detect Faces");
-    face_btn.set_tooltip_text(Some("Detect and tag faces in all library images"));
-    if !settings.face.models_available() {
-        face_btn.set_sensitive(false);
-        face_btn.set_tooltip_text(Some(
-            "Face detection unavailable — set face.detector_model to the \
-             atksh ONNX model path in settings.toml",
-        ));
-    }
-    header.pack_end(&face_btn);
-
+    // ── Face detector state ───────────────────────────────────────
     let face_tagger: Rc<RefCell<Option<maple_db::FaceTagger>>> = Rc::new(RefCell::new(None));
 
-    // Helper: load the face detector in a background thread, then spawn the
-    // tagger on the main thread once loading completes.  This keeps the UI
-    // responsive during the potentially slow ORT model-load + graph-build step.
     let start_face_detector: Rc<dyn Fn()> = Rc::new({
         let db = db.clone();
         let face_tagger = face_tagger.clone();
-        let face_btn = face_btn.clone();
+        let face_detect_btn = face_detect_btn.clone();
         let settings = settings.clone();
         move || {
             let detector_path = settings.face.detector_model.clone();
@@ -107,8 +126,8 @@ pub fn build_library_page(
             let device: maple_db::models::ModelDevice =
                 settings.face.device.parse().unwrap_or_default();
 
-            face_btn.set_sensitive(false);
-            face_btn.set_label("Loading model…");
+            face_detect_btn.set_sensitive(false);
+            face_detect_btn.set_label("Loading model…");
 
             let (tx, rx) =
                 std::sync::mpsc::sync_channel::<Result<maple_db::FaceDetector, String>>(1);
@@ -129,25 +148,25 @@ pub fn build_library_page(
             glib::timeout_add_local(Duration::from_millis(200), {
                 let db = db.clone();
                 let face_tagger = face_tagger.clone();
-                let face_btn = face_btn.clone();
+                let face_detect_btn = face_detect_btn.clone();
                 move || match rx.try_recv() {
                     Ok(Ok(detector)) => {
                         *face_tagger.borrow_mut() =
                             Some(maple_db::spawn_face_tagger(db.clone(), detector));
-                        face_btn.set_label("Stop Face Detection");
-                        face_btn.set_sensitive(true);
+                        face_detect_btn.set_label("Stop Face Detection");
+                        face_detect_btn.set_sensitive(true);
                         glib::ControlFlow::Break
                     }
                     Ok(Err(e)) => {
                         tracing::warn!("Failed to load face detector: {e}");
-                        face_btn.set_label("Detect Faces");
-                        face_btn.set_sensitive(true);
+                        face_detect_btn.set_label("Detect Faces");
+                        face_detect_btn.set_sensitive(true);
                         glib::ControlFlow::Break
                     }
                     Err(std::sync::mpsc::TryRecvError::Empty) => glib::ControlFlow::Continue,
                     Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                        face_btn.set_label("Detect Faces");
-                        face_btn.set_sensitive(true);
+                        face_detect_btn.set_label("Detect Faces");
+                        face_detect_btn.set_sensitive(true);
                         glib::ControlFlow::Break
                     }
                 }
@@ -155,24 +174,23 @@ pub fn build_library_page(
         }
     });
 
-    face_btn.connect_clicked({
+    face_detect_btn.connect_clicked({
         let face_tagger = face_tagger.clone();
-        let face_btn = face_btn.clone();
+        let face_detect_btn = face_detect_btn.clone();
         let start_face_detector = start_face_detector.clone();
         move |_| {
             let mut guard = face_tagger.borrow_mut();
             if let Some(t) = guard.take() {
                 t.stop();
-                face_btn.set_label("Detect Faces");
+                face_detect_btn.set_label("Detect Faces");
             } else {
-                drop(guard); // release borrow before start_face_detector borrows it
+                drop(guard);
                 start_face_detector();
             }
         }
     });
 
     // ── AI tagger state ───────────────────────────────────────────
-    // Holds the running tagger handle; None means stopped.
     let tagger: Rc<RefCell<Option<maple_db::AiTagger>>> = Rc::new(RefCell::new(None));
 
     let update_button_label = {
@@ -186,7 +204,6 @@ pub fn build_library_page(
         }
     };
 
-    // Helper: build a fresh describer from current settings.
     let make_describer = {
         let settings = settings.clone();
         move || {
@@ -198,7 +215,6 @@ pub fn build_library_page(
         }
     };
 
-    // Toggle button: start if stopped, stop if running.
     ai_button.connect_clicked({
         let db = db.clone();
         let tagger = tagger.clone();
@@ -240,7 +256,6 @@ pub fn build_library_page(
             }
         }
     });
-
 
     page
 }

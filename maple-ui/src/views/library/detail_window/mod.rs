@@ -127,7 +127,7 @@ fn build_window(
         zoom.clone(),
         img_dims.clone(),
         db.clone(),
-        settings.face.similarity_threshold,
+        settings.face.tagging_top_k,
     );
 
     // Load detections for the first image immediately.
@@ -198,7 +198,6 @@ fn build_window(
     info_bar::fill_info_bar(&info_bar, image);
 
     // ── Layout ────────────────────────────────────────────────────
-    // face_overlay.container is the gtk4::Overlay that wraps the scrolled window.
     let content = gtk4::Box::builder()
         .orientation(gtk4::Orientation::Vertical)
         .build();

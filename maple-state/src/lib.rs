@@ -139,6 +139,9 @@ pub struct FaceSettings {
     /// ArcFace-R100: same person typically ≥ 0.40.
     #[serde(default = "FaceSettings::default_similarity_threshold")]
     pub similarity_threshold: f32,
+    /// Number of suggested persons shown in tagging mode.
+    #[serde(default = "FaceSettings::default_tagging_top_k")]
+    pub tagging_top_k: usize,
     /// Execution device for ONNX inference.
     /// Accepts: `"cpu"` (default), `"cuda:N"` (NVIDIA GPU index N),
     /// `"tensorrt:N"` (TensorRT, fastest for fixed-shape models).
@@ -154,6 +157,10 @@ impl FaceSettings {
 
     fn default_device() -> String {
         "cpu".into()
+    }
+
+    fn default_tagging_top_k() -> usize {
+        5
     }
 
     /// True when the detector model path is set and exists on disk.
@@ -179,6 +186,7 @@ impl Default for FaceSettings {
             detector_model: PathBuf::new(),
             embedder_model: PathBuf::new(),
             similarity_threshold: Self::default_similarity_threshold(),
+            tagging_top_k: Self::default_tagging_top_k(),
             device: Self::default_device(),
         }
     }
@@ -409,6 +417,7 @@ mod tests {
         let s = Settings::default();
         assert_eq!(s.preview_buffer_size, 21);
         assert_eq!(s.library_dir, config_dir());
+        assert_eq!(s.face.tagging_top_k, 5);
     }
 
     #[test]

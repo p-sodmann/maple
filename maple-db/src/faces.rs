@@ -17,6 +17,7 @@
 
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
+use std::collections::HashMap;
 
 use rusqlite::params;
 
@@ -67,11 +68,50 @@ pub fn best_person_match(
     known: &[(i64, String, Vec<f32>)],
     threshold: f32,
 ) -> Option<(i64, String, f32)> {
-    known
-        .iter()
-        .map(|(pid, name, emb)| (*pid, name.clone(), cosine_similarity(query, emb)))
-        .filter(|(_, _, sim)| *sim >= threshold)
-        .max_by(|a, b| a.2.partial_cmp(&b.2).unwrap_or(std::cmp::Ordering::Equal))
+    best_person_matches(query, known, threshold, 1).into_iter().next()
+}
+
+/// Find the top `k` matching persons for a query embedding.
+///
+/// Multiple known embeddings for the same person are merged by taking the
+/// highest similarity per person.
+pub fn best_person_matches(
+    query: &[f32],
+    known: &[(i64, String, Vec<f32>)],
+    threshold: f32,
+    k: usize,
+) -> Vec<(i64, String, f32)> {
+    if k == 0 {
+        return vec![];
+    }
+
+    let mut best_per_person: HashMap<i64, (String, f32)> = HashMap::new();
+    for (pid, name, emb) in known {
+        let sim = cosine_similarity(query, emb);
+        if sim < threshold {
+            continue;
+        }
+        match best_per_person.get_mut(pid) {
+            Some((saved_name, saved_sim)) => {
+                if sim > *saved_sim {
+                    *saved_name = name.clone();
+                    *saved_sim = sim;
+                }
+            }
+            None => {
+                best_per_person.insert(*pid, (name.clone(), sim));
+            }
+        }
+    }
+
+    let mut matches: Vec<(i64, String, f32)> = best_per_person
+        .into_iter()
+        .map(|(pid, (name, sim))| (pid, name, sim))
+        .collect();
+
+    matches.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal));
+    matches.truncate(k);
+    matches
 }
 
 // ── Database impl ─────────────────────────────────────────────────
@@ -242,6 +282,26 @@ impl Database {
                     name: row.get(1)?,
                 })
             })?
+            .filter_map(|r| r.ok())
+            .collect();
+        Ok(rows)
+    }
+
+    /// Return IDs of present images that have at least one real untagged face.
+    pub fn images_with_untagged_faces(&self) -> anyhow::Result<Vec<i64>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT DISTINCT fd.image_id
+             FROM face_detections fd
+             JOIN images i ON i.id = fd.image_id
+             WHERE fd.person_id IS NULL
+               AND fd.confidence >= 0.0
+               AND NOT (fd.bbox_x1 = 0.0 AND fd.bbox_y1 = 0.0
+                        AND fd.bbox_x2 = 0.0 AND fd.bbox_y2 = 0.0)
+               AND i.status = 'present'
+             ORDER BY fd.image_id",
+        )?;
+        let rows = stmt
+            .query_map([], |row| row.get::<_, i64>(0))?
             .filter_map(|r| r.ok())
             .collect();
         Ok(rows)

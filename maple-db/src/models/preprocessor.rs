@@ -144,7 +144,7 @@ fn apply_step(arr: ArrayD<f32>, step: &PreprocessStep) -> Result<ArrayD<f32>> {
             let arr3 = arr
                 .into_dimensionality::<ndarray::Ix3>()
                 .map_err(|_| anyhow::anyhow!("HwcToChw: failed to reshape to Ix3"))?;
-            Ok(arr3.permuted_axes([2usize, 0, 1]).into_dyn())
+            Ok(arr3.permuted_axes([2usize, 0, 1]).as_standard_layout().into_owned().into_dyn())
         }
 
         PreprocessStep::AddBatchDim => {

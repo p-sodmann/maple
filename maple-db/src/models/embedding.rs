@@ -90,12 +90,10 @@ impl OnnxFaceEmbedder {
             .and_then(|d| usize::try_from(d).ok())
             .unwrap_or(512);
 
-        // ArcFace preprocessing: remap [0,255]→[-1,1], HWC→CHW, add batch.
+        // ArcFace preprocessing: BGR→RGB, HWC→CHW, add batch.
+        // Input from atksh detector is BGR [0,255]; model expects RGB CHW [0,255].
         let preprocessor = Preprocessor::new()
-            .add(PreprocessStep::LinearScale {
-                scale: 1.0 / 127.5,
-                offset: -1.0,
-            })
+            .add(PreprocessStep::SwapChannels)
             .add(PreprocessStep::HwcToChw)
             .add(PreprocessStep::AddBatchDim);
 
