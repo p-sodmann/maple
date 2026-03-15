@@ -20,8 +20,7 @@ use std::path::Path;
 use anyhow::{Context, Result};
 use image::{DynamicImage, ImageDecoder, ImageReader};
 use ndarray::{s, Array3, Array4, ArrayView2, ArrayView4, Ix3};
-use tracing::debug;
-use tracing::info;
+use tracing::{debug, info};
 
 use super::{
     device::ModelDevice,
@@ -127,7 +126,7 @@ impl DetectionModel for OnnxFaceDetector {
             .run(ort::inputs![input_name.as_str() => tensor])
             .context("running face detector")?;
 
-        // Use cached output names (positional order: scores, bboxes, _, aligned_imgs, …).
+        // Positional outputs: 0=scores, 1=bboxes, 2=keypoints, 3=aligned_imgs, …
         let scores_name = &self.detector.output_names[0];
         let bboxes_name = &self.detector.output_names[1];
         let aligned_name = &self.detector.output_names[3];
@@ -144,24 +143,16 @@ impl DetectionModel for OnnxFaceDetector {
 
         let n = scores_shape[0] as usize;
         let bboxes_data: Vec<f32> = bboxes_i64.iter().map(|&v| v as f32).collect();
-        // Debug: log model input / output shapes and a sample of raw bbox values
         info!(
             input_shape = ?img_arr.shape(),
-            orig = %format!("{}x{}", orig_w, orig_h),
-            resized = %format!("{}x{}", new_w, new_h),
-            scale = %scale,
-            scores_shape = ?scores_shape,
-            bboxes_len = bboxes_data.len(),
-            "detector I/O shapes"
+            orig = %format!("{orig_w}x{orig_h}"),
+            resized = %format!("{new_w}x{new_h}"),
+            scale,
+            faces = n,
+            "detector I/O"
         );
         if n > 0 {
-            let sample = (
-                bboxes_data.get(0).copied().unwrap_or(f32::NAN),
-                bboxes_data.get(1).copied().unwrap_or(f32::NAN),
-                bboxes_data.get(2).copied().unwrap_or(f32::NAN),
-                bboxes_data.get(3).copied().unwrap_or(f32::NAN),
-            );
-            info!(raw_bbox_first = ?sample, "first raw bbox from model (pixels in input tensor space)");
+            info!(raw_bbox_first = ?&bboxes_data[..4.min(bboxes_data.len())], "first bbox (input-tensor pixels)");
         }
         let bboxes = ArrayView2::from_shape((n, 4), &bboxes_data[..])
             .context("reshaping bboxes to [N, 4]")?;
@@ -200,5 +191,3 @@ impl DetectionModel for OnnxFaceDetector {
         Ok(result)
     }
 }
-
-

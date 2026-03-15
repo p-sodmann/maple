@@ -14,13 +14,13 @@
 //! [`EmbeddingModel`].
 //!
 //! Expected model I/O (InsightFace ArcFace):
-//! - Input  (first) : `[1, 3, 112, 112]` float32 — BGR, normalised to `[-1, 1]`
+//! - Input  (first) : `[1, 3, 112, 112]` float32 — RGB `[0, 255]`
 //! - Output (first) : `[1, 512]`         float32 — raw embedding (L2-normalised here)
 //!
 //! The preprocessing pipeline applied inside [`OnnxFaceEmbedder::embed_face_crop`]:
-//! 1. `LinearScale { scale: 1/127.5, offset: -1.0 }` — remap `[0, 255]` → `[-1, 1]`
-//! 2. `HwcToChw`    — `[112, 112, 3]` → `[3, 112, 112]`
-//! 3. `AddBatchDim` — `[3, 112, 112]` → `[1, 3, 112, 112]`
+//! 1. `SwapChannels` — BGR → RGB
+//! 2. `HwcToChw`     — `[112, 112, 3]` → `[3, 112, 112]`
+//! 3. `AddBatchDim`  — `[3, 112, 112]` → `[1, 3, 112, 112]`
 
 use std::path::Path;
 
@@ -64,11 +64,11 @@ pub trait TextEmbeddingModel: Send + Sync {
 /// ArcFace-compatible ONNX face embedder.
 ///
 /// Loads any InsightFace-compatible ArcFace ONNX model and implements
-/// [`EmbeddingModel`].  The preprocessing pipeline (scale → CHW → batch) is
+/// [`EmbeddingModel`].  The preprocessing pipeline (BGR→RGB → CHW → batch) is
 /// applied internally — callers pass raw BGR `[0, 255]` crops.
 pub struct OnnxFaceEmbedder {
     session: OnnxSession,
-    /// Preprocessing: scale to [-1,1], HWC→CHW, add batch dim.
+    /// Preprocessing: BGR→RGB, HWC→CHW, add batch dim.
     preprocessor: Preprocessor,
     embedding_dim: usize,
 }
@@ -103,15 +103,14 @@ impl OnnxFaceEmbedder {
 
 impl EmbeddingModel for OnnxFaceEmbedder {
     fn embed_face_crop(&mut self, crop: ArrayView3<f32>) -> Result<Vec<f32>> {
-        // Apply preprocessing pipeline → [1, 3, 112, 112].
-        let tensor_dyn = self.preprocessor.run(crop.to_owned())?;
-
-        // Convert from dynamic rank to concrete Ix4 so ort::inputs! accepts it.
-        let tensor = tensor_dyn
+        // Preprocess [H,W,C] BGR → [1,C,H,W] RGB.
+        let tensor = self
+            .preprocessor
+            .run(crop.to_owned())?
             .into_dimensionality::<ndarray::Ix4>()
             .context("embedder preprocessing must produce a 4-D tensor [1,C,H,W]")?;
 
-        // Run the ONNX session.
+        // Run inference.
         let input_name = &self.session.input_names[0];
         let tensor_ref =
             ort::value::TensorRef::from_array_view(tensor.view()).context("creating embedder input tensor")?;
@@ -121,7 +120,7 @@ impl EmbeddingModel for OnnxFaceEmbedder {
             .run(ort::inputs![input_name.as_str() => tensor_ref])
             .context("running face embedder")?;
 
-        // Extract the first output as a flat Vec<f32>.
+        // Extract embedding and L2-normalise.
         let output_name = &self.session.output_names[0];
         let (_, raw_data) = outputs[output_name.as_str()]
             .try_extract_tensor::<f32>()
