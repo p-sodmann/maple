@@ -123,6 +123,14 @@ const V4: &str = "
     CREATE INDEX IF NOT EXISTS idx_face_det_person ON face_detections(person_id);
 ";
 
+// ── V5: raw companion path ─────────────────────────────────────────
+//
+// When a standard image (JPG) has a raw companion (RAF), we store the
+// raw file path alongside the display path instead of creating two rows.
+// The migration also deduplicates existing RAF+JPG pairs (done in Rust).
+
+const V5_COLUMN: &str = "ALTER TABLE images ADD COLUMN raw_path TEXT";
+
 // ── Migration runner ─────────────────────────────────────────────
 
 /// Apply all pending schema migrations to `conn`.
@@ -160,5 +168,86 @@ pub fn ensure_schema(conn: &Connection) -> anyhow::Result<()> {
         conn.execute_batch("PRAGMA user_version = 4")?;
     }
 
+    if version < 5 {
+        if let Err(e) = conn.execute_batch(V5_COLUMN) {
+            if !e.to_string().to_lowercase().contains("duplicate column") {
+                return Err(e.into());
+            }
+        }
+        dedup_raw_companions(conn)?;
+        conn.execute_batch("PRAGMA user_version = 5")?;
+    }
+
+    Ok(())
+}
+
+/// One-shot V5 migration helper: find RAF rows whose stem matches a
+/// JPG/PNG row in the same directory, move the RAF path into the JPG
+/// row's `raw_path`, and delete the RAF row (cascading AI/face data).
+fn dedup_raw_companions(conn: &Connection) -> anyhow::Result<()> {
+    use std::collections::HashMap;
+    use std::path::Path;
+
+    // Collect all rows.
+    let mut stmt = conn.prepare("SELECT id, path FROM images")?;
+    let rows: Vec<(i64, String)> = stmt
+        .query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))?
+        .filter_map(|r| r.ok())
+        .collect();
+
+    // Group by (directory, lowercase stem).
+    let mut groups: HashMap<(String, String), Vec<(i64, String)>> = HashMap::new();
+    for (id, path_str) in &rows {
+        let p = Path::new(path_str);
+        let dir = p
+            .parent()
+            .map(|d| d.to_string_lossy().to_string())
+            .unwrap_or_default();
+        let stem = p
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .map(|s| s.to_ascii_lowercase())
+            .unwrap_or_default();
+        groups
+            .entry((dir, stem))
+            .or_default()
+            .push((*id, path_str.clone()));
+    }
+
+    let mut merged = 0usize;
+    for members in groups.values() {
+        if members.len() < 2 {
+            continue;
+        }
+        // Find the display file (non-raw) and raw file(s).
+        let display = members
+            .iter()
+            .find(|(_, p)| !maple_import::is_raw_format(Path::new(p)));
+        let raws: Vec<&(i64, String)> = members
+            .iter()
+            .filter(|(_, p)| maple_import::is_raw_format(Path::new(p)))
+            .collect();
+
+        if let (Some((display_id, _)), Some((raw_id, raw_path))) =
+            (display, raws.first())
+        {
+            // Set raw_path on the display row.
+            conn.execute(
+                "UPDATE images SET raw_path = ?1 WHERE id = ?2",
+                rusqlite::params![raw_path, display_id],
+            )?;
+            // Delete the raw row (ON DELETE CASCADE handles ai_descriptions
+            // and face_detections).
+            conn.execute(
+                "DELETE FROM images WHERE id = ?1",
+                rusqlite::params![raw_id],
+            )?;
+            merged += 1;
+        }
+    }
+
+    if merged > 0 {
+        tracing::info!("V5 migration: merged {merged} raw companion(s) into display rows");
+    }
     Ok(())
 }

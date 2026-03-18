@@ -5,14 +5,15 @@
 //!
 //! * Files in the DB that no longer exist on disk → marked `missing`.
 //! * Files that are `missing` in the DB but have reappeared → marked `present`.
-//! * Image files found on disk that have no DB record → hashed and inserted.
+//! * Image groups found on disk that have no DB record → hashed and inserted
+//!   (one row per group, with `raw_path` set for any companion raw file).
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use maple_import::{content_hash, scan_images};
+use maple_import::{content_hash, scan_grouped};
 
 use crate::{Database, ImageStatus};
 
@@ -69,20 +70,25 @@ impl LibraryScanner {
                 return;
             }
         };
-        // Build a set of all paths known to the DB.
+        // Build a set of all display paths known to the DB.
         let db_path_set: HashSet<&PathBuf> = db_records.iter().map(|(p, _)| p).collect();
 
-        // ── 2. Scan the library directory on disk ────────────────
-        let found = match scan_images(dir) {
-            Ok(f) => f,
+        // ── 2. Scan the library directory on disk (grouped) ───────
+        let groups = match scan_grouped(dir) {
+            Ok(g) => g,
             Err(e) => {
                 tracing::warn!("Library scan error scanning {}: {e}", dir.display());
                 return;
             }
         };
-        // Map path → size for O(1) lookup when inserting new files.
-        let found_map: HashMap<PathBuf, u64> =
-            found.into_iter().map(|f| (f.path, f.size)).collect();
+        // Map display_path → (size, optional raw_path) for quick lookup.
+        let found_map: HashMap<PathBuf, (u64, Option<PathBuf>)> = groups
+            .into_iter()
+            .map(|g| {
+                let raw = g.companions.first().map(|c| c.path.clone());
+                (g.display.path, (g.display.size, raw))
+            })
+            .collect();
 
         // ── 3. Reconcile DB records against disk ─────────────────
         for (path, status) in &db_records {
@@ -104,19 +110,25 @@ impl LibraryScanner {
             }
         }
 
-        // ── 4. Insert newly discovered files ─────────────────────
+        // ── 4. Insert newly discovered groups ────────────────────
         let mut inserted = 0usize;
-        for (path, size) in &found_map {
-            if db_path_set.contains(path) {
+        for (display_path, (size, raw_path)) in &found_map {
+            if db_path_set.contains(display_path) {
                 continue;
             }
-            match content_hash(path) {
+            match content_hash(display_path) {
                 Ok(hash) => {
                     if let Ok(db) = self.db.lock() {
-                        if let Err(e) = db.insert_image(path, &hash, *size) {
+                        let result = db.insert_image_with_raw(
+                            display_path,
+                            &hash,
+                            *size,
+                            raw_path.as_deref(),
+                        );
+                        if let Err(e) = result {
                             tracing::warn!(
                                 "Library scan: failed to insert {}: {e}",
-                                path.display()
+                                display_path.display()
                             );
                         } else {
                             inserted += 1;
@@ -126,14 +138,14 @@ impl LibraryScanner {
                 Err(e) => {
                     tracing::warn!(
                         "Library scan: failed to hash {}: {e}",
-                        path.display()
+                        display_path.display()
                     );
                 }
             }
         }
 
         tracing::info!(
-            "Library scan complete: {} DB records, {} on disk, {} newly inserted",
+            "Library scan complete: {} DB records, {} groups on disk, {} newly inserted",
             db_records.len(),
             found_map.len(),
             inserted,

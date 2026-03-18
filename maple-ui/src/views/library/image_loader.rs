@@ -20,6 +20,7 @@ use std::time::Duration;
 use gtk4::gdk;
 use gtk4::gdk_pixbuf;
 use gtk4::glib;
+use maple_import::{is_raw_format, loadable_image_bytes};
 
 /// Raw pixel data that can safely be moved across threads.
 struct PixelBuffer {
@@ -44,7 +45,18 @@ pub fn load_image_async(
     let (tx, rx) = mpsc::channel::<PixelBuffer>();
 
     std::thread::spawn(move || {
-        let Ok(pixbuf) = gdk_pixbuf::Pixbuf::from_file(&path) else { return };
+        let pixbuf = if is_raw_format(&path) {
+            let Ok(bytes) = loadable_image_bytes(&path) else { return };
+            let stream = gtk4::gio::MemoryInputStream::from_bytes(&glib::Bytes::from(&bytes));
+            let Ok(pb) = gdk_pixbuf::Pixbuf::from_stream(&stream, gtk4::gio::Cancellable::NONE)
+            else {
+                return;
+            };
+            pb
+        } else {
+            let Ok(pb) = gdk_pixbuf::Pixbuf::from_file(&path) else { return };
+            pb
+        };
         // apply_embedded_orientation() rotates/flips according to the EXIF tag.
         // It returns None when orientation is already 1 (top-left), so fall
         // back to the original in that case.

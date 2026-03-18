@@ -71,6 +71,8 @@ pub struct ImageRecord {
 pub struct LibraryImage {
     pub id: i64,
     pub path: PathBuf,
+    /// Optional companion raw file path (e.g. the RAF for a JPG display file).
+    pub raw_path: Option<PathBuf>,
     pub added_at: i64,
     pub status: ImageStatus,
     pub meta: ImageMetadata,
@@ -103,11 +105,26 @@ impl Database {
     ///
     /// The file basename is stored immediately as `filename` so that FTS-based
     /// filename search works before full EXIF extraction runs.
+    ///
+    /// `raw_path` is the optional companion raw file (e.g. the RAF when the
+    /// display file is JPG).  Stored alongside the display path so the DB
+    /// holds one row per *image*, not per file.
     pub fn insert_image(
         &self,
         path: &Path,
         hash: &[u8; 32],
         file_size: u64,
+    ) -> anyhow::Result<()> {
+        self.insert_image_with_raw(path, hash, file_size, None)
+    }
+
+    /// Insert an image with an optional raw companion path.
+    pub fn insert_image_with_raw(
+        &self,
+        path: &Path,
+        hash: &[u8; 32],
+        file_size: u64,
+        raw_path: Option<&Path>,
     ) -> anyhow::Result<()> {
         let added_at = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -120,17 +137,29 @@ impl Database {
             .unwrap_or("")
             .to_owned();
 
+        let raw_str = raw_path.map(|p| p.to_string_lossy().to_string());
+
         self.conn.execute(
             "INSERT OR IGNORE INTO images
-                 (path, hash, file_size, added_at, status, filename)
-             VALUES (?1, ?2, ?3, ?4, 'present', ?5)",
+                 (path, hash, file_size, added_at, status, filename, raw_path)
+             VALUES (?1, ?2, ?3, ?4, 'present', ?5, ?6)",
             params![
                 path.to_string_lossy().as_ref(),
                 hash.as_slice(),
                 file_size as i64,
                 added_at,
                 filename,
+                raw_str,
             ],
+        )?;
+        Ok(())
+    }
+
+    /// Set the raw companion path on an existing image record.
+    pub fn set_raw_path(&self, id: i64, raw_path: &Path) -> anyhow::Result<()> {
+        self.conn.execute(
+            "UPDATE images SET raw_path = ?1 WHERE id = ?2",
+            params![raw_path.to_string_lossy().as_ref(), id],
         )?;
         Ok(())
     }
@@ -243,7 +272,7 @@ impl Database {
                 "SELECT DISTINCT i.id, i.path, i.added_at, i.status,
                         i.filename, i.taken_at, i.make, i.model, i.lens,
                         i.focal_length, i.aperture, i.iso,
-                        i.width, i.height, i.orientation
+                        i.width, i.height, i.orientation, i.raw_path
                  FROM images i
                  LEFT JOIN ai_descriptions ad ON ad.image_id = i.id
                  LEFT JOIN face_detections fd ON fd.image_id = i.id
@@ -273,7 +302,7 @@ impl Database {
                 "SELECT id, path, added_at, status,
                         filename, taken_at, make, model, lens,
                         focal_length, aperture, iso,
-                        width, height, orientation
+                        width, height, orientation, raw_path
                  FROM images
                  WHERE status = 'present'
                  ORDER BY added_at DESC
@@ -478,9 +507,11 @@ fn row_to_library_image(row: &rusqlite::Row<'_>) -> rusqlite::Result<LibraryImag
         height: row.get(13)?,
         orientation: row.get(14)?,
     };
+    let raw_path: Option<String> = row.get(15)?;
     Ok(LibraryImage {
         id: row.get(0)?,
         path: PathBuf::from(row.get::<_, String>(1)?),
+        raw_path: raw_path.map(PathBuf::from),
         added_at: row.get(2)?,
         status: ImageStatus::from_str(&status_str),
         meta,

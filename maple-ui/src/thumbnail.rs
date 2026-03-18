@@ -10,6 +10,8 @@ use std::fs::File;
 use std::io::{BufReader, Cursor};
 use std::path::Path;
 
+use maple_import::{is_raw_format, loadable_image_bytes};
+
 /// Generate a PNG thumbnail for the given image file.
 ///
 /// The thumbnail preserves aspect ratio with the longest edge ≤ `max_size` pixels.
@@ -21,15 +23,23 @@ use std::path::Path;
 pub fn generate_thumbnail(path: &Path, max_size: u32) -> anyhow::Result<Vec<u8>> {
     let size = max_size as i32;
 
-    // Load at reduced resolution — gdk-pixbuf tells libjpeg to use
-    // IDCT scaling (1/2, 1/4, 1/8) when possible, vastly reducing work.
-    let pixbuf = gtk4::gdk_pixbuf::Pixbuf::from_file_at_scale(
-        path,
-        size,
-        size,
-        true, // preserve aspect ratio
-    )
-    .map_err(|e| anyhow::anyhow!("Failed to decode {}: {}", path.display(), e))?;
+    let pixbuf = if is_raw_format(path) {
+        // Raw files: extract embedded JPEG preview, decode from memory.
+        let bytes = loadable_image_bytes(path)?;
+        let stream = gtk4::gio::MemoryInputStream::from_bytes(&gtk4::glib::Bytes::from(&bytes));
+        gtk4::gdk_pixbuf::Pixbuf::from_stream_at_scale(
+            &stream,
+            size,
+            size,
+            true,
+            gtk4::gio::Cancellable::NONE,
+        )
+        .map_err(|e| anyhow::anyhow!("Failed to decode {}: {}", path.display(), e))?
+    } else {
+        // Standard formats: load directly from file for optimal DCT downscaling.
+        gtk4::gdk_pixbuf::Pixbuf::from_file_at_scale(path, size, size, true)
+            .map_err(|e| anyhow::anyhow!("Failed to decode {}: {}", path.display(), e))?
+    };
 
     // Apply EXIF orientation (rotation/flip).
     let pixbuf = pixbuf.apply_embedded_orientation().unwrap_or(pixbuf);

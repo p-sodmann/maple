@@ -26,6 +26,8 @@ use gtk4::prelude::*;
 use libadwaita as adw;
 use adw::prelude::*;
 
+use maple_import::loadable_image_bytes;
+
 use crate::thumbnail::generate_thumbnail;
 
 // ── Thumbnail size constants ────────────────────────────────────
@@ -40,6 +42,7 @@ enum ScanMsg {
     Thumb {
         index: usize,
         path: PathBuf,
+        companions: Vec<PathBuf>,
         png_bytes: Vec<u8>,
         content_hash: [u8; 32],
         imported: bool,
@@ -62,19 +65,31 @@ struct FullResMsg {
 /// Message from the background copy worker to the UI thread.
 enum CopyMsg {
     Progress { done: usize, total: usize },
-    /// Carries the full summary and the (source_path, hash) pairs in the same
-    /// order as the copy results, so the UI thread can insert DB records.
+    /// Carries the full summary and per-group info for DB insertion.
     Finished {
         summary: maple_import::CopySummary,
-        source_infos: Vec<(PathBuf, [u8; 32])>,
+        /// One entry per source file: `(display_hash, is_display_file)`.
+        /// The copy results and this vec share the same order/length.
+        copy_file_info: Vec<CopyFileInfo>,
     },
     Error(String),
+}
+
+/// Metadata about one file in the flat copy list.
+#[derive(Clone)]
+struct CopyFileInfo {
+    /// BLAKE3 hash of the *display* file for this group.
+    display_hash: [u8; 32],
+    /// Whether this file is the display file (JPG) or a companion (RAF).
+    is_display: bool,
 }
 
 // ── Per-image data stored on the UI thread ──────────────────────
 
 struct ImageEntry {
     path: PathBuf,
+    /// Companion files (e.g. RAF when display is JPG).
+    companions: Vec<PathBuf>,
     texture: Option<gdk::Texture>,
     content_hash: [u8; 32],
     imported: bool,
@@ -111,6 +126,8 @@ struct BrowserState {
     rejected_set: Arc<Mutex<maple_state::SeenSet>>,
     /// Directory where library data files are read/written.
     library_dir: PathBuf,
+    /// What to include when copying (all files / raw only / display only).
+    copy_mode: maple_import::CopyMode,
 }
 
 impl BrowserState {
@@ -138,6 +155,7 @@ impl BrowserState {
             imported_set: Arc::new(Mutex::new(maple_state::SeenSet::load_imported(&library_dir))),
             rejected_set: Arc::new(Mutex::new(maple_state::SeenSet::load_rejected(&library_dir))),
             library_dir,
+            copy_mode: maple_import::CopyMode::default(),
         }
     }
 
@@ -209,8 +227,6 @@ pub fn build_browser_page(
 ) -> adw::NavigationPage {
     let settings = maple_state::Settings::load();
 
-    // Start the background scanner for the destination directory.
-    maple_db::LibraryScanner::new(db.clone(), destination.to_path_buf()).spawn();
     let (fullres_tx, fullres_rx) = mpsc::channel::<FullResMsg>();
     let state = Rc::new(RefCell::new(BrowserState::new(
         fullres_tx,
@@ -329,6 +345,16 @@ pub fn build_browser_page(
         .build();
     copy_btn.add_css_class("suggested-action");
     header.pack_start(&copy_btn);
+
+    // ── Copy mode dropdown (what files to include when copying) ──
+    let copy_mode_dropdown = gtk4::DropDown::from_strings(&[
+        "Copy all (JPG+RAW)",
+        "Copy RAW only",
+        "Copy JPG only",
+    ]);
+    copy_mode_dropdown.set_selected(0);
+    copy_mode_dropdown.set_tooltip_text(Some("Choose which files to copy for paired JPG+RAW images"));
+    header.pack_start(&copy_mode_dropdown);
 
     let filter_btn = gtk4::ToggleButton::builder()
         .label("Hide seen")
@@ -502,6 +528,19 @@ pub fn build_browser_page(
         });
     }
 
+    // ── Copy mode dropdown handler ────────────────────────────
+    {
+        let state = state.clone();
+        copy_mode_dropdown.connect_selected_notify(move |dd| {
+            let mode = match dd.selected() {
+                1 => maple_import::CopyMode::RawOnly,
+                2 => maple_import::CopyMode::DisplayOnly,
+                _ => maple_import::CopyMode::All,
+            };
+            state.borrow_mut().copy_mode = mode;
+        });
+    }
+
     // ── Scroll-to-zoom on preview ───────────────────────────────
     {
         let state = state.clone();
@@ -565,27 +604,46 @@ pub fn build_browser_page(
                 return;
             }
 
-            // Build (source_path, hash) pairs sorted by path so they align
-            // with the copy results that copy_images produces in source order.
-            let mut source_infos: Vec<(PathBuf, [u8; 32])> = st
-                .selected
-                .iter()
-                .filter_map(|&i| {
-                    let path = &st.images[i].path;
-                    if path.as_os_str().is_empty() {
-                        None
-                    } else {
-                        Some((path.clone(), st.images[i].content_hash))
-                    }
-                })
-                .collect();
-            source_infos.sort_by(|a, b| a.0.cmp(&b.0));
-            let sources: Vec<PathBuf> = source_infos.iter().map(|(p, _)| p.clone()).collect();
+            // Build the list of files to copy, respecting copy_mode.
+            // copy_file_info tracks per-file metadata so the DB insertion
+            // knows which dest paths are display files vs raw companions.
+            let copy_mode = st.copy_mode;
+            let mut sources: Vec<PathBuf> = Vec::new();
+            let mut copy_file_info: Vec<CopyFileInfo> = Vec::new();
+            let mut copied_hashes: Vec<[u8; 32]> = Vec::new();
+            for &i in &st.selected {
+                let entry = &st.images[i];
+                if entry.path.as_os_str().is_empty() {
+                    continue;
+                }
+                let group = maple_import::ImageGroup {
+                    display: maple_import::ImageFile {
+                        path: entry.path.clone(),
+                        size: 0,
+                    },
+                    companions: entry
+                        .companions
+                        .iter()
+                        .map(|p| maple_import::ImageFile {
+                            path: p.clone(),
+                            size: 0,
+                        })
+                        .collect(),
+                };
+                let paths = group.paths_for_copy(copy_mode);
+                let display_path = &entry.path;
+                for p in &paths {
+                    copy_file_info.push(CopyFileInfo {
+                        display_hash: entry.content_hash,
+                        is_display: p == display_path,
+                    });
+                }
+                sources.extend(paths);
+                copied_hashes.push(entry.content_hash);
+            }
 
             let destination = st.destination.clone();
             let copied_indices: Vec<usize> = st.selected.iter().copied().collect();
-            // Hashes in the same sorted order as sources (for SeenSet update).
-            let copied_hashes: Vec<[u8; 32]> = source_infos.iter().map(|(_, h)| *h).collect();
             drop(st);
 
             // Disable button during copy.
@@ -596,16 +654,18 @@ pub fn build_browser_page(
 
             let (copy_tx, copy_rx) = mpsc::channel::<CopyMsg>();
 
+            let folder_format = maple_state::Settings::load().folder_format;
+
             // Background thread for the copy.
             std::thread::spawn(move || {
-                let result = maple_import::copy_images(&sources, &destination, |done, total| {
+                let result = maple_import::copy_images(&sources, &destination, &folder_format, |done, total| {
                     let _ = copy_tx.send(CopyMsg::Progress { done, total });
                 });
                 match result {
                     Ok(summary) => {
                         let _ = copy_tx.send(CopyMsg::Finished {
                             summary,
-                            source_infos,
+                            copy_file_info,
                         });
                     }
                     Err(e) => {
@@ -633,7 +693,7 @@ pub fn build_browser_page(
                                 )));
                             }
                         }
-                        CopyMsg::Finished { summary, source_infos } => {
+                        CopyMsg::Finished { summary, copy_file_info } => {
                             let (copied, failed) = (summary.copied, summary.failed);
                             let msg = if failed == 0 {
                                 format!("Copied {copied} image{}", if copied == 1 { "" } else { "s" })
@@ -643,18 +703,43 @@ pub fn build_browser_page(
                             toast_overlay.add_toast(adw::Toast::new(&msg));
 
                             // Insert successfully copied files into the library DB.
+                            // Only display files get a DB row; raw companions are
+                            // stored as `raw_path` on the display row.
                             if let Ok(db_guard) = db.lock() {
-                                for ((_, hash), result) in
-                                    source_infos.iter().zip(summary.results.iter())
+                                // First pass: collect dest paths for raw companions
+                                // keyed by display_hash so we can attach them.
+                                let mut raw_dest_paths: HashMap<[u8; 32], PathBuf> = HashMap::new();
+                                for (info, result) in
+                                    copy_file_info.iter().zip(summary.results.iter())
                                 {
+                                    if let maple_import::CopyResult::Ok(dest_path) = result {
+                                        if !info.is_display {
+                                            raw_dest_paths
+                                                .insert(info.display_hash, dest_path.clone());
+                                        }
+                                    }
+                                }
+
+                                // Second pass: insert display files with raw_path.
+                                for (info, result) in
+                                    copy_file_info.iter().zip(summary.results.iter())
+                                {
+                                    if !info.is_display {
+                                        continue;
+                                    }
                                     if let maple_import::CopyResult::Ok(dest_path) = result {
                                         let file_size = dest_path
                                             .metadata()
                                             .map(|m| m.len())
                                             .unwrap_or(0);
-                                        if let Err(e) =
-                                            db_guard.insert_image(dest_path, hash, file_size)
-                                        {
+                                        let raw_path =
+                                            raw_dest_paths.get(&info.display_hash);
+                                        if let Err(e) = db_guard.insert_image_with_raw(
+                                            dest_path,
+                                            &info.display_hash,
+                                            file_size,
+                                            raw_path.map(|p| p.as_path()),
+                                        ) {
                                             tracing::warn!(
                                                 "Failed to insert {} into library DB: {e}",
                                                 dest_path.display()
@@ -908,7 +993,7 @@ fn update_preview(
     for (i, path) in to_load {
         let tx = fullres_tx.clone();
         std::thread::spawn(move || {
-            match std::fs::read(&path) {
+            match loadable_image_bytes(&path) {
                 Ok(file_bytes) => {
                     if let Ok(tx) = tx.lock() {
                         let _ = tx.send(FullResMsg {
@@ -1075,36 +1160,37 @@ fn start_scan(
     let imported_set = state.borrow().imported_set.clone();
     let rejected_set = state.borrow().rejected_set.clone();
 
-    // Worker thread: scan, generate thumbnails, and check seen status
+    // Worker thread: scan, generate thumbnails, and check seen status.
+    // Uses scan_grouped so that JPG+RAF pairs are shown as a single entry.
     std::thread::spawn(move || {
-        match maple_import::scan_images(&source) {
-            Ok(images) => {
-                let total = images.len();
+        match maple_import::scan_grouped(&source) {
+            Ok(groups) => {
+                let total = groups.len();
                 let _ = sender.send(ScanMsg::Count(total));
 
                 let parallelism = std::thread::available_parallelism()
                     .map(|n| n.get())
                     .unwrap_or(4);
 
-                let indexed: Vec<_> = images
-                    .into_iter()
-                    .enumerate()
-                    .map(|(i, img)| (img, i))
-                    .collect();
-
                 std::thread::scope(|scope| {
-                    let chunk_size = (indexed.len() / parallelism).max(1);
                     let sender = &sender;
                     let imported_set = &imported_set;
                     let rejected_set = &rejected_set;
+                    let groups = &groups;
 
-                    for chunk in indexed.chunks(chunk_size) {
+                    // Round-robin: thread T processes groups T, T+P, T+2P, …
+                    // so all threads start near the beginning of the list and
+                    // thumbnails arrive roughly in order.
+                    for thread_id in 0..parallelism {
                         scope.spawn(move || {
-                            for (img, idx) in chunk {
-                                match generate_thumbnail(&img.path, THUMB_SIZE) {
+                            let mut idx = thread_id;
+                            while idx < groups.len() {
+                                let group = &groups[idx];
+                                let display_path = &group.display.path;
+                                match generate_thumbnail(display_path, THUMB_SIZE) {
                                     Ok(bytes) => {
                                         let (content_hash, imported, rejected) =
-                                            match maple_import::content_hash(&img.path) {
+                                            match maple_import::content_hash(display_path) {
                                                 Ok(hash) => {
                                                     let imported = imported_set
                                                         .lock()
@@ -1119,8 +1205,13 @@ fn start_scan(
                                                 Err(_) => ([0u8; 32], false, false),
                                             };
                                         let _ = sender.send(ScanMsg::Thumb {
-                                            index: *idx,
-                                            path: img.path.clone(),
+                                            index: idx,
+                                            path: display_path.clone(),
+                                            companions: group
+                                                .companions
+                                                .iter()
+                                                .map(|c| c.path.clone())
+                                                .collect(),
                                             png_bytes: bytes,
                                             content_hash,
                                             imported,
@@ -1130,10 +1221,11 @@ fn start_scan(
                                     Err(e) => {
                                         tracing::warn!(
                                             "Thumbnail failed for {}: {e}",
-                                            img.path.display()
+                                            display_path.display()
                                         );
                                     }
                                 }
+                                idx += parallelism;
                             }
                         });
                     }
@@ -1175,6 +1267,7 @@ fn start_scan(
                     for _ in 0..n {
                         st.images.push(ImageEntry {
                             path: PathBuf::new(),
+                            companions: Vec::new(),
                             texture: None,
                             content_hash: [0u8; 32],
                             imported: false,
@@ -1190,6 +1283,7 @@ fn start_scan(
                 ScanMsg::Thumb {
                     index,
                     path,
+                    companions,
                     png_bytes,
                     content_hash,
                     imported,
@@ -1210,6 +1304,7 @@ fn start_scan(
                         if index < st.images.len() {
                             st.images[index] = ImageEntry {
                                 path: path.clone(),
+                                companions,
                                 texture: Some(texture.clone()),
                                 content_hash,
                                 imported,

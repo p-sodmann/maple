@@ -17,8 +17,11 @@
 
 use std::path::Path;
 
+use std::io::Cursor;
+
 use anyhow::{Context, Result};
 use image::{DynamicImage, ImageDecoder, ImageReader};
+use maple_import::{is_raw_format, loadable_image_bytes};
 use ndarray::{s, Array3, Array4, ArrayView2, ArrayView4, Ix3};
 use tracing::{debug, info};
 
@@ -83,14 +86,30 @@ impl DetectionModel for OnnxFaceDetector {
 
         // ── Load image and explicitly apply EXIF orientation ───────────────
         // Keep orientation handling explicit so detector and UI use the same basis.
-        let mut decoder = ImageReader::open(path)
-            .with_context(|| format!("opening image: {}", path.display()))?
-            .into_decoder()
-            .with_context(|| format!("decoding image header: {}", path.display()))?;
-        let orientation = decoder.orientation().context("reading EXIF orientation")?;
-        let mut dyn_img = DynamicImage::from_decoder(decoder).context("decoding image")?;
-        dyn_img.apply_orientation(orientation);
-        let img = dyn_img.to_rgb8();
+        // For raw files (RAF), decode from the embedded JPEG preview bytes.
+        let img = if is_raw_format(path) {
+            let bytes = loadable_image_bytes(path)?;
+            let reader = ImageReader::new(Cursor::new(bytes))
+                .with_guessed_format()
+                .with_context(|| format!("guessing format for raw preview: {}", path.display()))?;
+            let mut decoder = reader
+                .into_decoder()
+                .with_context(|| format!("decoding image header: {}", path.display()))?;
+            let orientation = decoder.orientation().context("reading EXIF orientation")?;
+            let mut dyn_img = DynamicImage::from_decoder(decoder).context("decoding image")?;
+            dyn_img.apply_orientation(orientation);
+            dyn_img.to_rgb8()
+        } else {
+            let reader = ImageReader::open(path)
+                .with_context(|| format!("opening image: {}", path.display()))?;
+            let mut decoder = reader
+                .into_decoder()
+                .with_context(|| format!("decoding image header: {}", path.display()))?;
+            let orientation = decoder.orientation().context("reading EXIF orientation")?;
+            let mut dyn_img = DynamicImage::from_decoder(decoder).context("decoding image")?;
+            dyn_img.apply_orientation(orientation);
+            dyn_img.to_rgb8()
+        };
         let (orig_w, orig_h) = (img.width(), img.height());
 
         // ── Optionally resize oversized images, preserving aspect ratio ──

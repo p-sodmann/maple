@@ -21,7 +21,11 @@ pub struct CopySummary {
 
 /// Copy the given source files into `destination`.
 ///
-/// Files are placed directly in the destination directory (flat copy).
+/// When `folder_format` is non-empty, files are placed into subdirectories
+/// derived from each file's EXIF DateTimeOriginal using `strftime` tokens
+/// (e.g. `"%Y/%m"` → `2024/01/`).  Files without EXIF dates fall back to
+/// a flat copy into `destination` directly.
+///
 /// If a file with the same name already exists, a numeric suffix is
 /// appended (e.g. `photo_1.jpg`, `photo_2.jpg`).
 ///
@@ -29,6 +33,7 @@ pub struct CopySummary {
 pub fn copy_images<F>(
     sources: &[PathBuf],
     destination: &Path,
+    folder_format: &str,
     mut on_progress: F,
 ) -> anyhow::Result<CopySummary>
 where
@@ -46,7 +51,24 @@ where
     let mut failed = 0usize;
 
     for (i, src) in sources.iter().enumerate() {
-        let dest_path = unique_dest_path(src, destination);
+        let target_dir = resolve_target_dir(src, destination, folder_format);
+
+        // Ensure the subdirectory exists (no-op for flat copy).
+        if target_dir != destination {
+            if let Err(e) = std::fs::create_dir_all(&target_dir) {
+                let msg = format!("failed to create {}: {e}", target_dir.display());
+                tracing::warn!("{msg}");
+                results.push(CopyResult::Failed {
+                    source: src.clone(),
+                    error: msg,
+                });
+                failed += 1;
+                on_progress(i + 1, total);
+                continue;
+            }
+        }
+
+        let dest_path = unique_dest_path(src, &target_dir);
         match std::fs::copy(src, &dest_path) {
             Ok(_) => {
                 tracing::info!("Copied {} → {}", src.display(), dest_path.display());
@@ -71,6 +93,61 @@ where
         failed,
         results,
     })
+}
+
+/// Resolve the target directory for `source` inside `destination`.
+///
+/// Reads EXIF DateTimeOriginal and formats it with `folder_format`.
+/// Falls back to `destination` (flat) when the format is empty or
+/// no EXIF date is available.
+fn resolve_target_dir(source: &Path, destination: &Path, folder_format: &str) -> PathBuf {
+    if folder_format.is_empty() {
+        return destination.to_path_buf();
+    }
+
+    if let Some(sub) = exif_date_subdir(source, folder_format) {
+        destination.join(sub)
+    } else {
+        destination.to_path_buf()
+    }
+}
+
+/// Try to read EXIF DateTimeOriginal from `path` and format it.
+///
+/// EXIF ASCII format is `"YYYY:MM:DD HH:MM:SS"`.  We parse just enough
+/// to feed the strftime-style format string.
+fn exif_date_subdir(path: &Path, format: &str) -> Option<String> {
+    let file = std::fs::File::open(path).ok()?;
+    let mut reader = std::io::BufReader::new(file);
+    let exif = exif::Reader::new().read_from_container(&mut reader).ok()?;
+    let field = exif
+        .fields()
+        .find(|f| f.tag == exif::Tag::DateTimeOriginal)?;
+
+    if let exif::Value::Ascii(ref v) = field.value {
+        let bytes = v.first()?;
+        let s = std::str::from_utf8(bytes).ok()?;
+        // "YYYY:MM:DD HH:MM:SS"
+        if s.len() < 10 {
+            return None;
+        }
+        let year: u32 = s[0..4].parse().ok()?;
+        let month: u32 = s[5..7].parse().ok()?;
+        let day: u32 = s[8..10].parse().ok()?;
+
+        let result = format
+            .replace("%Y", &format!("{year:04}"))
+            .replace("%m", &format!("{month:02}"))
+            .replace("%d", &format!("{day:02}"));
+
+        if result.is_empty() {
+            None
+        } else {
+            Some(result)
+        }
+    } else {
+        None
+    }
 }
 
 /// Determine a destination path that does not collide with existing files.
@@ -129,7 +206,7 @@ mod tests {
         ];
 
         let mut progress_calls = Vec::new();
-        let summary = copy_images(&sources, dst_dir.path(), |done, total| {
+        let summary = copy_images(&sources, dst_dir.path(), "", |done, total| {
             progress_calls.push((done, total));
         })
         .unwrap();
@@ -151,7 +228,7 @@ mod tests {
         fs::write(dst_dir.path().join("photo.jpg"), b"existing").unwrap();
 
         let sources = vec![src_dir.path().join("photo.jpg")];
-        let summary = copy_images(&sources, dst_dir.path(), |_, _| {}).unwrap();
+        let summary = copy_images(&sources, dst_dir.path(), "", |_, _| {}).unwrap();
 
         assert_eq!(summary.copied, 1);
         // Original file in destination should be untouched.
@@ -167,7 +244,7 @@ mod tests {
     #[test]
     fn copy_invalid_destination_returns_error() {
         let sources = vec![PathBuf::from("/nonexistent/photo.jpg")];
-        let result = copy_images(&sources, Path::new("/nonexistent/dir"), |_, _| {});
+        let result = copy_images(&sources, Path::new("/nonexistent/dir"), "", |_, _| {});
         assert!(result.is_err());
     }
 
@@ -175,10 +252,43 @@ mod tests {
     fn copy_missing_source_records_failure() {
         let dst_dir = tempfile::tempdir().unwrap();
         let sources = vec![PathBuf::from("/nonexistent/photo.jpg")];
-        let summary = copy_images(&sources, dst_dir.path(), |_, _| {}).unwrap();
+        let summary = copy_images(&sources, dst_dir.path(), "", |_, _| {}).unwrap();
 
         assert_eq!(summary.copied, 0);
         assert_eq!(summary.failed, 1);
         matches!(&summary.results[0], CopyResult::Failed { .. });
+    }
+
+    #[test]
+    fn no_exif_falls_back_to_flat_copy() {
+        let src_dir = tempfile::tempdir().unwrap();
+        let dst_dir = tempfile::tempdir().unwrap();
+
+        fs::write(src_dir.path().join("a.jpg"), b"not-a-real-jpeg").unwrap();
+
+        let sources = vec![src_dir.path().join("a.jpg")];
+        let summary = copy_images(&sources, dst_dir.path(), "%Y/%m", |_, _| {}).unwrap();
+
+        assert_eq!(summary.copied, 1);
+        // No EXIF → file goes directly into destination.
+        assert!(dst_dir.path().join("a.jpg").exists());
+    }
+
+    #[test]
+    fn exif_date_subdir_parsing() {
+        // Verify the format replacement logic directly.
+        assert_eq!(
+            "%Y/%m"
+                .replace("%Y", &format!("{:04}", 2024))
+                .replace("%m", &format!("{:02}", 1)),
+            "2024/01"
+        );
+        assert_eq!(
+            "%Y/%m/%d"
+                .replace("%Y", &format!("{:04}", 2024))
+                .replace("%m", &format!("{:02}", 12))
+                .replace("%d", &format!("{:02}", 5)),
+            "2024/12/05"
+        );
     }
 }

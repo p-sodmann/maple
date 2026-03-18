@@ -26,6 +26,10 @@ pub fn build_window(app: &adw::Application) -> adw::ApplicationWindow {
         }
     };
 
+    // Start the background library scanner immediately so the DB stays
+    // in sync with the library directory from the moment the app launches.
+    maple_db::LibraryScanner::new(db.clone(), settings.library_dir).spawn();
+
     let toast_overlay = adw::ToastOverlay::new();
     let nav_view = adw::NavigationView::new();
 

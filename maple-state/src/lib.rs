@@ -258,6 +258,11 @@ pub struct Settings {
     /// Defaults to `~/.config/maple/library.db`.
     #[serde(default = "Settings::default_database_path")]
     pub database_path: PathBuf,
+    /// `strftime`-style format string for organising imported files into
+    /// subdirectories based on EXIF date.  Set to an empty string to
+    /// disable (flat copy).  Defaults to `"%Y/%m"` → `2024/01/`.
+    #[serde(default = "Settings::default_folder_format")]
+    pub folder_format: String,
     /// AI image description settings.
     #[serde(default)]
     pub ai: AiSettings,
@@ -277,6 +282,10 @@ impl Settings {
 
     fn default_database_path() -> PathBuf {
         config_dir().join("library.db")
+    }
+
+    fn default_folder_format() -> String {
+        "%Y/%m".into()
     }
 
     /// Load settings from the default config path.
@@ -320,6 +329,7 @@ impl Default for Settings {
             preview_buffer_size: Self::default_preview_buffer_size(),
             library_dir: Self::default_library_dir(),
             database_path: Self::default_database_path(),
+            folder_format: Self::default_folder_format(),
             ai: AiSettings::default(),
             face: FaceSettings::default(),
         }

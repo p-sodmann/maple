@@ -17,6 +17,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use base64::{engine::general_purpose::STANDARD, Engine as _};
+use maple_import::loadable_image_bytes;
 use tracing::{info, warn};
 
 use crate::Database;
@@ -80,7 +81,7 @@ impl AiDescriber for LmStudioDescriber {
     }
 
     fn describe_image(&self, path: &Path) -> anyhow::Result<String> {
-        let bytes = std::fs::read(path)?;
+        let bytes = loadable_image_bytes(path)?;
         let mime = mime_type_for_path(path);
         let data_url = format!("data:{mime};base64,{}", STANDARD.encode(&bytes));
 
@@ -126,6 +127,7 @@ fn mime_type_for_path(path: &Path) -> &'static str {
         Some("gif") => "image/gif",
         Some("webp") => "image/webp",
         Some("tiff") | Some("tif") => "image/tiff",
+        Some("raf") => "image/jpeg", // embedded JPEG preview
         _ => "image/jpeg",
     }
 }

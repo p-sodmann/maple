@@ -9,11 +9,12 @@
 //! existed (i.e. `filename IS NULL` in the DB).
 
 use std::fs::File;
-use std::io::BufReader;
+use std::io::{BufReader, Cursor};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 use exif::{Tag, Value};
+use maple_import::{is_raw_format, loadable_image_bytes};
 
 use crate::Database;
 
@@ -48,13 +49,25 @@ pub fn extract_metadata(path: &Path) -> ImageMetadata {
         .and_then(|n| n.to_str())
         .map(ToOwned::to_owned);
 
-    let Ok(file) = File::open(path) else {
-        return ImageMetadata { filename, ..Default::default() };
-    };
-
-    let mut reader = BufReader::new(file);
-    let Ok(exif) = exif::Reader::new().read_from_container(&mut reader) else {
-        return ImageMetadata { filename, ..Default::default() };
+    // For raw files, read EXIF from the embedded JPEG preview.
+    let exif = if is_raw_format(path) {
+        let Ok(bytes) = loadable_image_bytes(path) else {
+            return ImageMetadata { filename, ..Default::default() };
+        };
+        let mut cursor = Cursor::new(bytes);
+        match exif::Reader::new().read_from_container(&mut cursor) {
+            Ok(e) => e,
+            Err(_) => return ImageMetadata { filename, ..Default::default() },
+        }
+    } else {
+        let Ok(file) = File::open(path) else {
+            return ImageMetadata { filename, ..Default::default() };
+        };
+        let mut reader = BufReader::new(file);
+        match exif::Reader::new().read_from_container(&mut reader) {
+            Ok(e) => e,
+            Err(_) => return ImageMetadata { filename, ..Default::default() },
+        }
     };
 
     // ── Helper closures that search all IFDs ─────────────────────

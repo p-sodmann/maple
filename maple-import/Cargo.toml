@@ -9,6 +9,7 @@ tokio = { workspace = true }
 blake3 = { workspace = true }
 anyhow = { workspace = true }
 tracing = { workspace = true }
+kamadak-exif = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
