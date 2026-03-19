@@ -43,7 +43,6 @@ impl OnnxSession {
         let builder = ort::session::builder::SessionBuilder::new()
             .context("creating ort session builder")?;
 
-        info!("step2");
         // Level1 = basic intra-node fusions only; much faster to load than
         // the default All/Level3 without measurable inference slowdown on CPU.
         let builder = builder

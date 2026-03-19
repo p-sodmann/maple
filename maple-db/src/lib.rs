@@ -8,6 +8,7 @@
 
 mod scanner;
 mod schema;
+pub mod worker;
 
 pub mod ai;
 pub mod face_detector;
@@ -25,7 +26,23 @@ pub use scanner::LibraryScanner;
 
 use rusqlite::{params, Connection};
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, MutexGuard};
 use std::time::{SystemTime, UNIX_EPOCH};
+
+/// Lock the database mutex, recovering from poison.
+///
+/// A poisoned mutex means another thread panicked while holding the lock.
+/// The SQLite connection itself remains valid, so we log and continue
+/// rather than propagating the panic.
+pub fn lock_db(db: &Mutex<Database>) -> MutexGuard<'_, Database> {
+    match db.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => {
+            tracing::warn!("DB mutex was poisoned — recovering");
+            poisoned.into_inner()
+        }
+    }
+}
 
 // ── Status ───────────────────────────────────────────────────────
 
@@ -225,95 +242,109 @@ impl Database {
     ///   least one of: filename, make, model, lens, any AI description, or
     ///   any assigned person name.
     pub fn search_images(&self, query: &SearchQuery) -> anyhow::Result<Vec<LibraryImage>> {
-        let limit = query.limit.unwrap_or(500) as i64;
-        let offset = query.offset.unwrap_or(0) as i64;
+        match &query.text {
+            Some(text) => self.search_images_text(text, query.limit, query.offset),
+            None => self.search_images_all(query.limit, query.offset),
+        }
+    }
 
-        let rows: Vec<LibraryImage> = if let Some(ref text) = query.text {
-            // Build one LIKE pattern per space-separated token.
-            let like_patterns: Vec<String> = text
-                .split_whitespace()
-                .map(|t| {
-                    let escaped = t
-                        .to_lowercase()
-                        .replace('\\', "\\\\")
-                        .replace('%', "\\%")
-                        .replace('_', "\\_");
-                    format!("%{escaped}%")
-                })
-                .collect();
+    /// Return all present images, newest-first.
+    fn search_images_all(
+        &self,
+        limit: Option<usize>,
+        offset: Option<usize>,
+    ) -> anyhow::Result<Vec<LibraryImage>> {
+        let limit = limit.unwrap_or(500) as i64;
+        let offset = offset.unwrap_or(0) as i64;
+        let mut stmt = self.conn.prepare(
+            "SELECT id, path, added_at, status,
+                    filename, taken_at, make, model, lens,
+                    focal_length, aperture, iso,
+                    width, height, orientation, raw_path
+             FROM images
+             WHERE status = 'present'
+             ORDER BY added_at DESC
+             LIMIT ?1 OFFSET ?2",
+        )?;
+        let rows = stmt
+            .query_map(params![limit, offset], row_to_library_image)?
+            .filter_map(|r| r.ok())
+            .collect();
+        Ok(rows)
+    }
 
-            if like_patterns.is_empty() {
-                return Ok(vec![]);
-            }
+    /// Search present images by text tokens (AND logic).
+    ///
+    /// Each whitespace-delimited token must appear in at least one of:
+    /// EXIF fields, AI descriptions, or assigned person names.
+    fn search_images_text(
+        &self,
+        text: &str,
+        limit: Option<usize>,
+        offset: Option<usize>,
+    ) -> anyhow::Result<Vec<LibraryImage>> {
+        let limit = limit.unwrap_or(500) as i64;
+        let offset = offset.unwrap_or(0) as i64;
 
-            // Each token must match somewhere in the combined EXIF fields OR
-            // in any AI description OR in any assigned person name.
-            let exif_expr =
-                "LOWER(COALESCE(i.filename,'') || ' ' || \
-                       COALESCE(i.make,'')     || ' ' || \
-                       COALESCE(i.model,'')    || ' ' || \
-                       COALESCE(i.lens,''))";
-            let ai_expr     = "LOWER(COALESCE(ad.description,''))";
-            let person_expr = "LOWER(COALESCE(p.name,''))";
+        let like_patterns: Vec<String> = text
+            .split_whitespace()
+            .map(|t| format!("%{}%", escape_like_token(t)))
+            .collect();
 
-            let token_conditions: String = like_patterns
-                .iter()
-                .map(|_| {
-                    format!(
-                        "({exif_expr} LIKE ? ESCAPE '\\' \
-                          OR {ai_expr} LIKE ? ESCAPE '\\' \
-                          OR {person_expr} LIKE ? ESCAPE '\\')"
-                    )
-                })
-                .collect::<Vec<_>>()
-                .join(" AND ");
+        if like_patterns.is_empty() {
+            return Ok(vec![]);
+        }
 
-            let sql = format!(
-                "SELECT DISTINCT i.id, i.path, i.added_at, i.status,
-                        i.filename, i.taken_at, i.make, i.model, i.lens,
-                        i.focal_length, i.aperture, i.iso,
-                        i.width, i.height, i.orientation, i.raw_path
-                 FROM images i
-                 LEFT JOIN ai_descriptions ad ON ad.image_id = i.id
-                 LEFT JOIN face_detections fd ON fd.image_id = i.id
-                 LEFT JOIN persons p ON p.id = fd.person_id
-                 WHERE i.status = 'present'
-                   AND {token_conditions}
-                 ORDER BY i.added_at DESC
-                 LIMIT ? OFFSET ?"
-            );
+        // Each token must match somewhere in the combined EXIF fields OR
+        // in any AI description OR in any assigned person name.
+        let exif_expr =
+            "LOWER(COALESCE(i.filename,'') || ' ' || \
+                   COALESCE(i.make,'')     || ' ' || \
+                   COALESCE(i.model,'')    || ' ' || \
+                   COALESCE(i.lens,''))";
+        let ai_expr = "LOWER(COALESCE(ad.description,''))";
+        let person_expr = "LOWER(COALESCE(p.name,''))";
 
-            // Each token pattern appears three times: EXIF, AI desc, person name.
-            use rusqlite::types::Value;
-            let params: Vec<Value> = like_patterns
-                .into_iter()
-                .flat_map(|p| [Value::Text(p.clone()), Value::Text(p.clone()), Value::Text(p)])
-                .chain([Value::Integer(limit), Value::Integer(offset)])
-                .collect();
+        let token_conditions: String = like_patterns
+            .iter()
+            .map(|_| {
+                format!(
+                    "({exif_expr} LIKE ? ESCAPE '\\' \
+                      OR {ai_expr} LIKE ? ESCAPE '\\' \
+                      OR {person_expr} LIKE ? ESCAPE '\\')"
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(" AND ");
 
-            let mut stmt = self.conn.prepare(&sql)?;
-            let rows: Vec<LibraryImage> = stmt
-                .query_map(rusqlite::params_from_iter(params), row_to_library_image)?
-                .filter_map(|r| r.ok())
-                .collect();
-            rows
-        } else {
-            let mut stmt = self.conn.prepare(
-                "SELECT id, path, added_at, status,
-                        filename, taken_at, make, model, lens,
-                        focal_length, aperture, iso,
-                        width, height, orientation, raw_path
-                 FROM images
-                 WHERE status = 'present'
-                 ORDER BY added_at DESC
-                 LIMIT ?1 OFFSET ?2",
-            )?;
-            let rows: Vec<LibraryImage> = stmt
-                .query_map(params![limit, offset], row_to_library_image)?
-                .filter_map(|r| r.ok())
-                .collect();
-            rows
-        };
+        let sql = format!(
+            "SELECT DISTINCT i.id, i.path, i.added_at, i.status,
+                    i.filename, i.taken_at, i.make, i.model, i.lens,
+                    i.focal_length, i.aperture, i.iso,
+                    i.width, i.height, i.orientation, i.raw_path
+             FROM images i
+             LEFT JOIN ai_descriptions ad ON ad.image_id = i.id
+             LEFT JOIN face_detections fd ON fd.image_id = i.id
+             LEFT JOIN persons p ON p.id = fd.person_id
+             WHERE i.status = 'present'
+               AND {token_conditions}
+             ORDER BY i.added_at DESC
+             LIMIT ? OFFSET ?"
+        );
+
+        // Each token pattern appears three times: EXIF, AI desc, person name.
+        use rusqlite::types::Value;
+        let params: Vec<Value> = like_patterns
+            .into_iter()
+            .flat_map(|p| [Value::Text(p.clone()), Value::Text(p.clone()), Value::Text(p)])
+            .chain([Value::Integer(limit), Value::Integer(offset)])
+            .collect();
+
+        let mut stmt = self.conn.prepare(&sql)?;
+        let rows = stmt
+            .query_map(rusqlite::params_from_iter(params), row_to_library_image)?
+            .filter_map(|r| r.ok())
+            .collect();
         Ok(rows)
     }
 
@@ -473,7 +504,7 @@ impl Database {
             "SELECT id, path, added_at, status,
                     filename, taken_at, make, model, lens,
                     focal_length, aperture, iso,
-                    width, height, orientation
+                    width, height, orientation, raw_path
              FROM images
              WHERE id = ?1",
         )?;
@@ -488,6 +519,17 @@ impl Database {
             .query_row("SELECT COUNT(*) FROM images", [], |r| r.get(0))?;
         Ok(n as u64)
     }
+}
+
+// ── Helpers ──────────────────────────────────────────────────────
+
+/// Escape SQL LIKE special characters in a search token.
+fn escape_like_token(token: &str) -> String {
+    token
+        .to_lowercase()
+        .replace('\\', "\\\\")
+        .replace('%', "\\%")
+        .replace('_', "\\_")
 }
 
 // ── Row-mapping helper ───────────────────────────────────────────

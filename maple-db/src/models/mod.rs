@@ -29,10 +29,12 @@ pub mod device;
 pub mod embedding;
 pub mod factory;
 pub mod preprocessor;
+pub mod scrfd;
 pub mod session;
 
 pub use detection::{DetectionModel, OnnxFaceDetector};
 pub use device::ModelDevice;
+pub use scrfd::ScrfdDetector;
 pub use embedding::{EmbeddingModel, OnnxFaceEmbedder, TextEmbeddingModel};
 pub use factory::ModelFactory;
 pub use preprocessor::{Preprocessor, PreprocessStep};

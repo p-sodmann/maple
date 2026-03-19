@@ -127,24 +127,9 @@ fn exif_date_subdir(path: &Path, format: &str) -> Option<String> {
     if let exif::Value::Ascii(ref v) = field.value {
         let bytes = v.first()?;
         let s = std::str::from_utf8(bytes).ok()?;
-        // "YYYY:MM:DD HH:MM:SS"
-        if s.len() < 10 {
-            return None;
-        }
-        let year: u32 = s[0..4].parse().ok()?;
-        let month: u32 = s[5..7].parse().ok()?;
-        let day: u32 = s[8..10].parse().ok()?;
-
-        let result = format
-            .replace("%Y", &format!("{year:04}"))
-            .replace("%m", &format!("{month:02}"))
-            .replace("%d", &format!("{day:02}"));
-
-        if result.is_empty() {
-            None
-        } else {
-            Some(result)
-        }
+        let dt = crate::ExifDateTime::parse(s)?;
+        let result = dt.format(format);
+        if result.is_empty() { None } else { Some(result) }
     } else {
         None
     }

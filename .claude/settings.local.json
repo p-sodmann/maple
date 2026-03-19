@@ -14,7 +14,9 @@
       "Bash(find /home/eterna/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tract-hir-0.21.10 -name *.rs -exec grep -l \"InferenceModel\\\\|with_input_fact\" {})",
       "Bash(2)",
       "Bash(find /home/eterna/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tract-core-0.21.10 -name \"framework.rs\" -exec cat {})",
-      "Bash(cargo build:*)"
+      "Bash(cargo build:*)",
+      "Bash(grep -r \"load_dynamic\\\\|init\\(\\)\\\\|OrtApiBase\\\\|dylib\" ~/.cargo/registry/src/*/ort-2.0.0-rc.12/src/ --include=*.rs -l)",
+      "Bash(cargo test:*)"
     ]
   }
 }

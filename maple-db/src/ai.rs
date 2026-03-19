@@ -137,13 +137,13 @@ fn mime_type_for_path(path: &Path) -> &'static str {
 /// Handle to a running AI tagger thread.  Call [`stop`](AiTagger::stop) to
 /// request a graceful shutdown (the thread finishes the current image first).
 pub struct AiTagger {
-    stop_tx: std::sync::mpsc::SyncSender<()>,
+    handle: crate::worker::WorkerHandle,
 }
 
 impl AiTagger {
     /// Signal the tagger thread to stop after the current image.
     pub fn stop(&self) {
-        let _ = self.stop_tx.send(());
+        self.handle.stop();
     }
 }
 
@@ -160,73 +160,38 @@ pub fn spawn_ai_tagger(
     db: Arc<Mutex<Database>>,
     describer: impl AiDescriber + 'static,
 ) -> AiTagger {
-    use std::sync::mpsc::RecvTimeoutError;
+    let model_id = describer.model_id().to_owned();
 
-    let (stop_tx, stop_rx) = std::sync::mpsc::sync_channel(1);
-
-    std::thread::Builder::new()
-        .name(format!("ai-tagger[{}]", describer.model_id()))
-        .spawn(move || {
-            info!(model = describer.model_id(), "AI tagger started");
-
-            'outer: loop {
-                // ── Fetch images needing a description ──────────────
-                let images = {
-                    match db.lock().unwrap().images_needing_ai_description(describer.model_id()) {
-                        Ok(v) => v,
-                        Err(e) => {
-                            warn!("ai_tagger: DB query failed: {e}");
-                            vec![]
-                        }
-                    }
-                };
-
-                if images.is_empty() {
-                    // All images are described — sleep 60 s then check again.
-                    info!(model = describer.model_id(), "AI tagger: no pending images, sleeping");
-                    match stop_rx.recv_timeout(Duration::from_secs(60)) {
-                        Ok(_) | Err(RecvTimeoutError::Disconnected) => break 'outer,
-                        Err(RecvTimeoutError::Timeout) => continue 'outer,
-                    }
-                }
-
-                info!(
-                    model = describer.model_id(),
-                    count = images.len(),
-                    "AI tagger: describing images"
-                );
-
-                for (id, path) in images {
-                    // Check stop signal between images.
-                    match stop_rx.try_recv() {
-                        Ok(_) | Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                            break 'outer;
-                        }
-                        Err(std::sync::mpsc::TryRecvError::Empty) => {}
-                    }
-
-                    match describer.describe_image(&path) {
-                        Ok(desc) => {
-                            let result = db
-                                .lock()
-                                .unwrap()
-                                .insert_ai_description(id, describer.model_id(), &desc);
-                            if let Err(e) = result {
-                                warn!(path = %path.display(), "AI tagger: failed to store description: {e}");
-                            } else {
-                                info!(path = %path.display(), "AI tagger: described image");
-                            }
-                        }
-                        Err(e) => {
-                            warn!(path = %path.display(), "AI tagger: description failed: {e}");
-                        }
-                    }
+    let handle = crate::worker::spawn_db_worker(
+        &format!("ai-tagger[{model_id}]"),
+        db,
+        describer,
+        Duration::from_secs(60),
+        // fetch
+        move |db_guard| {
+            db_guard
+                .images_needing_ai_description(&model_id)
+                .unwrap_or_else(|e| {
+                    warn!("ai_tagger: DB query failed: {e}");
+                    vec![]
+                })
+        },
+        // process
+        |describer, db, (id, path)| match describer.describe_image(&path) {
+            Ok(desc) => {
+                let result =
+                    crate::lock_db(db).insert_ai_description(id, describer.model_id(), &desc);
+                if let Err(e) = result {
+                    warn!(path = %path.display(), "AI tagger: failed to store description: {e}");
+                } else {
+                    info!(path = %path.display(), "AI tagger: described image");
                 }
             }
+            Err(e) => {
+                warn!(path = %path.display(), "AI tagger: description failed: {e}");
+            }
+        },
+    );
 
-            info!(model = describer.model_id(), "AI tagger stopped");
-        })
-        .expect("failed to spawn AI tagger thread");
-
-    AiTagger { stop_tx }
+    AiTagger { handle }
 }

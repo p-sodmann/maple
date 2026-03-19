@@ -15,15 +15,15 @@
 //!
 //! Download: <https://github.com/atksh/onnx-facial-lmk-detector/releases>
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use std::io::Cursor;
 
 use anyhow::{Context, Result};
 use image::{DynamicImage, ImageDecoder, ImageReader};
 use maple_import::{is_raw_format, loadable_image_bytes};
-use ndarray::{s, Array3, Array4, ArrayView2, ArrayView4, Ix3};
-use tracing::{debug, info};
+use ndarray::{Array3, Array4, ArrayView2, ArrayView4};
+use tracing::{debug, info, warn};
 
 use super::{
     device::ModelDevice,
@@ -55,17 +55,23 @@ pub struct OnnxFaceDetector {
     pub(super) detector: OnnxSession,
     /// Optional ArcFace embedder for per-face identity vectors.
     pub(super) embedder: Option<Box<dyn EmbeddingModel>>,
+    /// When `Some`, aligned 112×112 face crops are saved here as PNGs.
+    debug_dir: Option<PathBuf>,
 }
 
 impl OnnxFaceDetector {
     /// Create from a pre-loaded `OnnxSession` and optional embedder.
-    pub fn new(detector: OnnxSession, embedder: Option<Box<dyn EmbeddingModel>>) -> Self {
+    pub fn new(
+        detector: OnnxSession,
+        embedder: Option<Box<dyn EmbeddingModel>>,
+        debug_dir: Option<PathBuf>,
+    ) -> Self {
         debug!(
             inputs  = ?detector.input_names,
             outputs = ?detector.output_names,
             "atksh detector loaded"
         );
-        Self { detector, embedder }
+        Self { detector, embedder, debug_dir }
     }
 
     /// Load the atksh detector directly from a path.
@@ -73,10 +79,11 @@ impl OnnxFaceDetector {
         path: &Path,
         device: &ModelDevice,
         embedder: Option<Box<dyn EmbeddingModel>>,
+        debug_dir: Option<PathBuf>,
     ) -> Result<Self> {
         let session = OnnxSession::load(path, device)
             .with_context(|| format!("loading face detector: {}", path.display()))?;
-        Ok(Self::new(session, embedder))
+        Ok(Self::new(session, embedder, debug_dir))
     }
 }
 
@@ -175,10 +182,33 @@ impl DetectionModel for OnnxFaceDetector {
         }
         let bboxes = ArrayView2::from_shape((n, 4), &bboxes_data[..])
             .context("reshaping bboxes to [N, 4]")?;
-        // aligned_imgs shape: [N, 112, 112, 3] — model returns u8, convert to f32 for embedder.
-        let aligned_u8_4d = ArrayView4::from_shape((n, 112, 112, 3), aligned_u8)
-            .context("reshaping aligned_imgs to [N, 112, 112, 3]")?;
-        let aligned4: Array4<f32> = aligned_u8_4d.mapv(|v| v as f32);
+
+        // atksh model outputs aligned_imgs as (N, 224, 224, 3) uint8 BGR.
+        let aligned_u8_4d = ArrayView4::from_shape((n, 224, 224, 3), aligned_u8)
+            .context("reshaping aligned_imgs to [N, 224, 224, 3]")?;
+
+        // ── Debug: save aligned crops ──────────────────────────────────────
+        if let Some(ref dir) = self.debug_dir {
+            if let Err(e) = std::fs::create_dir_all(dir) {
+                warn!(dir = %dir.display(), "could not create aligned_faces dir: {e}");
+            } else {
+                let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("img");
+                for i in 0..n {
+                    // aligned_imgs are BGR — swap to RGB for PNG output.
+                    let crop_rgb = image::RgbImage::from_fn(224, 224, |x, y| {
+                        let b = aligned_u8_4d[[i, y as usize, x as usize, 0]];
+                        let g = aligned_u8_4d[[i, y as usize, x as usize, 1]];
+                        let r = aligned_u8_4d[[i, y as usize, x as usize, 2]];
+                        image::Rgb([r, g, b])
+                    });
+                    let file = dir.join(format!("{stem}_face_{i}.png"));
+                    if let Err(e) = crop_rgb.save(&file) {
+                        warn!(file = %file.display(), "could not save aligned face crop: {e}");
+                    }
+                }
+            }
+        }
+
         let mut result = Vec::with_capacity(n);
 
         for i in 0..n {
@@ -193,13 +223,32 @@ impl DetectionModel for OnnxFaceDetector {
             let y2 = (bboxes[[i, 3]] / scale / orig_h as f32).clamp(0.0, 1.0);
 
             // ── Optional ArcFace embedding pass ───────────────────────────
-            // aligned4[i] is [112, 112, 3] BGR [0, 255].
+            // ArcFace expects 112×112. The atksh model outputs 224×224 crops,
+            // so we resize down before embedding.
             let embedding = if let Some(ref mut embedder) = self.embedder {
-                let crop = aligned4
-                    .slice(s![i, .., .., ..])
-                    .into_dimensionality::<Ix3>()
-                    .context("extracting aligned crop")?;
-                embedder.embed_face_crop(crop.view().reborrow())?
+                // Build a temporary RgbImage (treating BGR bytes as generic 3-ch)
+                // and resize to 112×112. Channel ordering is preserved by resize.
+                let crop_224 = image::RgbImage::from_fn(224, 224, |x, y| {
+                    image::Rgb([
+                        aligned_u8_4d[[i, y as usize, x as usize, 0]], // B
+                        aligned_u8_4d[[i, y as usize, x as usize, 1]], // G
+                        aligned_u8_4d[[i, y as usize, x as usize, 2]], // R
+                    ])
+                });
+                let crop_112 = image::imageops::resize(
+                    &crop_224,
+                    112,
+                    112,
+                    image::imageops::FilterType::Triangle,
+                );
+                // Convert to [112, 112, 3] BGR f32 [0, 255] for the embedder.
+                let mut crop_arr = Array3::<f32>::zeros((112, 112, 3));
+                for (x, y, p) in crop_112.enumerate_pixels() {
+                    crop_arr[[y as usize, x as usize, 0]] = p[0] as f32;
+                    crop_arr[[y as usize, x as usize, 1]] = p[1] as f32;
+                    crop_arr[[y as usize, x as usize, 2]] = p[2] as f32;
+                }
+                embedder.embed_face_crop(crop_arr.view())?
             } else {
                 vec![]
             };

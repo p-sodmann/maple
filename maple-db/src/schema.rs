@@ -214,6 +214,8 @@ fn dedup_raw_companions(conn: &Connection) -> anyhow::Result<()> {
             .push((*id, path_str.clone()));
     }
 
+    let tx = conn.unchecked_transaction()?;
+
     let mut merged = 0usize;
     for members in groups.values() {
         if members.len() < 2 {
@@ -232,19 +234,21 @@ fn dedup_raw_companions(conn: &Connection) -> anyhow::Result<()> {
             (display, raws.first())
         {
             // Set raw_path on the display row.
-            conn.execute(
+            tx.execute(
                 "UPDATE images SET raw_path = ?1 WHERE id = ?2",
                 rusqlite::params![raw_path, display_id],
             )?;
             // Delete the raw row (ON DELETE CASCADE handles ai_descriptions
             // and face_detections).
-            conn.execute(
+            tx.execute(
                 "DELETE FROM images WHERE id = ?1",
                 rusqlite::params![raw_id],
             )?;
             merged += 1;
         }
     }
+
+    tx.commit()?;
 
     if merged > 0 {
         tracing::info!("V5 migration: merged {merged} raw companion(s) into display rows");

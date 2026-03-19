@@ -24,10 +24,15 @@ use std::path::Path;
 
 use anyhow::Result;
 
+use std::path::PathBuf;
+
+use maple_state::DetectorKind;
+
 use super::{
     detection::{DetectionModel, OnnxFaceDetector},
     device::ModelDevice,
     embedding::{EmbeddingModel, OnnxFaceEmbedder},
+    scrfd::ScrfdDetector,
     session::OnnxSession,
 };
 
@@ -37,9 +42,14 @@ use super::{
 ///
 /// Use [`with_device`](ModelFactory::with_device) to select GPU execution;
 /// defaults to CPU when not specified.
+///
+/// Use [`with_debug_dir`](ModelFactory::with_debug_dir) to enable saving
+/// aligned face crops to disk for debugging.
 #[derive(Debug, Default)]
 pub struct ModelFactory {
     device: ModelDevice,
+    /// When `Some`, detectors write 112×112 aligned face crops here.
+    debug_dir: Option<PathBuf>,
 }
 
 impl ModelFactory {
@@ -58,19 +68,28 @@ impl ModelFactory {
         self
     }
 
+    /// Enable debug crop saving.  Detectors will write one 112×112 PNG per
+    /// detected face into `dir` after each image is processed.
+    pub fn with_debug_dir(mut self, dir: PathBuf) -> Self {
+        self.debug_dir = Some(dir);
+        self
+    }
+
     // ── Face detection ────────────────────────────────────────────────────
 
-    /// Build an atksh face detector, optionally combined with an ArcFace
-    /// embedder for identity embeddings.
+    /// Build a face detector of the given `kind`, optionally combined with an
+    /// ArcFace embedder for identity embeddings.
     ///
-    /// - `detector_path`: path to the atksh joined ONNX model.
+    /// - `detector_path`: path to the detector ONNX model.
     /// - `embedder_path`: optional path to an InsightFace ArcFace ONNX model.
     ///   Pass `None` to run detection without embedding (person grouping
     ///   will be unavailable but bounding boxes are still stored).
+    /// - `kind`: which detector backend to instantiate.
     pub fn build_face_detector(
         &self,
         detector_path: &Path,
         embedder_path: Option<&Path>,
+        kind: DetectorKind,
     ) -> Result<Box<dyn DetectionModel>> {
         let embedder: Option<Box<dyn EmbeddingModel>> = embedder_path
             .map(|p| -> Result<Box<dyn EmbeddingModel>> {
@@ -78,8 +97,26 @@ impl ModelFactory {
             })
             .transpose()?;
 
-        let detector = OnnxFaceDetector::load(detector_path, &self.device, embedder)?;
-        Ok(Box::new(detector))
+        match kind {
+            DetectorKind::Atksh => {
+                let detector = OnnxFaceDetector::load(
+                    detector_path,
+                    &self.device,
+                    embedder,
+                    self.debug_dir.clone(),
+                )?;
+                Ok(Box::new(detector))
+            }
+            DetectorKind::Scrfd => {
+                let detector = ScrfdDetector::load(
+                    detector_path,
+                    &self.device,
+                    embedder,
+                    self.debug_dir.clone(),
+                )?;
+                Ok(Box::new(detector))
+            }
+        }
     }
 
     // ── Face embedding (standalone) ───────────────────────────────────────

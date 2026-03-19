@@ -40,7 +40,7 @@ use super::face_shared::{
     assign_face_to_name, assign_face_to_person, face_screen_rect, is_real_detection,
     next_untagged_index, unassign_face, EmbeddingMatrix,
 };
-use tracing::info;
+use tracing::{debug, info};
 use super::image_loader::load_image_async;
 
 // ── History ───────────────────────────────────────────────────────
@@ -430,14 +430,14 @@ fn rebuild_panel(state: &TaggingState, previous_action: Option<&TagAction>) {
         .borrow()
         .top_k(&embedding, state.tagging_top_k);
 
-    info!(
+    debug!(
         "face tagging: face_idx={}, {} suggestions (embedding len={})",
         face_idx,
         suggestions.len(),
         embedding.len(),
     );
     for (pid, name, sim) in &suggestions {
-        info!("  suggestion: person_id={}, name={:?}, similarity={:.4}", pid, name, sim);
+        debug!("  suggestion: person_id={}, name={:?}, similarity={:.4}", pid, name, sim);
     }
 
     if suggestions.is_empty() {

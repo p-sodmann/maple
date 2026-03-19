@@ -18,7 +18,7 @@
 //! background `std::thread` and polls `images_needing_face_detection` in a
 //! loop, sleeping 60 s when the queue is empty.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -50,28 +50,49 @@ pub struct FaceDetector {
 }
 
 impl FaceDetector {
-    /// Load detector (and optional embedder) targeting the CPU.
+    /// Load detector (and optional embedder) targeting the CPU using the
+    /// default atksh backend.
     ///
-    /// This is the backward-compatible constructor.  For GPU inference use
+    /// For GPU inference or to select the SCRFD backend use
     /// [`with_device`](FaceDetector::with_device).
     pub fn new(detector_path: &Path, embedder_path: Option<&Path>) -> Result<Self> {
-        Self::with_device(detector_path, embedder_path, &models::ModelDevice::Cpu)
+        Self::with_device(
+            detector_path,
+            embedder_path,
+            &models::ModelDevice::Cpu,
+            maple_state::DetectorKind::Atksh,
+            None,
+        )
     }
 
     /// Load detector (and optional embedder) targeting `device`.
     ///
+    /// `kind` selects the detector backend:
+    /// - [`DetectorKind::Atksh`] — single-pass model (detection + aligned crops).
+    /// - [`DetectorKind::Scrfd`] — standard InsightFace SCRFD model.
+    ///
+    /// `debug_dir`: when `Some`, 112×112 aligned face crops are saved as PNGs
+    /// into that directory after each image is processed.
+    ///
     /// ```ignore
     /// let device: models::ModelDevice = settings.face.device.parse().unwrap_or_default();
-    /// let fd = FaceDetector::with_device(&detector_path, embedder_path, &device)?;
+    /// let debug_dir = settings.debug.then(|| maple_state::config_dir().join("aligned_faces"));
+    /// let fd = FaceDetector::with_device(
+    ///     &detector_path, embedder_path, &device, settings.face.detector_type, debug_dir,
+    /// )?;
     /// ```
     pub fn with_device(
         detector_path: &Path,
         embedder_path: Option<&Path>,
         device: &models::ModelDevice,
+        kind: maple_state::DetectorKind,
+        debug_dir: Option<PathBuf>,
     ) -> Result<Self> {
-        let inner = models::ModelFactory::new()
-            .with_device(device.clone())
-            .build_face_detector(detector_path, embedder_path)?;
+        let mut factory = models::ModelFactory::new().with_device(device.clone());
+        if let Some(dir) = debug_dir {
+            factory = factory.with_debug_dir(dir);
+        }
+        let inner = factory.build_face_detector(detector_path, embedder_path, kind)?;
         Ok(Self { inner })
     }
 
@@ -92,13 +113,13 @@ unsafe impl Send for FaceDetector {}
 
 /// Handle to the running face tagger background thread.
 pub struct FaceTagger {
-    stop_tx: std::sync::mpsc::SyncSender<()>,
+    handle: crate::worker::WorkerHandle,
 }
 
 impl FaceTagger {
     /// Signal the thread to stop after the current image.
     pub fn stop(&self) {
-        let _ = self.stop_tx.send(());
+        self.handle.stop();
     }
 }
 
@@ -113,83 +134,60 @@ impl FaceTagger {
 /// Returns a [`FaceTagger`] whose [`stop`](FaceTagger::stop) method gracefully
 /// terminates the thread after the current image finishes.
 pub fn spawn_face_tagger(db: Arc<Mutex<Database>>, detector: FaceDetector) -> FaceTagger {
-    use std::sync::mpsc::RecvTimeoutError;
-
-    let (stop_tx, stop_rx) = std::sync::mpsc::sync_channel(1);
-
-    std::thread::Builder::new()
-        .name("face-tagger".to_owned())
-        .spawn(move || {
-            let mut detector = detector;
-            info!("face tagger started");
-            'outer: loop {
-                let images = match db.lock().unwrap().images_needing_face_detection() {
-                    Ok(v) => v,
-                    Err(e) => {
-                        warn!("face_tagger: DB query failed: {e:?}");
-                        vec![]
-                    }
-                };
-
-                if images.is_empty() {
-                    info!("face tagger: no pending images, sleeping");
-                    match stop_rx.recv_timeout(Duration::from_secs(60)) {
-                        Ok(_) | Err(RecvTimeoutError::Disconnected) => break 'outer,
-                        Err(RecvTimeoutError::Timeout) => continue 'outer,
-                    }
-                }
-
-                info!(count = images.len(), "face tagger: processing images");
-
-                for (image_id, path) in images {
-                    match stop_rx.try_recv() {
-                        Ok(_) | Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                            break 'outer
-                        }
-                        Err(std::sync::mpsc::TryRecvError::Empty) => {}
-                    }
-
-                    match detector.detect_and_embed(&path) {
-                        Ok(faces) => {
-                            let count = faces.len();
-                            let guard = db.lock().unwrap();
-                            for face in faces {
-                                if let Err(e) = guard.insert_face_detection(
-                                    image_id,
-                                    face.bbox,
-                                    &face.embedding,
-                                    face.confidence,
-                                ) {
-                                    warn!(
-                                        path = %path.display(),
-                                        "face_tagger: insert failed: {e:?}"
-                                    );
-                                }
-                            }
-                            // Sentinel: marks image as "processed, no face found".
-                            if count == 0 {
-                                let _ = guard.insert_face_detection(
-                                    image_id,
-                                    [0.0, 0.0, 0.0, 0.0],
-                                    &[],
-                                    -1.0,
-                                );
-                            }
-                            info!(
-                                path = %path.display(),
-                                faces = count,
-                                "face tagger: done"
-                            );
-                        }
-                        Err(e) => {
-                            warn!(path = %path.display(), "face_tagger: detection failed: {e:?}");
-                        }
+    let handle = crate::worker::spawn_db_worker(
+        "face-tagger",
+        db,
+        detector,
+        Duration::from_secs(60),
+        // fetch
+        |db_guard| {
+            db_guard
+                .images_needing_face_detection()
+                .unwrap_or_else(|e| {
+                    warn!("face_tagger: DB query failed: {e:?}");
+                    vec![]
+                })
+        },
+        // process
+        |detector, db, (image_id, path)| match detector.detect_and_embed(&path) {
+            Ok(faces) => {
+                let count = faces.len();
+                let guard = crate::lock_db(db);
+                for face in faces {
+                    if let Err(e) = guard.insert_face_detection(
+                        image_id,
+                        face.bbox,
+                        &face.embedding,
+                        face.confidence,
+                    ) {
+                        warn!(
+                            path = %path.display(),
+                            "face_tagger: insert failed: {e:?}"
+                        );
                     }
                 }
+                // Sentinel: marks image as "processed, no face found".
+                if count == 0 {
+                    if let Err(e) = guard.insert_face_detection(
+                        image_id,
+                        [0.0, 0.0, 0.0, 0.0],
+                        &[],
+                        -1.0,
+                    ) {
+                        warn!("face_tagger: failed to insert sentinel for image {image_id}: {e:?}");
+                    }
+                }
+                info!(
+                    path = %path.display(),
+                    faces = count,
+                    "face tagger: done"
+                );
             }
-            info!("face tagger stopped");
-        })
-        .expect("failed to spawn face tagger thread");
+            Err(e) => {
+                warn!(path = %path.display(), "face_tagger: detection failed: {e:?}");
+            }
+        },
+    );
 
-    FaceTagger { stop_tx }
+    FaceTagger { handle }
 }

@@ -1,0 +1,71 @@
+# Maple — default settings
+# This file is written to ~/.config/maple/settings.toml on first launch.
+# Edit it to customise Maple's behaviour.
+
+# Debug mode — when true, aligned face crops (112×112 px) are saved to
+# ~/.config/maple/aligned_faces/ after each detection pass.
+debug = false
+
+# Number of full-resolution images to keep buffered around the current
+# image in the browser view.
+preview_buffer_size = 21
+
+# Directory where library data files are stored
+# (seen_imported.bin, seen_rejected.bin, …).
+# Defaults to ~/.config/maple/ when left empty.
+library_dir = ""
+
+# Path to the SQLite library database.
+# Defaults to ~/.config/maple/library.db when left empty.
+database_path = ""
+
+# strftime-style format string for organising imported files into
+# subdirectories based on EXIF date.  Set to "" to disable (flat copy).
+folder_format = "%Y/%m"
+
+# ── AI image description ────────────────────────────────────────
+
+[ai]
+# Whether the AI tagger starts automatically when the library opens.
+enabled = false
+
+# Base URL of the OpenAI-compatible server.
+server_url = "http://localhost:1234"
+
+# Model identifier as the server expects it.
+model = "local-model"
+
+# System prompt sent with every image.
+prompt = "Describe this image in detail. Include the main subjects, scene, colors, mood, any text visible, and notable elements. Be thorough to enable comprehensive search results."
+
+# ── Face detection / recognition ────────────────────────────────
+
+[face]
+# Whether the face tagger starts automatically when the library opens.
+enabled = false
+
+# Face detector backend.
+# "atksh" — single-pass model (detection + landmarks + aligned crops).
+#            Download from https://github.com/atksh/onnx-facial-lmk-detector/releases
+# "scrfd"  — standard InsightFace SCRFD model (e.g. scrfd_10g_bnkps.onnx).
+#            Download from https://github.com/deepinsight/insightface/tree/master/model_zoo
+detector_type = "atksh"
+
+# Path to the detector ONNX model (required).
+detector_model = ""
+
+# Path to an ArcFace ONNX embedder (optional — enables person grouping).
+# Download from https://github.com/deepinsight/insightface/tree/master/model_zoo
+# Leave empty to run detection without embedding.
+embedder_model = ""
+
+# Cosine-similarity threshold for suggesting a person match (0.0–1.0).
+# ArcFace-R100: same person typically >= 0.40.
+similarity_threshold = 0.40
+
+# Number of suggested persons shown in tagging mode.
+tagging_top_k = 5
+
+# Execution device for ONNX inference.
+# Accepts: "cpu" (default), "cuda:N" (NVIDIA GPU), "tensorrt:N".
+device = "cpu"

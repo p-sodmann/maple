@@ -1,4 +1,17 @@
 //! Library browser page — wires the search bar, grid, and detail window.
+//!
+//! Reached from `home::build_home_page` via the "Browse Library" button.
+//!
+//! Background workers started here (if enabled in Settings):
+//!   • **Metadata filler** — one-shot thread that populates EXIF fields for
+//!     images missing metadata (runs once on page creation).
+//!   • **AI tagger** — loops until stopped; describes images via LM Studio.
+//!   • **Face tagger** — loops until stopped; detects faces + computes
+//!     ArcFace embeddings via ONNX.
+//!
+//! All workers receive `Arc<Mutex<Database>>` and are stopped when the page
+//! is destroyed (face/AI taggers) or when their one-shot work completes
+//! (metadata filler).
 
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
@@ -76,8 +89,8 @@ pub fn build_library_page(
     if !settings.face.models_available() {
         face_detect_btn.set_sensitive(false);
         face_detect_btn.set_tooltip_text(Some(
-            "Face detection unavailable — set face.detector_model to the \
-             atksh ONNX model path in settings.toml",
+            "Face detection unavailable — set face.detector_model and \
+             face.detector_type in settings.toml",
         ));
     }
     header.pack_end(&face_detect_btn);
@@ -125,6 +138,10 @@ pub fn build_library_page(
             let embedder_path = settings.face.embedder_path().map(|p| p.to_owned());
             let device: maple_db::models::ModelDevice =
                 settings.face.device.parse().unwrap_or_default();
+            let detector_kind = settings.face.detector_type;
+            let debug_dir = settings
+                .debug
+                .then(|| maple_state::config_dir().join("aligned_faces"));
 
             face_detect_btn.set_sensitive(false);
             face_detect_btn.set_label("Loading model…");
@@ -139,6 +156,8 @@ pub fn build_library_page(
                         &detector_path,
                         embedder_path.as_deref(),
                         &device,
+                        detector_kind,
+                        debug_dir,
                     )
                     .map_err(|e| format!("{e:#}"));
                     let _ = tx.send(result);

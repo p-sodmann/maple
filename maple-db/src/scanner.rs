@@ -63,13 +63,8 @@ impl LibraryScanner {
         tracing::info!("Library scan: reconciling {}", dir.display());
 
         // ── 1. Load all DB records ───────────────────────────────
-        let db_records: Vec<(PathBuf, ImageStatus)> = match self.db.lock() {
-            Ok(db) => db.all_paths().unwrap_or_default(),
-            Err(e) => {
-                tracing::warn!("Library scan: DB lock poisoned: {e}");
-                return;
-            }
-        };
+        let db_records: Vec<(PathBuf, ImageStatus)> =
+            crate::lock_db(&self.db).all_paths().unwrap_or_default();
         // Build a set of all display paths known to the DB.
         let db_path_set: HashSet<&PathBuf> = db_records.iter().map(|(p, _)| p).collect();
 
@@ -96,14 +91,14 @@ impl LibraryScanner {
             match (on_disk, status) {
                 (false, ImageStatus::Present) => {
                     tracing::info!("Library scan: marking missing {}", path.display());
-                    if let Ok(db) = self.db.lock() {
-                        let _ = db.mark_missing(path);
+                    if let Err(e) = crate::lock_db(&self.db).mark_missing(path) {
+                        tracing::warn!("Library scan: failed to mark missing {}: {e}", path.display());
                     }
                 }
                 (true, ImageStatus::Missing) => {
                     tracing::info!("Library scan: marking present {}", path.display());
-                    if let Ok(db) = self.db.lock() {
-                        let _ = db.mark_present(path);
+                    if let Err(e) = crate::lock_db(&self.db).mark_present(path) {
+                        tracing::warn!("Library scan: failed to mark present {}: {e}", path.display());
                     }
                 }
                 _ => {} // already consistent
@@ -118,21 +113,19 @@ impl LibraryScanner {
             }
             match content_hash(display_path) {
                 Ok(hash) => {
-                    if let Ok(db) = self.db.lock() {
-                        let result = db.insert_image_with_raw(
-                            display_path,
-                            &hash,
-                            *size,
-                            raw_path.as_deref(),
+                    let result = crate::lock_db(&self.db).insert_image_with_raw(
+                        display_path,
+                        &hash,
+                        *size,
+                        raw_path.as_deref(),
+                    );
+                    if let Err(e) = result {
+                        tracing::warn!(
+                            "Library scan: failed to insert {}: {e}",
+                            display_path.display()
                         );
-                        if let Err(e) = result {
-                            tracing::warn!(
-                                "Library scan: failed to insert {}: {e}",
-                                display_path.display()
-                            );
-                        } else {
-                            inserted += 1;
-                        }
+                    } else {
+                        inserted += 1;
                     }
                 }
                 Err(e) => {

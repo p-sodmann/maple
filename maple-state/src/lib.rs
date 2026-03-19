@@ -111,13 +111,34 @@ fn settings_path() -> PathBuf {
     config_dir().join("settings.toml")
 }
 
+/// Which face detection backend to use.
+///
+/// Serialises to/from the lowercase string name (`"atksh"`, `"scrfd"`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DetectorKind {
+    /// atksh joined ONNX model — single-pass SCRFD detection + landmark
+    /// alignment + aligned 112×112 face-crop extraction.  Provides
+    /// pre-aligned crops so an ArcFace embedder can be used without any
+    /// extra preprocessing.
+    ///
+    /// Download: <https://github.com/atksh/onnx-facial-lmk-detector/releases>
+    #[default]
+    Atksh,
+    /// Standard SCRFD detector (e.g. `scrfd_10g_bnkps.onnx` from InsightFace).
+    /// Outputs raw bounding boxes + 5-point keypoints; face crops for
+    /// ArcFace embedding are produced by manually cropping from the source image.
+    ///
+    /// Download: <https://github.com/deepinsight/insightface/tree/master/model_zoo>
+    Scrfd,
+}
+
 /// Face detection and recognition settings.
 ///
 /// Stored under `[face]` in `settings.toml`.
 ///
-/// **Required:** `detector_model` — the atksh joined ONNX model that performs
-/// face detection + landmark detection + aligned-crop extraction in a single
-/// pass.  Download from <https://github.com/atksh/onnx-facial-lmk-detector/releases>.
+/// **Required:** `detector_model` — path to an ONNX face detector.  Which
+/// model format to expect is controlled by `detector_type`.
 ///
 /// **Optional:** `embedder_model` — an ArcFace model for 512-dim identity
 /// embeddings and cosine-similarity person grouping.  Download from
@@ -128,7 +149,10 @@ pub struct FaceSettings {
     /// Whether the face tagger starts automatically when the library opens.
     #[serde(default)]
     pub enabled: bool,
-    /// Path to the atksh joined ONNX model (required for face detection).
+    /// Face detector backend.  Accepted values: `"atksh"` (default), `"scrfd"`.
+    #[serde(default)]
+    pub detector_type: DetectorKind,
+    /// Path to the detector ONNX model (required).
     #[serde(default)]
     pub detector_model: PathBuf,
     /// Path to an ArcFace ONNX embedder (optional — enables person grouping).
@@ -183,6 +207,7 @@ impl Default for FaceSettings {
     fn default() -> Self {
         Self {
             enabled: false,
+            detector_type: DetectorKind::default(),
             detector_model: PathBuf::new(),
             embedder_model: PathBuf::new(),
             similarity_threshold: Self::default_similarity_threshold(),
@@ -239,12 +264,21 @@ impl Default for AiSettings {
     }
 }
 
+/// The bundled defaults.toml — written to disk on first launch so users
+/// can discover and edit every setting.
+const DEFAULTS_TOML: &str = include_str!("../defaults.toml");
+
 /// Application settings loaded from `settings.toml`.
 ///
 /// Missing keys fall back to defaults. The file is created with defaults
 /// if it doesn't exist.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Settings {
+    /// Enable debug output (e.g. saving aligned face crops to disk).
+    /// When `true`, aligned face images are written to
+    /// `~/.config/maple/aligned_faces/` for inspection.
+    #[serde(default)]
+    pub debug: bool,
     /// Number of full-resolution images to keep buffered around the
     /// current image in the browser view.
     #[serde(default = "Settings::default_preview_buffer_size")]
@@ -288,6 +322,16 @@ impl Settings {
         "%Y/%m".into()
     }
 
+    /// Replace empty path fields with their runtime defaults.
+    fn fill_empty_paths(&mut self) {
+        if self.library_dir.as_os_str().is_empty() {
+            self.library_dir = Self::default_library_dir();
+        }
+        if self.database_path.as_os_str().is_empty() {
+            self.database_path = Self::default_database_path();
+        }
+    }
+
     /// Load settings from the default config path.
     /// Returns `Settings::default()` if the file doesn't exist or is invalid.
     pub fn load() -> Self {
@@ -295,16 +339,24 @@ impl Settings {
     }
 
     /// Load settings from a specific path.
+    ///
+    /// If the file doesn't exist, the bundled `defaults.toml` is written
+    /// to disk so the user can discover and edit every available setting.
     pub fn load_from(path: &Path) -> Self {
-        match std::fs::read_to_string(path) {
-            Ok(contents) => toml::from_str(&contents).unwrap_or_default(),
+        let contents = match std::fs::read_to_string(path) {
+            Ok(c) => c,
             Err(_) => {
-                let settings = Self::default();
-                // Write the default file so the user can discover/edit it.
-                let _ = settings.save_to(path);
-                settings
+                // First boot — seed settings.toml from the bundled defaults.
+                if let Some(parent) = path.parent() {
+                    let _ = std::fs::create_dir_all(parent);
+                }
+                let _ = std::fs::write(path, DEFAULTS_TOML);
+                DEFAULTS_TOML.to_owned()
             }
-        }
+        };
+        let mut settings: Self = toml::from_str(&contents).unwrap_or_default();
+        settings.fill_empty_paths();
+        settings
     }
 
     /// Persist settings to the default config path.
@@ -326,6 +378,7 @@ impl Settings {
 impl Default for Settings {
     fn default() -> Self {
         Self {
+            debug: false,
             preview_buffer_size: Self::default_preview_buffer_size(),
             library_dir: Self::default_library_dir(),
             database_path: Self::default_database_path(),
@@ -443,6 +496,32 @@ mod tests {
         assert_eq!(parsed.preview_buffer_size, 11);
         assert_eq!(parsed.library_dir, PathBuf::from("/my/library"));
         assert_eq!(parsed.database_path, PathBuf::from("/my/library/library.db"));
+    }
+
+    #[test]
+    fn defaults_toml_parses_and_fills_paths() {
+        let mut settings: Settings = toml::from_str(DEFAULTS_TOML).unwrap();
+        // Empty strings in the file mean "use runtime default".
+        assert!(settings.library_dir.as_os_str().is_empty());
+        assert!(settings.database_path.as_os_str().is_empty());
+        settings.fill_empty_paths();
+        assert_eq!(settings.library_dir, config_dir());
+        assert_eq!(settings.database_path, config_dir().join("library.db"));
+        assert_eq!(settings.preview_buffer_size, 21);
+        assert!(!settings.ai.enabled);
+        assert!(!settings.face.enabled);
+    }
+
+    #[test]
+    fn settings_missing_file_writes_defaults_toml() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.toml");
+        let loaded = Settings::load_from(&path);
+        assert_eq!(loaded.preview_buffer_size, 21);
+        assert_eq!(loaded.library_dir, config_dir());
+        // The file should now exist with the bundled defaults content.
+        let on_disk = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(on_disk, DEFAULTS_TOML);
     }
 
     #[test]

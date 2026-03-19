@@ -135,30 +135,8 @@ pub fn extract_metadata(path: &Path) -> ImageMetadata {
 
 /// Parse an EXIF datetime string `"YYYY:MM:DD HH:MM:SS"` into a Unix
 /// timestamp (seconds since 1970-01-01 UTC, no timezone adjustment).
-///
-/// Returns `None` on any parse failure rather than panicking.
 fn parse_exif_datetime(s: &str) -> Option<i64> {
-    if s.len() < 19 {
-        return None;
-    }
-    let year: i64 = s[0..4].parse().ok()?;
-    let month: i64 = s[5..7].parse().ok()?;
-    let day: i64 = s[8..10].parse().ok()?;
-    let hour: i64 = s[11..13].parse().ok()?;
-    let minute: i64 = s[14..16].parse().ok()?;
-    let second: i64 = s[17..19].parse().ok()?;
-
-    // Days from 1970-01-01 (proleptic Gregorian calendar).
-    // Algorithm: https://howardhinnant.github.io/date_algorithms.html#days_from_civil
-    let y = if month <= 2 { year - 1 } else { year };
-    let m = if month <= 2 { month + 9 } else { month - 3 };
-    let era = y.div_euclid(400);
-    let yoe = y - era * 400;
-    let doy = (153 * m + 2) / 5 + day - 1;
-    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
-    let days = era * 146097 + doe - 719468;
-
-    Some(days * 86400 + hour * 3600 + minute * 60 + second)
+    maple_import::ExifDateTime::parse(s).map(|dt| dt.to_unix_timestamp())
 }
 
 // ── Background worker ────────────────────────────────────────────
@@ -171,10 +149,7 @@ pub fn spawn_metadata_filler(db: Arc<Mutex<Database>>) {
     std::thread::Builder::new()
         .name("maple-metadata-filler".into())
         .spawn(move || {
-            let to_fill = match db.lock() {
-                Ok(d) => d.records_needing_metadata().unwrap_or_default(),
-                Err(_) => return,
-            };
+            let to_fill = crate::lock_db(&db).records_needing_metadata().unwrap_or_default();
 
             if to_fill.is_empty() {
                 return;
@@ -184,10 +159,8 @@ pub fn spawn_metadata_filler(db: Arc<Mutex<Database>>) {
 
             for (id, path) in to_fill {
                 let meta = extract_metadata(&path);
-                if let Ok(d) = db.lock() {
-                    if let Err(e) = d.update_metadata(id, &meta) {
-                        tracing::warn!("Metadata filler: failed for {}: {e}", path.display());
-                    }
+                if let Err(e) = crate::lock_db(&db).update_metadata(id, &meta) {
+                    tracing::warn!("Metadata filler: failed for {}: {e}", path.display());
                 }
             }
 

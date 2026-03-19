@@ -9,7 +9,7 @@ use std::sync::{Arc, Mutex};
 
 use gtk4::prelude::*;
 use maple_db::{cosine_similarity, FaceDetection};
-use tracing::info;
+use tracing::debug;
 
 /// Return `true` when this row represents a real detection (not a sentinel).
 pub fn is_real_detection(face: &FaceDetection) -> bool {
@@ -65,7 +65,7 @@ impl EmbeddingMatrix {
             .iter()
             .find_map(|(_, _, e)| if !e.is_empty() { Some(e.len()) } else { None })
             .unwrap_or(512);
-        info!(
+        debug!(
             "EmbeddingMatrix::build: {} assigned face embeddings, {} persons, dim={}",
             known.len(),
             persons.len(),
@@ -78,13 +78,13 @@ impl EmbeddingMatrix {
             persons,
         };
         for (pid, name, emb) in &known {
-            info!(
+            debug!(
                 "  embedding row: person_id={}, name={:?}, embedding_len={}",
                 pid, name, emb.len(),
             );
             mat.add(*pid, name.clone(), emb);
         }
-        info!(
+        debug!(
             "EmbeddingMatrix::build: final matrix has {} rows, data len={}",
             mat.rows.len(),
             mat.data.len(),
@@ -132,7 +132,7 @@ impl EmbeddingMatrix {
 
         // No embedding data — list all known persons without scores.
         if query.is_empty() || self.dim == 0 || query.len() != self.dim {
-            info!(
+            debug!(
                 "top_k: falling back to persons list (query_len={}, dim={}, rows={})",
                 query.len(),
                 self.dim,
