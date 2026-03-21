@@ -15,6 +15,39 @@ use super::super::face_shared::{
     person_name, EmbeddingMatrix,
 };
 
+/// Look up the display label for a face detection.
+///
+/// - Assigned face → person name (from DB).
+/// - Unassigned face with embedding → best match name if above threshold, else "?".
+/// - Unassigned face without embedding → "?".
+///
+/// Returns `(label, is_assigned, is_suggestion)`.
+fn face_label(
+    face: &FaceDetection,
+    db: &Arc<Mutex<maple_db::Database>>,
+    known: &EmbeddingMatrix,
+    threshold: f32,
+) -> (String, bool, bool) {
+    if let Some(pid) = face.person_id {
+        let name = db
+            .lock()
+            .ok()
+            .and_then(|g| g.person_name(pid).ok().flatten())
+            .unwrap_or_else(|| "?".into());
+        return (name, true, false);
+    }
+    if face.embedding.is_empty() {
+        return ("?".into(), false, false);
+    }
+    let matches = known.top_k(&face.embedding, 1);
+    if let Some((_pid, name, sim)) = matches.first() {
+        if sim.is_finite() && *sim >= threshold {
+            return (name.clone(), false, true);
+        }
+    }
+    ("?".into(), false, false)
+}
+
 #[derive(Clone)]
 pub struct FaceOverlay {
     /// Image overlay used to draw bounding boxes.
@@ -34,6 +67,9 @@ impl FaceOverlay {
         db: Arc<Mutex<maple_db::Database>>,
         tagging_top_k: usize,
     ) -> Self {
+        let settings = maple_state::Settings::load();
+        let threshold = settings.face.similarity_threshold;
+
         let faces: Rc<RefCell<Vec<FaceDetection>>> = Rc::new(RefCell::new(vec![]));
         let visible: Rc<Cell<bool>> = Rc::new(Cell::new(false));
         let known_embeddings: Rc<RefCell<EmbeddingMatrix>> =
@@ -51,6 +87,8 @@ impl FaceOverlay {
             let zoom = zoom.clone();
             let img_dims = img_dims.clone();
             let scrolled = scrolled.clone();
+            let known_embeddings = known_embeddings.clone();
+            let db = db.clone();
             move |_da, cx, _w, _h| {
                 if !visible.get() {
                     return;
@@ -67,6 +105,7 @@ impl FaceOverlay {
                 let z = zoom.get();
                 let scroll_x = scrolled.hadjustment().value();
                 let scroll_y = scrolled.vadjustment().value();
+                let known = known_embeddings.borrow();
 
                 for face in f.iter() {
                     if !is_real_detection(face) {
@@ -85,22 +124,44 @@ impl FaceOverlay {
                         continue;
                     };
 
-                    if face.person_id.is_some() {
-                        cx.set_source_rgba(0.2, 0.85, 0.4, 0.9);
+                    // Determine label and colours.
+                    let (label, is_assigned, is_suggestion) =
+                        face_label(face, &db, &known, threshold);
+
+                    // Colour: green = assigned, orange = suggestion, blue = unknown.
+                    let (r, g, b) = if is_assigned {
+                        (0.2, 0.85, 0.4)
+                    } else if is_suggestion {
+                        (1.0, 0.65, 0.0)
                     } else {
-                        cx.set_source_rgba(0.2, 0.55, 1.0, 0.9);
-                    }
+                        (0.2, 0.55, 1.0)
+                    };
+
+                    // Bounding box stroke.
+                    cx.set_source_rgba(r, g, b, 0.9);
                     cx.set_line_width(2.5);
                     cx.rectangle(sx, sy, sw, sh);
                     let _ = cx.stroke();
 
-                    if face.person_id.is_some() {
-                        cx.set_source_rgba(0.2, 0.85, 0.4, 0.08);
-                    } else {
-                        cx.set_source_rgba(0.2, 0.55, 1.0, 0.08);
-                    }
+                    // Bounding box fill.
+                    cx.set_source_rgba(r, g, b, 0.08);
                     cx.rectangle(sx, sy, sw, sh);
                     let _ = cx.fill();
+
+                    // Label text below the bounding box.
+                    let font_size = (sh * 0.18).clamp(10.0, 24.0);
+                    cx.set_font_size(font_size);
+                    let text_y = sy + sh + font_size + 2.0;
+
+                    // Draw text shadow/background for readability.
+                    cx.set_source_rgba(0.0, 0.0, 0.0, 0.6);
+                    let _ = cx.move_to(sx + 1.0, text_y + 1.0);
+                    let _ = cx.show_text(&label);
+
+                    // Draw the label in the face colour.
+                    cx.set_source_rgba(r, g, b, 1.0);
+                    let _ = cx.move_to(sx, text_y);
+                    let _ = cx.show_text(&label);
                 }
             }
         });
