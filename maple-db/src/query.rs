@@ -23,6 +23,8 @@ pub struct SearchQuery {
     pub text: Option<String>,
     pub limit: Option<usize>,
     pub offset: Option<usize>,
+    /// When set, restrict results to images in this collection.
+    pub collection_id: Option<i64>,
 }
 
 impl SearchQuery {
@@ -49,8 +51,13 @@ impl SearchQuery {
         self
     }
 
+    pub fn with_collection(mut self, id: i64) -> Self {
+        self.collection_id = Some(id);
+        self
+    }
+
     pub fn is_empty(&self) -> bool {
-        self.text.is_none()
+        self.text.is_none() && self.collection_id.is_none()
     }
 }
 

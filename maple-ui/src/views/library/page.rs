@@ -21,10 +21,11 @@ use std::time::Duration;
 use gtk4::glib;
 use gtk4::prelude::*;
 use libadwaita as adw;
+use adw::prelude::*;
 
 use maple_db::SearchQuery;
 
-use super::{build_face_tagging_page, detail_window, grid::LibraryGrid, search_bar};
+use super::{build_face_tagging_page, collection_manager, detail_window, grid::LibraryGrid, search_bar};
 
 /// Build the library browser page.
 ///
@@ -54,11 +55,35 @@ pub fn build_library_page(
         .build();
     scrolled.set_child(Some(library_grid.widget()));
 
+    // ── Collection filter state ──────────────────────────────────
+    let active_collection: Rc<Cell<Option<i64>>> = Rc::new(Cell::new(None));
+    let search_text: Rc<RefCell<String>> = Rc::new(RefCell::new(String::new()));
+
+    // Helper closure to reload the grid with both text + collection filter.
+    let reload_grid = {
+        let grid = library_grid.clone();
+        let active_collection = active_collection.clone();
+        let search_text = search_text.clone();
+        Rc::new(move || {
+            let mut q = SearchQuery::default();
+            let text = search_text.borrow().clone();
+            if !text.trim().is_empty() {
+                q = q.with_text(&text);
+            }
+            if let Some(cid) = active_collection.get() {
+                q = q.with_collection(cid);
+            }
+            grid.load(q);
+        })
+    };
+
     // ── Search bar ────────────────────────────────────────────────
     let search_entry = search_bar::build_search_entry({
-        let grid = library_grid.clone();
+        let search_text = search_text.clone();
+        let reload_grid = reload_grid.clone();
         move |text| {
-            grid.load(SearchQuery::default().with_text(&text));
+            *search_text.borrow_mut() = text;
+            reload_grid();
         }
     });
 
@@ -113,6 +138,152 @@ pub fn build_library_page(
                 settings.face.tagging_top_k,
             );
             nav_view.push(&page);
+        }
+    });
+
+    // ── Collection filter button ─────────────────────────────────
+    let coll_menu_btn = gtk4::MenuButton::builder()
+        .icon_name("folder-symbolic")
+        .tooltip_text("Filter by collection")
+        .css_classes(["flat"])
+        .build();
+    header.pack_start(&coll_menu_btn);
+
+    // Build (and rebuild) the collection popover content.
+    let build_coll_popover = {
+        let db = db.clone();
+        let active_collection = active_collection.clone();
+        let reload_grid = reload_grid.clone();
+        let coll_menu_btn = coll_menu_btn.clone();
+        Rc::new(move || {
+            let list = gtk4::ListBox::builder()
+                .selection_mode(gtk4::SelectionMode::None)
+                .css_classes(["boxed-list"])
+                .build();
+
+            // "All" row.
+            let all_row = adw::ActionRow::builder()
+                .title("All Images")
+                .activatable(true)
+                .build();
+            if active_collection.get().is_none() {
+                all_row.add_prefix(&gtk4::Image::from_icon_name("object-select-symbolic"));
+            }
+            list.append(&all_row);
+
+            let collections = db
+                .lock()
+                .ok()
+                .and_then(|d| d.all_collections().ok())
+                .unwrap_or_default();
+
+            for coll in &collections {
+                let dot = gtk4::DrawingArea::builder()
+                    .content_width(12)
+                    .content_height(12)
+                    .valign(gtk4::Align::Center)
+                    .build();
+                let hex = coll.color.clone();
+                dot.set_draw_func(move |_, cr, w, h| {
+                    if let Ok(rgba) = gtk4::gdk::RGBA::parse(&hex) {
+                        cr.set_source_rgba(
+                            rgba.red() as f64,
+                            rgba.green() as f64,
+                            rgba.blue() as f64,
+                            1.0,
+                        );
+                        let r = w.min(h) as f64 / 2.0;
+                        cr.arc(w as f64 / 2.0, h as f64 / 2.0, r, 0.0, 2.0 * std::f64::consts::PI);
+                        let _ = cr.fill();
+                    }
+                });
+
+                let subtitle = format!("{} image{}", coll.image_count, if coll.image_count == 1 { "" } else { "s" });
+                let row = adw::ActionRow::builder()
+                    .title(&coll.name)
+                    .subtitle(&subtitle)
+                    .activatable(true)
+                    .build();
+                row.add_prefix(&dot);
+
+                if active_collection.get() == Some(coll.id) {
+                    row.add_suffix(&gtk4::Image::from_icon_name("object-select-symbolic"));
+                }
+
+                list.append(&row);
+            }
+
+            // Separator + Manage row.
+            let sep = gtk4::Separator::new(gtk4::Orientation::Horizontal);
+            list.append(&sep);
+            let manage_row = adw::ActionRow::builder()
+                .title("Manage Collections…")
+                .activatable(true)
+                .build();
+            list.append(&manage_row);
+
+            // Click handling.
+            let active_collection = active_collection.clone();
+            let reload_grid = reload_grid.clone();
+            let db2 = db.clone();
+            let coll_menu_btn = coll_menu_btn.clone();
+            let collections_clone = collections.clone();
+            list.connect_row_activated(move |_, row| {
+                let idx = row.index();
+                if idx == 0 {
+                    // "All"
+                    active_collection.set(None);
+                    coll_menu_btn.set_icon_name("folder-symbolic");
+                    coll_menu_btn.popdown();
+                    reload_grid();
+                } else if idx as usize <= collections_clone.len() {
+                    let coll = &collections_clone[(idx - 1) as usize];
+                    active_collection.set(Some(coll.id));
+                    coll_menu_btn.set_label(&coll.name);
+                    coll_menu_btn.popdown();
+                    reload_grid();
+                } else {
+                    // "Manage Collections…"
+                    coll_menu_btn.popdown();
+                    if let Some(win) = coll_menu_btn.root().and_downcast::<gtk4::Window>() {
+                        let reload_grid = reload_grid.clone();
+                        collection_manager::open_manager(&win, &db2, move || {
+                            reload_grid();
+                        });
+                    }
+                }
+            });
+
+            let scroll = gtk4::ScrolledWindow::builder()
+                .hscrollbar_policy(gtk4::PolicyType::Never)
+                .vscrollbar_policy(gtk4::PolicyType::Automatic)
+                .max_content_height(400)
+                .propagate_natural_height(true)
+                .build();
+            scroll.set_child(Some(&list));
+
+            let popover = gtk4::Popover::new();
+            popover.set_child(Some(&scroll));
+            popover
+        })
+    };
+
+    // Set an initial popover and rebuild its content each time it is shown.
+    {
+        let popover = build_coll_popover();
+        coll_menu_btn.set_popover(Some(&popover));
+    }
+    // Rebuild on each open so collection list is fresh.
+    coll_menu_btn.connect_notify_local(Some("active"), {
+        let build_coll_popover = build_coll_popover.clone();
+        let coll_menu_btn = coll_menu_btn.clone();
+        move |btn, _| {
+            // MenuButton "active" is true when the popover is about to show.
+            if btn.is_active() {
+                let popover = build_coll_popover();
+                coll_menu_btn.set_popover(Some(&popover));
+                popover.popup();
+            }
         }
     });
 
@@ -254,13 +425,13 @@ pub fn build_library_page(
     // ── Initial load + background workers ─────────────────────────
     let loaded = Rc::new(Cell::new(false));
     page.connect_map({
-        let grid = library_grid.clone();
+        let reload_grid = reload_grid.clone();
         let db = db.clone();
         let tagger = tagger.clone();
         move |_| {
             if !loaded.get() {
                 loaded.set(true);
-                grid.load(SearchQuery::default());
+                reload_grid();
                 maple_db::spawn_metadata_filler(db.clone());
 
                 if settings.ai.enabled {

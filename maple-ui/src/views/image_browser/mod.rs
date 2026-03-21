@@ -389,124 +389,114 @@ pub fn build_browser_page(
 
     // ── Keyboard controller ─────────────────────────────────────
     {
-        let state = state.clone();
-        let preview_picture = preview_picture.clone();
-        let preview_scroll = preview_scroll.clone();
-        let filename_label = filename_label.clone();
-        let selected_label = selected_label.clone();
-        let counter_label = counter_label.clone();
-        let sel_count_label = sel_count_label.clone();
-        let copy_btn = copy_btn.clone();
-        let strip_box = strip_box.clone();
-        let strip_scroll = strip_scroll.clone();
+        let hotkeys = crate::HotkeyManager::new();
 
-        let key_ctrl = gtk4::EventControllerKey::new();
-        key_ctrl.connect_key_pressed(move |_, keyval, _, _| {
-            let mut st = state.borrow_mut();
-            let len = st.images.len();
-            if len == 0 {
-                return glib::Propagation::Proceed;
-            }
-
-            match keyval {
-                gdk::Key::Up | gdk::Key::Left => {
-                    st.zoom = 1.0;
-                    let old_idx = st.current;
-                    let newly_rejected = st.auto_reject_current();
+        // Helper: navigate (prev or next) with auto-reject.
+        let make_nav = |go_prev: bool| {
+            let state = state.clone();
+            let preview_picture = preview_picture.clone();
+            let preview_scroll = preview_scroll.clone();
+            let filename_label = filename_label.clone();
+            let selected_label = selected_label.clone();
+            let counter_label = counter_label.clone();
+            let strip_box = strip_box.clone();
+            let strip_scroll = strip_scroll.clone();
+            move || {
+                let mut st = state.borrow_mut();
+                if st.images.is_empty() {
+                    return glib::Propagation::Proceed;
+                }
+                st.zoom = 1.0;
+                let old_idx = st.current;
+                let newly_rejected = st.auto_reject_current();
+                if go_prev {
                     st.go_prev();
-                    drop(st);
-                    if let Some(hash) = newly_rejected {
-                        update_strip_opacity(&strip_box, old_idx, true);
-                        let rejected_set = state.borrow().rejected_set.clone();
-                        let library_dir = state.borrow().library_dir.clone();
-                        std::thread::spawn(move || {
-                            let mut set = rejected_set.lock().unwrap();
-                            set.insert(&hash);
-                            if let Err(e) = set.save_rejected(&library_dir) {
-                                tracing::warn!("Failed to save rejected set: {e}");
-                            }
-                        });
-                    }
-                    update_preview(
-                        &state,
-                        &preview_picture,
-                        &preview_scroll,
-                        &filename_label,
-                        &selected_label,
-                        &counter_label,
-                        &strip_box,
-                        &strip_scroll,
-                    );
-                    glib::Propagation::Stop
-                }
-                gdk::Key::Down | gdk::Key::Right => {
-                    st.zoom = 1.0;
-                    let old_idx = st.current;
-                    let newly_rejected = st.auto_reject_current();
+                } else {
                     st.go_next();
-                    drop(st);
-                    if let Some(hash) = newly_rejected {
-                        update_strip_opacity(&strip_box, old_idx, true);
-                        let rejected_set = state.borrow().rejected_set.clone();
-                        let library_dir = state.borrow().library_dir.clone();
-                        std::thread::spawn(move || {
-                            let mut set = rejected_set.lock().unwrap();
-                            set.insert(&hash);
-                            if let Err(e) = set.save_rejected(&library_dir) {
-                                tracing::warn!("Failed to save rejected set: {e}");
-                            }
-                        });
-                    }
-                    update_preview(
-                        &state,
-                        &preview_picture,
-                        &preview_scroll,
-                        &filename_label,
-                        &selected_label,
-                        &counter_label,
-                        &strip_box,
-                        &strip_scroll,
-                    );
-                    glib::Propagation::Stop
                 }
-                gdk::Key::x => {
-                    let idx = st.current;
-                    let was_rejected = st.images[idx].rejected;
-                    if st.selected.contains(&idx) {
-                        st.selected.remove(&idx);
-                    } else {
-                        // Un-reject if the image was previously auto-rejected.
-                        if was_rejected {
-                            st.images[idx].rejected = false;
-                            if st.rejected_count > 0 {
-                                st.rejected_count -= 1;
-                            }
+                drop(st);
+                if let Some(hash) = newly_rejected {
+                    update_strip_opacity(&strip_box, old_idx, true);
+                    let rejected_set = state.borrow().rejected_set.clone();
+                    let library_dir = state.borrow().library_dir.clone();
+                    std::thread::spawn(move || {
+                        let mut set = rejected_set.lock().unwrap();
+                        set.insert(&hash);
+                        if let Err(e) = set.save_rejected(&library_dir) {
+                            tracing::warn!("Failed to save rejected set: {e}");
                         }
-                        st.selected.insert(idx);
-                    }
-                    let sel_count = st.selected.len();
-                    drop(st);
-                    if was_rejected {
-                        update_strip_opacity(&strip_box, idx, false);
-                    }
-                    sel_count_label.set_label(&format!("{sel_count} selected"));
-                    copy_btn.set_sensitive(sel_count > 0);
-                    update_preview(
-                        &state,
-                        &preview_picture,
-                        &preview_scroll,
-                        &filename_label,
-                        &selected_label,
-                        &counter_label,
-                        &strip_box,
-                        &strip_scroll,
-                    );
-                    glib::Propagation::Stop
+                    });
                 }
-                _ => glib::Propagation::Proceed,
+                update_preview(
+                    &state,
+                    &preview_picture,
+                    &preview_scroll,
+                    &filename_label,
+                    &selected_label,
+                    &counter_label,
+                    &strip_box,
+                    &strip_scroll,
+                );
+                glib::Propagation::Stop
             }
-        });
-        page.child().unwrap().add_controller(key_ctrl);
+        };
+
+        hotkeys.register("nav-prev", gdk::Key::Up, make_nav(true));
+        hotkeys.register("nav-prev-alt", gdk::Key::Left, make_nav(true));
+        hotkeys.register("nav-next", gdk::Key::Down, make_nav(false));
+        hotkeys.register("nav-next-alt", gdk::Key::Right, make_nav(false));
+
+        {
+            let state = state.clone();
+            let preview_picture = preview_picture.clone();
+            let preview_scroll = preview_scroll.clone();
+            let filename_label = filename_label.clone();
+            let selected_label = selected_label.clone();
+            let counter_label = counter_label.clone();
+            let sel_count_label = sel_count_label.clone();
+            let copy_btn = copy_btn.clone();
+            let strip_box = strip_box.clone();
+            let strip_scroll = strip_scroll.clone();
+            hotkeys.register("toggle-select", gdk::Key::x, move || {
+                let mut st = state.borrow_mut();
+                if st.images.is_empty() {
+                    return glib::Propagation::Proceed;
+                }
+                let idx = st.current;
+                let was_rejected = st.images[idx].rejected;
+                if st.selected.contains(&idx) {
+                    st.selected.remove(&idx);
+                } else {
+                    if was_rejected {
+                        st.images[idx].rejected = false;
+                        if st.rejected_count > 0 {
+                            st.rejected_count -= 1;
+                        }
+                    }
+                    st.selected.insert(idx);
+                }
+                let sel_count = st.selected.len();
+                drop(st);
+                if was_rejected {
+                    update_strip_opacity(&strip_box, idx, false);
+                }
+                sel_count_label.set_label(&format!("{sel_count} selected"));
+                copy_btn.set_sensitive(sel_count > 0);
+                update_preview(
+                    &state,
+                    &preview_picture,
+                    &preview_scroll,
+                    &filename_label,
+                    &selected_label,
+                    &counter_label,
+                    &strip_box,
+                    &strip_scroll,
+                );
+                glib::Propagation::Stop
+            });
+        }
+
+        hotkeys.attach(&page.child().unwrap());
     }
 
     // ── Filter toggle ─────────────────────────────────────────────

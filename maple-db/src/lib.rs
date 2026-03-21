@@ -11,6 +11,7 @@ mod schema;
 pub mod worker;
 
 pub mod ai;
+pub mod collections;
 pub mod face_detector;
 pub mod faces;
 pub mod metadata;
@@ -18,6 +19,7 @@ pub mod models;
 pub mod query;
 
 pub use ai::{spawn_ai_tagger, AiDescriber, AiTagger, LmStudioDescriber};
+pub use collections::Collection;
 pub use face_detector::{spawn_face_tagger, DetectedFace, FaceDetector, FaceTagger};
 pub use faces::{best_person_match, best_person_matches, cosine_similarity, FaceDetection, Person};
 pub use metadata::{extract_metadata, spawn_metadata_filler, ImageMetadata};
@@ -243,8 +245,8 @@ impl Database {
     ///   any assigned person name.
     pub fn search_images(&self, query: &SearchQuery) -> anyhow::Result<Vec<LibraryImage>> {
         match &query.text {
-            Some(text) => self.search_images_text(text, query.limit, query.offset),
-            None => self.search_images_all(query.limit, query.offset),
+            Some(text) => self.search_images_text(text, query.limit, query.offset, query.collection_id),
+            None => self.search_images_all(query.limit, query.offset, query.collection_id),
         }
     }
 
@@ -253,21 +255,40 @@ impl Database {
         &self,
         limit: Option<usize>,
         offset: Option<usize>,
+        collection_id: Option<i64>,
     ) -> anyhow::Result<Vec<LibraryImage>> {
+        use rusqlite::types::Value;
+
         let limit = limit.unwrap_or(500) as i64;
         let offset = offset.unwrap_or(0) as i64;
-        let mut stmt = self.conn.prepare(
+
+        let coll_clause = if collection_id.is_some() {
+            " AND id IN (SELECT image_id FROM collection_images WHERE collection_id = ?)"
+        } else {
+            ""
+        };
+
+        let sql = format!(
             "SELECT id, path, added_at, status,
                     filename, taken_at, make, model, lens,
                     focal_length, aperture, iso,
                     width, height, orientation, raw_path
              FROM images
-             WHERE status = 'present'
+             WHERE status = 'present'{coll_clause}
              ORDER BY added_at DESC
-             LIMIT ?1 OFFSET ?2",
-        )?;
+             LIMIT ? OFFSET ?"
+        );
+
+        let mut params: Vec<Value> = Vec::new();
+        if let Some(cid) = collection_id {
+            params.push(Value::Integer(cid));
+        }
+        params.push(Value::Integer(limit));
+        params.push(Value::Integer(offset));
+
+        let mut stmt = self.conn.prepare(&sql)?;
         let rows = stmt
-            .query_map(params![limit, offset], row_to_library_image)?
+            .query_map(rusqlite::params_from_iter(params), row_to_library_image)?
             .filter_map(|r| r.ok())
             .collect();
         Ok(rows)
@@ -282,6 +303,7 @@ impl Database {
         text: &str,
         limit: Option<usize>,
         offset: Option<usize>,
+        collection_id: Option<i64>,
     ) -> anyhow::Result<Vec<LibraryImage>> {
         let limit = limit.unwrap_or(500) as i64;
         let offset = offset.unwrap_or(0) as i64;
@@ -317,6 +339,12 @@ impl Database {
             .collect::<Vec<_>>()
             .join(" AND ");
 
+        let coll_clause = if collection_id.is_some() {
+            " AND i.id IN (SELECT image_id FROM collection_images WHERE collection_id = ?)"
+        } else {
+            ""
+        };
+
         let sql = format!(
             "SELECT DISTINCT i.id, i.path, i.added_at, i.status,
                     i.filename, i.taken_at, i.make, i.model, i.lens,
@@ -327,16 +355,22 @@ impl Database {
              LEFT JOIN face_detections fd ON fd.image_id = i.id
              LEFT JOIN persons p ON p.id = fd.person_id
              WHERE i.status = 'present'
-               AND {token_conditions}
+               AND {token_conditions}{coll_clause}
              ORDER BY i.added_at DESC
              LIMIT ? OFFSET ?"
         );
 
         // Each token pattern appears three times: EXIF, AI desc, person name.
         use rusqlite::types::Value;
-        let params: Vec<Value> = like_patterns
+        let mut params: Vec<Value> = like_patterns
             .into_iter()
             .flat_map(|p| [Value::Text(p.clone()), Value::Text(p.clone()), Value::Text(p)])
+            .collect();
+        if let Some(cid) = collection_id {
+            params.push(Value::Integer(cid));
+        }
+        let params: Vec<Value> = params
+            .into_iter()
             .chain([Value::Integer(limit), Value::Integer(offset)])
             .collect();
 

@@ -24,9 +24,6 @@ pub(super) fn fill_info_bar(bar: &gtk4::Box, image: &LibraryImage) {
     let m = &image.meta;
     let mut fields: Vec<String> = Vec::new();
 
-    if let Some(ref name) = m.filename {
-        fields.push(name.clone());
-    }
     match (&m.make, &m.model) {
         (Some(make), Some(model)) => fields.push(format!("{make} {model}")),
         (Some(make), None) => fields.push(make.clone()),

@@ -69,3 +69,10 @@ tagging_top_k = 5
 # Execution device for ONNX inference.
 # Accepts: "cpu" (default), "cuda:N" (NVIDIA GPU), "tensorrt:N".
 device = "cpu"
+
+# ── Collections ────────────────────────────────────────────────
+
+[collections]
+# Key to add the current detail-view image to the last-used collection.
+# Uses GTK key names (e.g. "a", "f", "space").
+add_hotkey = "a"

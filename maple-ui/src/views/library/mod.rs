@@ -2,6 +2,7 @@
 
 pub(super) mod face_shared;
 pub(super) mod image_loader;
+pub(crate) mod collection_manager;
 mod detail_window;
 mod face_tagging;
 pub mod grid;

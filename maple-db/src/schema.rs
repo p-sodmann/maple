@@ -5,6 +5,8 @@
 //!   1 → 2 : metadata columns + FTS5 index + sync triggers + backfill
 //!   2 → 3 : ai_descriptions table (per-model AI-generated descriptions)
 //!   3 → 4 : persons + face_detections tables (ONNX face recognition)
+//!   4 → 5 : raw_path column for companion RAW files
+//!   5 → 6 : collections + collection_images tables
 
 use rusqlite::Connection;
 
@@ -131,6 +133,32 @@ const V4: &str = "
 
 const V5_COLUMN: &str = "ALTER TABLE images ADD COLUMN raw_path TEXT";
 
+// ── V6: collections ──────────────────────────────────────────────
+
+/// Named, colour-coded collections and a many-to-many link table.
+const V6: &str = "
+    CREATE TABLE IF NOT EXISTS collections (
+        id         INTEGER PRIMARY KEY,
+        name       TEXT    NOT NULL UNIQUE,
+        color      TEXT    NOT NULL DEFAULT '#3584e4',
+        created_at INTEGER NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS collection_images (
+        id            INTEGER PRIMARY KEY,
+        collection_id INTEGER NOT NULL REFERENCES collections(id) ON DELETE CASCADE,
+        image_id      INTEGER NOT NULL REFERENCES images(id)      ON DELETE CASCADE,
+        added_at      INTEGER NOT NULL
+    );
+
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_coll_img_unique
+        ON collection_images(collection_id, image_id);
+    CREATE INDEX IF NOT EXISTS idx_coll_img_collection
+        ON collection_images(collection_id);
+    CREATE INDEX IF NOT EXISTS idx_coll_img_image
+        ON collection_images(image_id);
+";
+
 // ── Migration runner ─────────────────────────────────────────────
 
 /// Apply all pending schema migrations to `conn`.
@@ -176,6 +204,11 @@ pub fn ensure_schema(conn: &Connection) -> anyhow::Result<()> {
         }
         dedup_raw_companions(conn)?;
         conn.execute_batch("PRAGMA user_version = 5")?;
+    }
+
+    if version < 6 {
+        conn.execute_batch(V6)?;
+        conn.execute_batch("PRAGMA user_version = 6")?;
     }
 
     Ok(())

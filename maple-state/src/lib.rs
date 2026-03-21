@@ -264,6 +264,31 @@ impl Default for AiSettings {
     }
 }
 
+/// Collection hotkey settings.
+///
+/// Stored under `[collections]` in `settings.toml`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CollectionSettings {
+    /// Key name (GTK key name) to add the current image in the detail
+    /// viewer to the last-used collection.  Default: `"a"`.
+    #[serde(default = "CollectionSettings::default_add_hotkey")]
+    pub add_hotkey: String,
+}
+
+impl CollectionSettings {
+    fn default_add_hotkey() -> String {
+        "a".into()
+    }
+}
+
+impl Default for CollectionSettings {
+    fn default() -> Self {
+        Self {
+            add_hotkey: Self::default_add_hotkey(),
+        }
+    }
+}
+
 /// The bundled defaults.toml — written to disk on first launch so users
 /// can discover and edit every setting.
 const DEFAULTS_TOML: &str = include_str!("../defaults.toml");
@@ -303,6 +328,9 @@ pub struct Settings {
     /// Face detection / recognition settings.
     #[serde(default)]
     pub face: FaceSettings,
+    /// Collection hotkey settings.
+    #[serde(default)]
+    pub collections: CollectionSettings,
 }
 
 impl Settings {
@@ -385,6 +413,7 @@ impl Default for Settings {
             folder_format: Self::default_folder_format(),
             ai: AiSettings::default(),
             face: FaceSettings::default(),
+            collections: CollectionSettings::default(),
         }
     }
 }
