@@ -1,5 +1,10 @@
 /* Maple — application-level CSS */
 
+/* White background for the main window */
+window.background {
+    background-color: white;
+}
+
 /* Slow down the spinner used in thumbnail placeholders.
    GTK4 spinner animation is ~1.05s by default; we stretch it to 3s. */
 .maple-slow-spinner {

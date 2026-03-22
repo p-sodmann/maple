@@ -6,10 +6,21 @@
 
 use std::sync::{Arc, Mutex};
 
+use gtk4::gdk;
+use gtk4::glib;
 use gtk4::prelude::*;
 use libadwaita as adw;
 
 use super::{library, source_picker};
+
+fn logo_picture(size: i32) -> gtk4::Picture {
+    let bytes = glib::Bytes::from_static(include_bytes!("../../../assets/logo.png"));
+    let texture = gdk::Texture::from_bytes(&bytes).expect("failed to load logo");
+    let picture = gtk4::Picture::for_paintable(&texture);
+    picture.set_content_fit(gtk4::ContentFit::Contain);
+    picture.set_size_request(size, size);
+    picture
+}
 
 /// Build the home page and wire navigation into `nav_view`.
 pub fn build_home_page(
@@ -42,11 +53,17 @@ pub fn build_home_page(
         .child(&buttons)
         .build();
 
+    let content = gtk4::Box::builder()
+        .orientation(gtk4::Orientation::Vertical)
+        .spacing(12)
+        .build();
+    content.append(&logo_picture(256));
+    content.append(&clamp);
+
     let status_page = adw::StatusPage::builder()
-        .icon_name("camera-photo-symbolic")
         .title("Maple")
         .description("Import and browse your photo library.")
-        .child(&clamp)
+        .child(&content)
         .build();
 
     let toolbar_view = adw::ToolbarView::new();
