@@ -4,7 +4,6 @@ use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 
-use gtk4::gdk;
 use gtk4::prelude::*;
 use libadwaita as adw;
 use adw::prelude::*;
@@ -197,37 +196,16 @@ impl CollectionBar {
         let chip_box = gtk4::Box::builder()
             .orientation(gtk4::Orientation::Horizontal)
             .spacing(4)
-            .css_classes(["card"])
+            .css_classes(["maple-chip"])
             .build();
-        chip_box.set_margin_start(2);
-        chip_box.set_margin_end(2);
         chip_box.set_margin_top(2);
         chip_box.set_margin_bottom(2);
 
-        // Color dot.
-        let dot = gtk4::DrawingArea::builder()
-            .content_width(10)
-            .content_height(10)
-            .margin_start(10)
-            .valign(gtk4::Align::Center)
-            .build();
-        let hex = coll.color.clone();
-        dot.set_draw_func(move |_, cr, w, h| {
-            if let Ok(rgba) = gdk::RGBA::parse(&hex) {
-                cr.set_source_rgba(
-                    rgba.red() as f64,
-                    rgba.green() as f64,
-                    rgba.blue() as f64,
-                    1.0,
-                );
-                let r = w.min(h) as f64 / 2.0;
-                cr.arc(w as f64 / 2.0, h as f64 / 2.0, r, 0.0, 2.0 * std::f64::consts::PI);
-                let _ = cr.fill();
-            }
-        });
+        let dot = crate::widgets::color_dot(&coll.color, 10);
+        dot.set_margin_start(8);
 
         let label = gtk4::Label::new(Some(&coll.name));
-        label.set_margin_start(4);
+        label.set_margin_start(2);
         label.set_margin_end(2);
         label.add_css_class("caption");
 

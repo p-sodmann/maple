@@ -178,9 +178,10 @@ impl EmbeddingMatrix {
 ///
 /// Returns `None` when image dimensions are unknown.
 ///
-/// At zoom <= 1.0 the image is in ContentFit::Contain (letterboxed).
-/// At zoom > 1.0 the image is ContentFit::Fill with a size_request and
-/// the scrolled window's adjustments carry the scroll offset.
+/// The image is always in ContentFit::Contain: at any zoom an axis whose
+/// drawn size is smaller than the viewport gets a centring margin, while
+/// an overflowing axis is positioned by the scroll adjustment (whose value
+/// is 0 when there is nothing to scroll).
 pub fn face_screen_rect(
     [x1, y1, x2, y2]: [f32; 4],
     img_w: i32,
@@ -196,28 +197,18 @@ pub fn face_screen_rect(
     }
     let fit = f64::min(vw / img_w as f64, vh / img_h as f64);
 
-    let (sx, sy, sw, sh) = if zoom <= 1.0 {
-        let draw_w = img_w as f64 * fit;
-        let draw_h = img_h as f64 * fit;
-        let off_x = (vw - draw_w) / 2.0;
-        let off_y = (vh - draw_h) / 2.0;
-        (
-            off_x + x1 as f64 * draw_w,
-            off_y + y1 as f64 * draw_h,
-            (x2 - x1) as f64 * draw_w,
-            (y2 - y1) as f64 * draw_h,
-        )
-    } else {
-        let ppx = fit * zoom;
-        (
-            x1 as f64 * img_w as f64 * ppx - scroll_x,
-            y1 as f64 * img_h as f64 * ppx - scroll_y,
-            (x2 - x1) as f64 * img_w as f64 * ppx,
-            (y2 - y1) as f64 * img_h as f64 * ppx,
-        )
-    };
+    let ppx = fit * zoom;
+    let draw_w = img_w as f64 * ppx;
+    let draw_h = img_h as f64 * ppx;
+    let off_x = ((vw - draw_w) / 2.0).max(0.0);
+    let off_y = ((vh - draw_h) / 2.0).max(0.0);
 
-    Some((sx, sy, sw, sh))
+    Some((
+        off_x + x1 as f64 * draw_w - scroll_x,
+        off_y + y1 as f64 * draw_h - scroll_y,
+        (x2 - x1) as f64 * draw_w,
+        (y2 - y1) as f64 * draw_h,
+    ))
 }
 
 /// Find the next unassigned real detection index, starting from `start_idx`.

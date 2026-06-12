@@ -5,23 +5,13 @@ use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 
-use gtk4::gdk;
-use gtk4::glib;
 use gtk4::prelude::*;
 use gtk4::gio;
 use libadwaita as adw;
 use adw::prelude::*;
 
 use super::image_browser;
-
-fn logo_picture(size: i32) -> gtk4::Picture {
-    let bytes = glib::Bytes::from_static(include_bytes!("../../../assets/logo.png"));
-    let texture = gdk::Texture::from_bytes(&bytes).expect("failed to load logo");
-    let picture = gtk4::Picture::for_paintable(&texture);
-    picture.set_content_fit(gtk4::ContentFit::Contain);
-    picture.set_size_request(size, size);
-    picture
-}
+use crate::widgets;
 
 /// Local UI state for folder selection.
 struct PickerState {
@@ -53,6 +43,8 @@ pub fn build_picker_page(
         })
         .build();
 
+    source_row.add_prefix(&gtk4::Image::from_icon_name("camera-photo-symbolic"));
+
     let source_btn = gtk4::Button::builder()
         .icon_name("folder-open-symbolic")
         .valign(gtk4::Align::Center)
@@ -71,6 +63,8 @@ pub fn build_picker_page(
         })
         .sensitive(has_source)
         .build();
+
+    dest_row.add_prefix(&gtk4::Image::from_icon_name("folder-download-symbolic"));
 
     let dest_btn = gtk4::Button::builder()
         .icon_name("folder-open-symbolic")
@@ -91,36 +85,41 @@ pub fn build_picker_page(
     // ── Scan button ─────────────────────────────────────────────
     let both_set = session.source.is_some() && session.destination.is_some();
     let scan_btn = gtk4::Button::builder()
-        .label("Start Scan")
+        .child(&adw::ButtonContent::builder()
+            .icon_name("system-search-symbolic")
+            .label("Start Scan")
+            .build())
         .css_classes(["suggested-action", "pill"])
         .halign(gtk4::Align::Center)
         .sensitive(both_set)
         .build();
 
     // ── Layout ──────────────────────────────────────────────────
+    // The list fills the clamp width so both pages share the same
+    // centred-column rhythm as the home page.
     let controls = gtk4::Box::builder()
         .orientation(gtk4::Orientation::Vertical)
         .spacing(24)
-        .halign(gtk4::Align::Center)
         .build();
     controls.append(&folder_list);
     controls.append(&scan_btn);
 
     let clamp = adw::Clamp::builder()
-        .maximum_size(500)
+        .maximum_size(480)
         .child(&controls)
         .build();
 
     let content = gtk4::Box::builder()
         .orientation(gtk4::Orientation::Vertical)
-        .spacing(12)
+        .spacing(24)
         .build();
-    content.append(&logo_picture(256));
+    content.append(&widgets::logo_picture(140));
     content.append(&clamp);
 
+    // Task page, not a brand page — the title says what to do here.
     let status_page = adw::StatusPage::builder()
-        .title("Maple")
-        .description("Import your best shots.\nSelect source and destination folders to begin.")
+        .title("Import Photos")
+        .description("Choose where your photos come from and where the library lives.")
         .child(&content)
         .build();
 
@@ -128,9 +127,10 @@ pub fn build_picker_page(
     let toolbar_view = adw::ToolbarView::new();
     toolbar_view.add_top_bar(&header);
     toolbar_view.set_content(Some(&status_page));
+    toolbar_view.add_css_class("maple-hero");
 
     let page = adw::NavigationPage::builder()
-        .title("Maple")
+        .title("Import Photos")
         .child(&toolbar_view)
         .build();
 

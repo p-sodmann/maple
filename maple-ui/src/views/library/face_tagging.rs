@@ -130,6 +130,7 @@ pub fn build_face_tagging_page(
     image_overlay.add_overlay(&drawing_area);
     image_overlay.set_hexpand(true);
     image_overlay.set_vexpand(true);
+    image_overlay.add_css_class("maple-photo-surface");
 
     // ── Right panel ───────────────────────────────────────────────
     let status_label = gtk4::Label::builder()
@@ -177,13 +178,10 @@ pub fn build_face_tagging_page(
     let panel = gtk4::Box::builder()
         .orientation(gtk4::Orientation::Vertical)
         .spacing(12)
-        .margin_top(12)
-        .margin_bottom(12)
-        .margin_start(12)
-        .margin_end(12)
         .width_request(320)
         .hexpand(false)
         .vexpand(true)
+        .css_classes(["maple-sidebar-panel"])
         .build();
     panel.append(&status_label);
     panel.append(&matches_scroll);
@@ -217,6 +215,7 @@ pub fn build_face_tagging_page(
         .vexpand(true)
         .build();
     body.append(&image_overlay);
+    body.append(&gtk4::Separator::new(gtk4::Orientation::Vertical));
     body.append(&panel);
     body.append(&done_box);
 

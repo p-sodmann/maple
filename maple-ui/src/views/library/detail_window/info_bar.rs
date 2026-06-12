@@ -8,9 +8,10 @@ pub(super) fn build_empty_info_bar() -> gtk4::Box {
     gtk4::Box::builder()
         .orientation(gtk4::Orientation::Horizontal)
         .spacing(16)
+        .halign(gtk4::Align::Center)
         .margin_start(12)
         .margin_end(12)
-        .margin_top(6)
+        .margin_top(2)
         .margin_bottom(6)
         .build()
 }

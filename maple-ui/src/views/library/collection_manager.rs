@@ -2,7 +2,6 @@
 
 use std::sync::{Arc, Mutex};
 
-use gtk4::gdk;
 use gtk4::prelude::*;
 use libadwaita as adw;
 use adw::prelude::*;
@@ -105,13 +104,30 @@ fn populate_list(
         .unwrap_or_default();
 
     if collections.is_empty() {
+        let icon = gtk4::Image::from_icon_name("folder-symbolic");
+        icon.set_pixel_size(32);
+        icon.add_css_class("dim-label");
+
         let label = gtk4::Label::builder()
             .label("No collections yet")
             .css_classes(["dim-label"])
+            .build();
+
+        let hint = gtk4::Label::builder()
+            .label("Use + to create one")
+            .css_classes(["dim-label", "caption"])
+            .build();
+
+        let empty = gtk4::Box::builder()
+            .orientation(gtk4::Orientation::Vertical)
+            .spacing(6)
             .margin_top(24)
             .margin_bottom(24)
             .build();
-        list_box.append(&label);
+        empty.append(&icon);
+        empty.append(&label);
+        empty.append(&hint);
+        list_box.append(&empty);
         return;
     }
 
@@ -127,26 +143,7 @@ fn build_collection_row(
     db: &Arc<Mutex<Database>>,
     on_changed: &std::rc::Rc<impl Fn() + 'static>,
 ) -> adw::ActionRow {
-    let color_dot = gtk4::DrawingArea::builder()
-        .content_width(16)
-        .content_height(16)
-        .valign(gtk4::Align::Center)
-        .build();
-
-    let hex = coll.color.clone();
-    color_dot.set_draw_func(move |_, cr, w, h| {
-        if let Some(rgba) = parse_hex(&hex) {
-            cr.set_source_rgba(
-                rgba.red() as f64,
-                rgba.green() as f64,
-                rgba.blue() as f64,
-                1.0,
-            );
-            let radius = w.min(h) as f64 / 2.0;
-            cr.arc(w as f64 / 2.0, h as f64 / 2.0, radius, 0.0, 2.0 * std::f64::consts::PI);
-            let _ = cr.fill();
-        }
-    });
+    let color_dot = crate::widgets::color_dot(&coll.color, 16);
 
     let count_label = format!("{} image{}", coll.image_count, if coll.image_count == 1 { "" } else { "s" });
 
@@ -214,26 +211,7 @@ fn open_new_collection_dialog(
             .tooltip_text(_name)
             .build();
 
-        let da = gtk4::DrawingArea::builder()
-            .content_width(24)
-            .content_height(24)
-            .build();
-
-        let hex_c = hex.to_string();
-        da.set_draw_func(move |_, cr, w, h| {
-            if let Some(rgba) = parse_hex(&hex_c) {
-                cr.set_source_rgba(
-                    rgba.red() as f64,
-                    rgba.green() as f64,
-                    rgba.blue() as f64,
-                    1.0,
-                );
-                let radius = w.min(h) as f64 / 2.0;
-                cr.arc(w as f64 / 2.0, h as f64 / 2.0, radius, 0.0, 2.0 * std::f64::consts::PI);
-                let _ = cr.fill();
-            }
-        });
-        btn.set_child(Some(&da));
+        btn.set_child(Some(&crate::widgets::color_dot(hex, 24)));
 
         let color_ref = selected_color.clone();
         let hex_owned = hex.to_string();
@@ -321,11 +299,4 @@ fn open_new_collection_dialog(
     });
 
     dialog.present();
-}
-
-// ── Helpers ─────────────────────────────────────────────────────
-
-fn parse_hex(hex: &str) -> Option<gdk::RGBA> {
-    let rgba = gdk::RGBA::parse(hex).ok()?;
-    Some(rgba)
 }

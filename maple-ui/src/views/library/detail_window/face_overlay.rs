@@ -62,6 +62,7 @@ pub struct FaceOverlay {
 impl FaceOverlay {
     pub fn new(
         scrolled: &gtk4::ScrolledWindow,
+        picture: &gtk4::Picture,
         zoom: Rc<Cell<f64>>,
         img_dims: Rc<Cell<(i32, i32)>>,
         db: Arc<Mutex<maple_db::Database>>,
@@ -164,6 +165,33 @@ impl FaceOverlay {
                     let _ = cx.show_text(&label);
                 }
             }
+        });
+
+        // Redraw the overlay whenever the view pans or the zoomed size
+        // changes. Box positions are computed from the adjustment values at
+        // draw time, so without this the previous frame lingers until some
+        // unrelated invalidation (e.g. toggling the overlay) repaints it.
+        // Zoom always updates the adjustment bounds ("changed"), pan updates
+        // their values ("value-changed").
+        for adj in [scrolled.hadjustment(), scrolled.vadjustment()] {
+            adj.connect_value_changed({
+                let drawing_area = drawing_area.clone();
+                move |_| drawing_area.queue_draw()
+            });
+            adj.connect_changed({
+                let drawing_area = drawing_area.clone();
+                move |_| drawing_area.queue_draw()
+            });
+        }
+
+        // Redraw when a new image is displayed. The async loader updates
+        // `img_dims` just before swapping the paintable; without this the
+        // boxes for the new image stay positioned with the previous image's
+        // dimensions until some other invalidation — visible whenever the
+        // two images have different aspect ratios.
+        picture.connect_notify_local(Some("paintable"), {
+            let drawing_area = drawing_area.clone();
+            move |_, _| drawing_area.queue_draw()
         });
 
         let container = gtk4::Overlay::new();

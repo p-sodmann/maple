@@ -49,6 +49,7 @@ pub fn build_grid_page(
         .margin_end(12)
         .margin_top(12)
         .margin_bottom(12)
+        .css_classes(["maple-grid"])
         .build();
 
     let scrolled = gtk4::ScrolledWindow::builder()
@@ -249,6 +250,7 @@ fn build_placeholder_card() -> gtk4::Box {
         .valign(gtk4::Align::Fill)
         .hexpand(true)
         .vexpand(true)
+        .css_classes(["maple-placeholder"])
         .build();
     frame.append(&spinner);
 
@@ -260,6 +262,7 @@ fn build_placeholder_card() -> gtk4::Box {
     let card = gtk4::Box::builder()
         .orientation(gtk4::Orientation::Vertical)
         .spacing(4)
+        .css_classes(["maple-card"])
         .build();
     card.append(&frame);
     card.append(&label);
@@ -272,7 +275,9 @@ fn build_placeholder_card() -> gtk4::Box {
 fn build_image_card(texture: &gdk::Texture, path: &Path) -> gtk4::Box {
     let picture = gtk4::Picture::for_paintable(texture);
     picture.set_size_request(180, 180);
-    picture.set_content_fit(gtk4::ContentFit::Contain);
+    picture.set_content_fit(gtk4::ContentFit::Cover);
+    picture.set_overflow(gtk4::Overflow::Hidden);
+    picture.add_css_class("maple-thumb");
 
     let filename = path
         .file_name()
@@ -283,10 +288,12 @@ fn build_image_card(texture: &gdk::Texture, path: &Path) -> gtk4::Box {
     label.set_ellipsize(gtk4::pango::EllipsizeMode::Middle);
     label.set_max_width_chars(18);
     label.add_css_class("caption");
+    label.add_css_class("dim-label");
 
     let card = gtk4::Box::builder()
         .orientation(gtk4::Orientation::Vertical)
         .spacing(4)
+        .css_classes(["maple-card"])
         .build();
     card.append(&picture);
     card.append(&label);

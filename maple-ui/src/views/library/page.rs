@@ -87,19 +87,16 @@ pub fn build_library_page(
         }
     });
 
+    // The search bar lives in a second top bar so it shares the header
+    // surface instead of floating over the grid.
     let search_clamp = adw::Clamp::builder()
         .maximum_size(600)
         .child(&search_entry)
-        .margin_top(8)
+        .margin_top(6)
         .margin_bottom(8)
+        .margin_start(12)
+        .margin_end(12)
         .build();
-
-    // ── Layout ────────────────────────────────────────────────────
-    let content = gtk4::Box::builder()
-        .orientation(gtk4::Orientation::Vertical)
-        .build();
-    content.append(&search_clamp);
-    content.append(&scrolled);
 
     // ── Header ────────────────────────────────────────────────────
     let header = adw::HeaderBar::new();
@@ -178,25 +175,7 @@ pub fn build_library_page(
                 .unwrap_or_default();
 
             for coll in &collections {
-                let dot = gtk4::DrawingArea::builder()
-                    .content_width(12)
-                    .content_height(12)
-                    .valign(gtk4::Align::Center)
-                    .build();
-                let hex = coll.color.clone();
-                dot.set_draw_func(move |_, cr, w, h| {
-                    if let Ok(rgba) = gtk4::gdk::RGBA::parse(&hex) {
-                        cr.set_source_rgba(
-                            rgba.red() as f64,
-                            rgba.green() as f64,
-                            rgba.blue() as f64,
-                            1.0,
-                        );
-                        let r = w.min(h) as f64 / 2.0;
-                        cr.arc(w as f64 / 2.0, h as f64 / 2.0, r, 0.0, 2.0 * std::f64::consts::PI);
-                        let _ = cr.fill();
-                    }
-                });
+                let dot = crate::widgets::color_dot(&coll.color, 12);
 
                 let subtitle = format!("{} image{}", coll.image_count, if coll.image_count == 1 { "" } else { "s" });
                 let row = adw::ActionRow::builder()
@@ -289,7 +268,8 @@ pub fn build_library_page(
 
     let toolbar_view = adw::ToolbarView::new();
     toolbar_view.add_top_bar(&header);
-    toolbar_view.set_content(Some(&content));
+    toolbar_view.add_top_bar(&search_clamp);
+    toolbar_view.set_content(Some(&scrolled));
 
     let page = adw::NavigationPage::builder()
         .title("Library")

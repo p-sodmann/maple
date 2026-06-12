@@ -6,21 +6,11 @@
 
 use std::sync::{Arc, Mutex};
 
-use gtk4::gdk;
-use gtk4::glib;
 use gtk4::prelude::*;
 use libadwaita as adw;
 
 use super::{library, source_picker};
-
-fn logo_picture(size: i32) -> gtk4::Picture {
-    let bytes = glib::Bytes::from_static(include_bytes!("../../../assets/logo.png"));
-    let texture = gdk::Texture::from_bytes(&bytes).expect("failed to load logo");
-    let picture = gtk4::Picture::for_paintable(&texture);
-    picture.set_content_fit(gtk4::ContentFit::Contain);
-    picture.set_size_request(size, size);
-    picture
-}
+use crate::widgets;
 
 /// Build the home page and wire navigation into `nav_view`.
 pub fn build_home_page(
@@ -29,39 +19,44 @@ pub fn build_home_page(
     db: Arc<Mutex<maple_db::Database>>,
 ) -> adw::NavigationPage {
     let import_btn = gtk4::Button::builder()
-        .label("Import Photos")
+        .child(&adw::ButtonContent::builder()
+            .icon_name("folder-download-symbolic")
+            .label("Import Photos")
+            .build())
         .css_classes(["suggested-action", "pill"])
-        .halign(gtk4::Align::Center)
         .build();
 
     let library_btn = gtk4::Button::builder()
-        .label("Browse Library")
+        .child(&adw::ButtonContent::builder()
+            .icon_name("view-grid-symbolic")
+            .label("Browse Library")
+            .build())
         .css_classes(["pill"])
-        .halign(gtk4::Align::Center)
         .build();
 
+    // Stacked full-width buttons inside the clamp so both share a width.
     let buttons = gtk4::Box::builder()
         .orientation(gtk4::Orientation::Vertical)
         .spacing(12)
-        .halign(gtk4::Align::Center)
         .build();
     buttons.append(&import_btn);
     buttons.append(&library_btn);
 
     let clamp = adw::Clamp::builder()
-        .maximum_size(360)
+        .maximum_size(280)
         .child(&buttons)
         .build();
 
     let content = gtk4::Box::builder()
         .orientation(gtk4::Orientation::Vertical)
-        .spacing(12)
+        .spacing(24)
         .build();
-    content.append(&logo_picture(256));
+    content.append(&widgets::logo_picture(200));
     content.append(&clamp);
 
+    // The logo already carries the wordmark, so the status page only
+    // adds the tagline beneath it.
     let status_page = adw::StatusPage::builder()
-        .title("Maple")
         .description("Import and browse your photo library.")
         .child(&content)
         .build();
@@ -69,6 +64,7 @@ pub fn build_home_page(
     let toolbar_view = adw::ToolbarView::new();
     toolbar_view.add_top_bar(&adw::HeaderBar::new());
     toolbar_view.set_content(Some(&status_page));
+    toolbar_view.add_css_class("maple-hero");
 
     let page = adw::NavigationPage::builder()
         .title("Maple")

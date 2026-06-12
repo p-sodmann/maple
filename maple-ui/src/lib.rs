@@ -3,6 +3,7 @@
 pub mod hotkeys;
 mod thumbnail;
 mod views;
+mod widgets;
 mod window;
 
 pub use hotkeys::HotkeyManager;

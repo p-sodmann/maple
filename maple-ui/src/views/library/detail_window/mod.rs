@@ -138,6 +138,7 @@ fn build_window(
         .vscrollbar_policy(gtk4::PolicyType::Never)
         .hexpand(true)
         .vexpand(true)
+        .css_classes(["maple-photo-surface"])
         .build();
     scrolled.set_child(Some(&picture));
 
@@ -147,6 +148,7 @@ fn build_window(
     let settings = maple_state::Settings::load();
     let face_overlay = FaceOverlay::new(
         &scrolled,
+        &picture,
         zoom.clone(),
         img_dims.clone(),
         db.clone(),
@@ -269,21 +271,22 @@ fn build_window(
 
     let bottom_bar = gtk4::Box::builder()
         .orientation(gtk4::Orientation::Horizontal)
+        .margin_top(4)
+        .margin_bottom(4)
+        .margin_start(8)
+        .margin_end(4)
         .build();
     bottom_bar.append(&collection_bar.chips);
     bottom_bar.append(&filename_label);
 
     // ── Layout ────────────────────────────────────────────────────
-    let content = gtk4::Box::builder()
-        .orientation(gtk4::Orientation::Vertical)
-        .build();
-    content.append(&info_bar);
-    content.append(&face_overlay.container);
-    content.append(&bottom_bar);
-
+    // Info strip and collection bar are real toolbars so they share the
+    // header/footer surface instead of floating over the photo.
     let toolbar_view = adw::ToolbarView::new();
     toolbar_view.add_top_bar(&header);
-    toolbar_view.set_content(Some(&content));
+    toolbar_view.add_top_bar(&info_bar);
+    toolbar_view.add_bottom_bar(&bottom_bar);
+    toolbar_view.set_content(Some(&face_overlay.container));
 
     toast_overlay.set_child(Some(&toolbar_view));
 

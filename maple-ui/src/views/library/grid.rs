@@ -75,6 +75,7 @@ impl LibraryGrid {
             .margin_end(12)
             .margin_top(12)
             .margin_bottom(12)
+            .css_classes(["maple-grid"])
             .build();
 
         let records: Rc<RefCell<Vec<LibraryImage>>> = Rc::new(RefCell::new(Vec::new()));
@@ -225,12 +226,14 @@ fn build_placeholder(name: &str) -> gtk4::Box {
         .hexpand(true)
         .vexpand(true)
         .build();
+    spinner.add_css_class("maple-slow-spinner");
 
     let frame = gtk4::Box::builder()
         .width_request(THUMB_PX as i32)
         .height_request(THUMB_PX as i32)
         .hexpand(true)
         .vexpand(true)
+        .css_classes(["maple-placeholder"])
         .build();
     frame.append(&spinner);
 
@@ -241,20 +244,24 @@ fn build_cell(texture: &gdk::Texture, name: &str) -> gtk4::Box {
     let picture = gtk4::Picture::for_paintable(texture);
     picture.set_size_request(THUMB_PX as i32, THUMB_PX as i32);
     picture.set_content_fit(gtk4::ContentFit::Cover);
+    picture.set_overflow(gtk4::Overflow::Hidden);
+    picture.add_css_class("maple-thumb");
 
     labeled_cell(&picture, name)
 }
 
-/// Wrap any widget with a caption label beneath it.
+/// Wrap any widget in a rounded card with a caption label beneath it.
 fn labeled_cell(content: &impl IsA<gtk4::Widget>, name: &str) -> gtk4::Box {
     let label = gtk4::Label::new(Some(name));
     label.set_ellipsize(gtk4::pango::EllipsizeMode::Middle);
     label.set_max_width_chars(20);
     label.add_css_class("caption");
+    label.add_css_class("dim-label");
 
     let cell = gtk4::Box::builder()
         .orientation(gtk4::Orientation::Vertical)
         .spacing(4)
+        .css_classes(["maple-card"])
         .build();
     cell.append(content);
     cell.append(&label);

@@ -75,6 +75,55 @@ pub(super) fn wire_zoom_and_pan(
     });
 
     scrolled.add_controller(drag);
+
+    // Viewport resizes (window resize, fullscreen toggle) invalidate the
+    // picture's pixel size request, which was computed against the old fit
+    // scale. Re-apply the current zoom factor for the new viewport, keeping
+    // the image point at the viewport centre fixed. The adjustments emit
+    // "changed" whenever their page size (= viewport) changes.
+    let last_viewport: Rc<Cell<(f64, f64)>> = Rc::new(Cell::new((0.0, 0.0)));
+    for adj in [scrolled.hadjustment(), scrolled.vadjustment()] {
+        adj.connect_changed({
+            let picture = picture.clone();
+            let scrolled = scrolled.clone();
+            let zoom = zoom.clone();
+            let img_dims = img_dims.clone();
+            let last_viewport = last_viewport.clone();
+            move |_| {
+                let vw = scrolled.width() as f64;
+                let vh = scrolled.height() as f64;
+                let (ovw, ovh) = last_viewport.replace((vw, vh));
+                if (ovw, ovh) == (vw, vh) || vw <= 0.0 || vh <= 0.0 {
+                    return;
+                }
+                let z = zoom.get();
+                let (img_w, img_h) = img_dims.get();
+                if z <= 1.0 || img_w == 0 || img_h == 0 || ovw <= 0.0 || ovh <= 0.0 {
+                    return;
+                }
+                // Image point that was at the old viewport centre…
+                let old_fit = f64::min(ovw / img_w as f64, ovh / img_h as f64);
+                let anchor = anchor_image_point(
+                    &scrolled,
+                    (img_w, img_h),
+                    (ovw, ovh),
+                    old_fit * z,
+                    (ovw / 2.0, ovh / 2.0),
+                );
+                // …stays at the new viewport centre.
+                let fit = f64::min(vw / img_w as f64, vh / img_h as f64);
+                apply_zoomed_geometry(
+                    &picture,
+                    &scrolled,
+                    (img_w, img_h),
+                    (vw, vh),
+                    fit * z,
+                    anchor,
+                    (vw / 2.0, vh / 2.0),
+                );
+            }
+        });
+    }
 }
 
 pub(super) fn reset_zoom(
@@ -112,46 +161,84 @@ fn apply_zoom(
         1.0
     };
 
-    // Image-space coordinates of the pixel currently under the pointer.
-    let (cx, cy) = if old_zoom <= 1.0 {
-        // Fit mode: ContentFit::Contain centers the image in the viewport.
-        let img_left = (vw - img_w as f64 * fit) / 2.0;
-        let img_top  = (vh - img_h as f64 * fit) / 2.0;
-        (
-            ((px - img_left) / fit).clamp(0.0, img_w as f64),
-            ((py - img_top)  / fit).clamp(0.0, img_h as f64),
-        )
-    } else {
-        let ppx = fit * old_zoom;
-        (
-            (scrolled.hadjustment().value() + px) / ppx,
-            (scrolled.vadjustment().value() + py) / ppx,
-        )
-    };
+    let anchor = anchor_image_point(
+        scrolled,
+        (img_w, img_h),
+        (vw, vh),
+        fit * old_zoom,
+        (px, py),
+    );
 
     if new_zoom <= 1.0 {
         picture.set_content_fit(gtk4::ContentFit::Contain);
         picture.set_size_request(-1, -1);
         scrolled.set_policy(gtk4::PolicyType::Never, gtk4::PolicyType::Never);
     } else {
-        picture.set_content_fit(gtk4::ContentFit::Fill);
-        let ppx = fit * new_zoom;
-        let w = (img_w as f64 * ppx).round() as i32;
-        let h = (img_h as f64 * ppx).round() as i32;
-        picture.set_size_request(w, h);
-        scrolled.set_policy(gtk4::PolicyType::Automatic, gtk4::PolicyType::Automatic);
-
-        // Scroll so the image pixel under the pointer stays under the pointer.
-        // Pre-configure adjustment bounds before set_value to avoid clamping.
-        let th = (cx * ppx - px).max(0.0);
-        let tv = (cy * ppx - py).max(0.0);
-        let hadj = scrolled.hadjustment();
-        hadj.set_upper(w as f64);
-        hadj.set_page_size(vw);
-        hadj.set_value(th);
-        let vadj = scrolled.vadjustment();
-        vadj.set_upper(h as f64);
-        vadj.set_page_size(vh);
-        vadj.set_value(tv);
+        apply_zoomed_geometry(
+            picture,
+            scrolled,
+            (img_w, img_h),
+            (vw, vh),
+            fit * new_zoom,
+            anchor,
+            (px, py),
+        );
     }
+}
+
+/// Image-space coordinates of the pixel at `(px, py)` (widget coords),
+/// given `ppx` screen pixels per image pixel.
+///
+/// The picture is allocated at least the viewport size, and
+/// ContentFit::Contain centres the image inside that allocation, so an
+/// axis that doesn't overflow the viewport has a centring margin instead
+/// of a scroll offset (the adjustment value is 0 there).
+fn anchor_image_point(
+    scrolled: &gtk4::ScrolledWindow,
+    (img_w, img_h): (i32, i32),
+    (vw, vh): (f64, f64),
+    ppx: f64,
+    (px, py): (f64, f64),
+) -> (f64, f64) {
+    let img_left = ((vw - img_w as f64 * ppx) / 2.0).max(0.0);
+    let img_top  = ((vh - img_h as f64 * ppx) / 2.0).max(0.0);
+    (
+        ((scrolled.hadjustment().value() + px - img_left) / ppx).clamp(0.0, img_w as f64),
+        ((scrolled.vadjustment().value() + py - img_top) / ppx).clamp(0.0, img_h as f64),
+    )
+}
+
+/// Size the picture for `ppx` screen pixels per image pixel and scroll so
+/// that image point `(cx, cy)` lands at widget point `(px, py)`.
+fn apply_zoomed_geometry(
+    picture: &gtk4::Picture,
+    scrolled: &gtk4::ScrolledWindow,
+    (img_w, img_h): (i32, i32),
+    (vw, vh): (f64, f64),
+    ppx: f64,
+    (cx, cy): (f64, f64),
+    (px, py): (f64, f64),
+) {
+    // Contain (not Fill): when the requested size is still smaller than
+    // the viewport on one axis, the allocation is grown to the viewport
+    // and Fill would stretch the image to that aspect ratio.
+    picture.set_content_fit(gtk4::ContentFit::Contain);
+    let w = (img_w as f64 * ppx).round() as i32;
+    let h = (img_h as f64 * ppx).round() as i32;
+    picture.set_size_request(w, h);
+    scrolled.set_policy(gtk4::PolicyType::Automatic, gtk4::PolicyType::Automatic);
+
+    // Pre-configure adjustment bounds before set_value to avoid clamping.
+    let img_left = ((vw - w as f64) / 2.0).max(0.0);
+    let img_top  = ((vh - h as f64) / 2.0).max(0.0);
+    let th = (cx * ppx + img_left - px).max(0.0);
+    let tv = (cy * ppx + img_top - py).max(0.0);
+    let hadj = scrolled.hadjustment();
+    hadj.set_upper((w as f64).max(vw));
+    hadj.set_page_size(vw);
+    hadj.set_value(th);
+    let vadj = scrolled.vadjustment();
+    vadj.set_upper((h as f64).max(vh));
+    vadj.set_page_size(vh);
+    vadj.set_value(tv);
 }

@@ -264,6 +264,7 @@ pub fn build_browser_page(
         .vscrollbar_policy(gtk4::PolicyType::Never)
         .hexpand(true)
         .vexpand(true)
+        .css_classes(["maple-photo-surface"])
         .build();
     preview_scroll.set_kinetic_scrolling(false);
     preview_scroll.set_child(Some(&preview_picture));
@@ -284,6 +285,7 @@ pub fn build_browser_page(
         .orientation(gtk4::Orientation::Vertical)
         .spacing(4)
         .halign(gtk4::Align::Center)
+        .margin_top(8)
         .margin_bottom(8)
         .build();
     info_box.append(&filename_label);
@@ -292,7 +294,7 @@ pub fn build_browser_page(
 
     let preview_box = gtk4::Box::builder()
         .orientation(gtk4::Orientation::Vertical)
-        .spacing(8)
+        .spacing(0)
         .hexpand(true)
         .vexpand(true)
         .build();
@@ -314,6 +316,7 @@ pub fn build_browser_page(
         .vscrollbar_policy(gtk4::PolicyType::Automatic)
         .width_request(STRIP_THUMB_PX + 24)
         .vexpand(true)
+        .css_classes(["maple-sidebar"])
         .build();
     strip_scroll.set_child(Some(&strip_box));
 
@@ -331,38 +334,17 @@ pub fn build_browser_page(
     hbox.append(&separator);
     hbox.append(&strip_scroll);
 
-    // ── Progress bar ────────────────────────────────────────────
+    // ── Progress bar (status strip in the bottom toolbar) ───────
     let progress_bar = gtk4::ProgressBar::builder()
         .show_text(true)
         .text("Scanning…")
-        .margin_start(12)
-        .margin_end(12)
-        .margin_top(4)
-        .margin_bottom(4)
+        .css_classes(["maple-progress"])
         .build();
 
-    let content = gtk4::Box::builder()
-        .orientation(gtk4::Orientation::Vertical)
-        .spacing(0)
-        .build();
-    content.append(&hbox);
-    content.append(&progress_bar);
-
-    // ── Header bar with selection counter ────────────────────────
+    // ── Header bar: view options left, import actions right ──────
     let header = adw::HeaderBar::new();
 
-    let sel_count_label = gtk4::Label::new(Some("0 selected"));
-    sel_count_label.add_css_class("caption");
-    header.pack_end(&sel_count_label);
-
-    let copy_btn = gtk4::Button::builder()
-        .label("Copy Selected")
-        .sensitive(false)
-        .build();
-    copy_btn.add_css_class("suggested-action");
-    header.pack_start(&copy_btn);
-
-    // ── Copy mode dropdown (what files to include when copying) ──
+    // Copy mode dropdown (what files to include when copying).
     let copy_mode_dropdown = gtk4::DropDown::from_strings(&[
         "Copy all (JPG+RAW)",
         "Copy RAW only",
@@ -373,14 +355,28 @@ pub fn build_browser_page(
     header.pack_start(&copy_mode_dropdown);
 
     let filter_btn = gtk4::ToggleButton::builder()
-        .label("Hide seen")
+        .icon_name("view-conceal-symbolic")
         .tooltip_text("Hide previously imported or rejected images")
         .build();
     header.pack_start(&filter_btn);
 
+    let copy_btn = gtk4::Button::builder()
+        .label("Copy Selected")
+        .sensitive(false)
+        .build();
+    copy_btn.add_css_class("suggested-action");
+    header.pack_end(&copy_btn);
+
+    let sel_count_label = gtk4::Label::new(Some("0 selected"));
+    sel_count_label.add_css_class("caption");
+    sel_count_label.add_css_class("dim-label");
+    sel_count_label.set_margin_end(6);
+    header.pack_end(&sel_count_label);
+
     let toolbar_view = adw::ToolbarView::new();
     toolbar_view.add_top_bar(&header);
-    toolbar_view.set_content(Some(&content));
+    toolbar_view.add_bottom_bar(&progress_bar);
+    toolbar_view.set_content(Some(&hbox));
 
     let page = adw::NavigationPage::builder()
         .title("Browse Images")
