@@ -83,7 +83,9 @@ add_hotkey = "a"
 # images by vector distance and merges those hits with keyword results.
 
 [semantic]
-# Whether the sentence embedder starts automatically when the library opens.
+# Whether the sentence embedder loads eagerly when the library opens.
+# Either way, the model also loads automatically on the first search (and can
+# be started/stopped manually with the "Build Semantic Index" button).
 enabled = false
 
 # HuggingFace repo id of the sentence-transformer model.  The ONNX model and

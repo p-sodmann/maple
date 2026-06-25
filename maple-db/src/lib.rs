@@ -121,6 +121,9 @@ pub struct LibraryImage {
     pub added_at: i64,
     pub status: ImageStatus,
     pub meta: ImageMetadata,
+    /// Cosine similarity (0–1) to the query, set only by semantic/hybrid
+    /// search; `None` for plain listing or keyword-only results.
+    pub similarity: Option<f32>,
 }
 
 // ── Database ─────────────────────────────────────────────────────
@@ -510,6 +513,14 @@ impl Database {
         Ok(rows)
     }
 
+    /// Delete every row in `ai_descriptions`.  The FTS sync trigger and the
+    /// sentence-embedding invalidation triggers cascade automatically.
+    /// Returns the number of rows deleted.
+    pub fn clear_all_ai_descriptions(&self) -> anyhow::Result<usize> {
+        let n = self.conn.execute("DELETE FROM ai_descriptions", [])?;
+        Ok(n)
+    }
+
     /// Return `(id, path)` for all records where EXIF has not been extracted
     /// yet (`filename IS NULL`).  Used by `spawn_metadata_filler`.
     pub fn records_needing_metadata(&self) -> anyhow::Result<Vec<(i64, PathBuf)>> {
@@ -634,6 +645,7 @@ fn row_to_library_image(row: &rusqlite::Row<'_>) -> rusqlite::Result<LibraryImag
         added_at: row.get(2)?,
         status: ImageStatus::from_str(&status_str),
         meta,
+        similarity: None,
     })
 }
 

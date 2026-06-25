@@ -55,6 +55,12 @@
     border-radius: 8px;
 }
 
+/* Semantic similarity score shown under a thumbnail during search. */
+.maple-score {
+    color: @accent_color;
+    font-weight: bold;
+}
+
 /* Grid container: round the selection highlight so it hugs the card. */
 .maple-grid > flowboxchild {
     border-radius: 14px;

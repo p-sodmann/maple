@@ -9,7 +9,7 @@ use std::sync::{Arc, Mutex};
 use gtk4::prelude::*;
 use libadwaita as adw;
 
-use super::{library, source_picker};
+use super::{library, settings_window, source_picker};
 use crate::widgets;
 
 /// Build the home page and wire navigation into `nav_view`.
@@ -61,8 +61,17 @@ pub fn build_home_page(
         .child(&content)
         .build();
 
+    let settings_btn = gtk4::Button::builder()
+        .icon_name("preferences-system-symbolic")
+        .tooltip_text("Settings")
+        .css_classes(["flat"])
+        .build();
+
+    let header = adw::HeaderBar::new();
+    header.pack_end(&settings_btn);
+
     let toolbar_view = adw::ToolbarView::new();
-    toolbar_view.add_top_bar(&adw::HeaderBar::new());
+    toolbar_view.add_top_bar(&header);
     toolbar_view.set_content(Some(&status_page));
     toolbar_view.add_css_class("maple-hero");
 
@@ -70,6 +79,16 @@ pub fn build_home_page(
         .title("Maple")
         .child(&toolbar_view)
         .build();
+
+    // ── Settings button ──────────────────────────────────────────
+    settings_btn.connect_clicked({
+        let db = db.clone();
+        move |btn| {
+            if let Some(win) = btn.root().and_downcast::<gtk4::Window>() {
+                settings_window::open_settings(&win, &db, || {});
+            }
+        }
+    });
 
     // ── Import button ────────────────────────────────────────────
     import_btn.connect_clicked({

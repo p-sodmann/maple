@@ -27,6 +27,11 @@ use maple_db::SearchQuery;
 
 use super::{build_face_tagging_page, collection_manager, detail_window, grid::LibraryGrid, search_bar};
 
+/// Shared slot holding the "load the semantic model" action, so `reload_grid`
+/// (defined first) can lazily trigger it on the first search without a
+/// definition-order cycle.
+type SemanticStartSlot = Rc<RefCell<Option<Rc<dyn Fn()>>>>;
+
 /// Build the library browser page.
 ///
 /// Opens a background metadata-filler thread so that newly imported images
@@ -61,13 +66,22 @@ pub fn build_library_page(
 
     // ── Semantic search state ─────────────────────────────────────
     // The resident sentence encoder embeds search queries; the worker embeds
-    // descriptions in the background.  Both are populated only once the
-    // semantic index is built — until then, search falls back to keyword-only.
+    // descriptions in the background.  Both are populated once the semantic
+    // index is built — which happens automatically on the first search (or via
+    // the header button).  Until the model is ready, search is keyword-only.
     let semantic_encoder: Rc<RefCell<Option<maple_db::SemanticEncoder>>> =
         Rc::new(RefCell::new(None));
     let semantic_worker: Rc<RefCell<Option<maple_db::SentenceEmbedder>>> =
         Rc::new(RefCell::new(None));
     let semantic_k = settings.semantic.knn_k;
+    // True while the model download/compile is in flight.
+    let semantic_loading = Rc::new(Cell::new(false));
+    // Set once an automatic (typing-triggered) load has been attempted, so a
+    // failed load doesn't retry on every keystroke (the button can still retry).
+    let semantic_auto_tried = Rc::new(Cell::new(false));
+    // Holds the "load the semantic model" action; assigned once it is defined
+    // below, so `reload_grid` (defined first) can trigger it without a cycle.
+    let start_semantic_holder: SemanticStartSlot = Rc::new(RefCell::new(None));
 
     // Helper closure to reload the grid with both text + collection filter.
     let reload_grid = {
@@ -75,6 +89,8 @@ pub fn build_library_page(
         let active_collection = active_collection.clone();
         let search_text = search_text.clone();
         let semantic_encoder = semantic_encoder.clone();
+        let semantic_auto_tried = semantic_auto_tried.clone();
+        let start_semantic_holder = start_semantic_holder.clone();
         Rc::new(move || {
             let mut q = SearchQuery::default();
             let text = search_text.borrow().clone();
@@ -82,9 +98,23 @@ pub fn build_library_page(
                 q = q.with_text(&text);
                 // Hybrid search: if a sentence encoder is loaded, embed the
                 // query so keyword + semantic results are merged.
-                if let Some(enc) = semantic_encoder.borrow().as_ref() {
-                    if let Some(embedding) = enc.embed_query(&text) {
-                        q = q.with_semantic(embedding, semantic_k);
+                let embedding = semantic_encoder
+                    .borrow()
+                    .as_ref()
+                    .and_then(|enc| enc.embed_query(&text));
+                match embedding {
+                    Some(embedding) => q = q.with_semantic(embedding, semantic_k),
+                    None => {
+                        // Model not ready: lazily kick off a load the first time
+                        // the user searches.  When it finishes it re-runs the
+                        // search (see the loader completion handler below).
+                        if !semantic_auto_tried.get() {
+                            semantic_auto_tried.set(true);
+                            let start = start_semantic_holder.borrow().clone();
+                            if let Some(start) = start {
+                                start();
+                            }
+                        }
                     }
                 }
             }
@@ -429,20 +459,33 @@ pub fn build_library_page(
     });
 
     // ── Semantic index control ────────────────────────────────────
+    // Loads the sentence-transformer model (downloading on first use) and
+    // starts the background embedder.  Idempotent: a no-op while a load is in
+    // flight, and only restarts the worker if the model is already resident.
     let start_semantic: Rc<dyn Fn()> = Rc::new({
         let db = db.clone();
         let semantic_encoder = semantic_encoder.clone();
         let semantic_worker = semantic_worker.clone();
+        let semantic_loading = semantic_loading.clone();
         let semantic_button = semantic_button.clone();
         let settings = settings.clone();
+        let reload_grid = reload_grid.clone();
         move || {
-            // If the model is already resident, just (re)start the worker.
-            if let Some(enc) = semantic_encoder.borrow().as_ref() {
-                *semantic_worker.borrow_mut() =
-                    Some(maple_db::spawn_sentence_embedder(db.clone(), enc.clone()));
+            // Already resident → just ensure the background worker is running.
+            let resident = semantic_encoder.borrow().clone();
+            if let Some(enc) = resident {
+                if semantic_worker.borrow().is_none() {
+                    *semantic_worker.borrow_mut() =
+                        Some(maple_db::spawn_sentence_embedder(db.clone(), enc));
+                }
                 semantic_button.set_label("Stop Semantic Index");
                 return;
             }
+            // A load is already in flight — don't start a second one.
+            if semantic_loading.get() {
+                return;
+            }
+            semantic_loading.set(true);
 
             let sem = settings.semantic.clone();
             let device: maple_db::models::ModelDevice = sem.device.parse().unwrap_or_default();
@@ -479,7 +522,9 @@ pub fn build_library_page(
                 let db = db.clone();
                 let semantic_encoder = semantic_encoder.clone();
                 let semantic_worker = semantic_worker.clone();
+                let semantic_loading = semantic_loading.clone();
                 let semantic_button = semantic_button.clone();
+                let reload_grid = reload_grid.clone();
                 move || match rx.try_recv() {
                     Ok(Ok(encoder)) => {
                         // Match the vector table to this model (rebuilds the
@@ -492,18 +537,24 @@ pub fn build_library_page(
                         *semantic_worker.borrow_mut() =
                             Some(maple_db::spawn_sentence_embedder(db.clone(), encoder.clone()));
                         *semantic_encoder.borrow_mut() = Some(encoder);
+                        semantic_loading.set(false);
                         semantic_button.set_label("Stop Semantic Index");
                         semantic_button.set_sensitive(true);
+                        // Re-run the current search now that the query can be
+                        // embedded (semantic results appear without retyping).
+                        reload_grid();
                         glib::ControlFlow::Break
                     }
                     Ok(Err(e)) => {
                         tracing::warn!("Failed to load semantic model: {e}");
+                        semantic_loading.set(false);
                         semantic_button.set_label("Build Semantic Index");
                         semantic_button.set_sensitive(true);
                         glib::ControlFlow::Break
                     }
                     Err(std::sync::mpsc::TryRecvError::Empty) => glib::ControlFlow::Continue,
                     Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                        semantic_loading.set(false);
                         semantic_button.set_label("Build Semantic Index");
                         semantic_button.set_sensitive(true);
                         glib::ControlFlow::Break
@@ -512,6 +563,10 @@ pub fn build_library_page(
             });
         }
     });
+
+    // Publish the start action so `reload_grid` can lazily trigger a load on
+    // the first search (breaks the definition-order cycle).
+    *start_semantic_holder.borrow_mut() = Some(start_semantic.clone());
 
     semantic_button.connect_clicked({
         let semantic_worker = semantic_worker.clone();

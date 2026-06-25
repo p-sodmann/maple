@@ -187,7 +187,7 @@ impl LibraryGrid {
                         for rec in &records {
                             let child = gtk4::FlowBoxChild::new();
                             let name = rec.meta.filename.as_deref().unwrap_or("…");
-                            child.set_child(Some(&build_placeholder(name)));
+                            child.set_child(Some(&build_placeholder(name, rec.similarity)));
                             flow_box.append(&child);
                         }
                     }
@@ -199,7 +199,7 @@ impl LibraryGrid {
                                 let bytes = glib::Bytes::from(&png_bytes);
                                 if let Ok(texture) = gdk::Texture::from_bytes(&bytes) {
                                     let name = rec.meta.filename.as_deref().unwrap_or("?");
-                                    child.set_child(Some(&build_cell(&texture, name)));
+                                    child.set_child(Some(&build_cell(&texture, name, rec.similarity)));
                                 }
                             }
                         }
@@ -216,7 +216,7 @@ impl LibraryGrid {
 
 // ── Cell widgets ─────────────────────────────────────────────────
 
-fn build_placeholder(name: &str) -> gtk4::Box {
+fn build_placeholder(name: &str, similarity: Option<f32>) -> gtk4::Box {
     let spinner = gtk4::Spinner::builder()
         .spinning(true)
         .width_request(32)
@@ -237,21 +237,28 @@ fn build_placeholder(name: &str) -> gtk4::Box {
         .build();
     frame.append(&spinner);
 
-    labeled_cell(&frame, name)
+    labeled_cell(&frame, name, similarity)
 }
 
-fn build_cell(texture: &gdk::Texture, name: &str) -> gtk4::Box {
+fn build_cell(texture: &gdk::Texture, name: &str, similarity: Option<f32>) -> gtk4::Box {
     let picture = gtk4::Picture::for_paintable(texture);
     picture.set_size_request(THUMB_PX as i32, THUMB_PX as i32);
     picture.set_content_fit(gtk4::ContentFit::Cover);
     picture.set_overflow(gtk4::Overflow::Hidden);
     picture.add_css_class("maple-thumb");
 
-    labeled_cell(&picture, name)
+    labeled_cell(&picture, name, similarity)
 }
 
 /// Wrap any widget in a rounded card with a caption label beneath it.
-fn labeled_cell(content: &impl IsA<gtk4::Widget>, name: &str) -> gtk4::Box {
+///
+/// When `similarity` is set (semantic/hybrid search), a "NN% match" score is
+/// shown under the filename.
+fn labeled_cell(
+    content: &impl IsA<gtk4::Widget>,
+    name: &str,
+    similarity: Option<f32>,
+) -> gtk4::Box {
     let label = gtk4::Label::new(Some(name));
     label.set_ellipsize(gtk4::pango::EllipsizeMode::Middle);
     label.set_max_width_chars(20);
@@ -265,5 +272,14 @@ fn labeled_cell(content: &impl IsA<gtk4::Widget>, name: &str) -> gtk4::Box {
         .build();
     cell.append(content);
     cell.append(&label);
+
+    if let Some(sim) = similarity {
+        let pct = (sim * 100.0).clamp(0.0, 100.0);
+        let score = gtk4::Label::new(Some(&format!("{pct:.0}% match")));
+        score.add_css_class("caption");
+        score.add_css_class("maple-score");
+        cell.append(&score);
+    }
+
     cell
 }

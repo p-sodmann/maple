@@ -252,6 +252,12 @@ impl Database {
         // Keyword hits (any token match), unioned in so exact matches appear.
         let keyword = self.search_images_text(text, Some(pool), Some(0), collection_id)?;
 
+        // Cosine similarity per image (vec0 cosine distance = 1 − similarity).
+        let similarity: std::collections::HashMap<i64, f32> = semantic
+            .iter()
+            .map(|(id, dist)| (*id, 1.0 - dist))
+            .collect();
+
         // Similarity order first, then keyword-only matches.
         let mut ordered: Vec<i64> = Vec::with_capacity(semantic.len() + keyword.len());
         let mut seen: std::collections::HashSet<i64> = std::collections::HashSet::new();
@@ -268,8 +274,12 @@ impl Database {
 
         let page: Vec<i64> = ordered.into_iter().skip(offset).take(limit).collect();
         // Materialise in similarity order (also applies present-status and the
-        // optional collection filter).
-        self.images_by_ids_ordered(&page, collection_id)
+        // optional collection filter), then attach each image's score.
+        let mut images = self.images_by_ids_ordered(&page, collection_id)?;
+        for img in &mut images {
+            img.similarity = similarity.get(&img.id).copied();
+        }
+        Ok(images)
     }
 }
 
