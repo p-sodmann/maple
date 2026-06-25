@@ -76,3 +76,30 @@ device = "cpu"
 # Key to add the current detail-view image to the last-used collection.
 # Uses GTK key names (e.g. "a", "f", "space").
 add_hotkey = "a"
+
+# ── Semantic search ─────────────────────────────────────────────
+# Encodes each sentence of every AI description into a vector with a
+# sentence-transformer and stores it in a sqlite-vec table.  Search then ranks
+# images by vector distance and merges those hits with keyword results.
+
+[semantic]
+# Whether the sentence embedder starts automatically when the library opens.
+enabled = false
+
+# HuggingFace repo id of the sentence-transformer model.  The ONNX model and
+# tokenizer are downloaded automatically and cached under ~/.config/maple/models/.
+#   "sentence-transformers/all-MiniLM-L6-v2"  — 384-dim, fast (default)
+#   "sentence-transformers/all-mpnet-base-v2" — 768-dim, higher quality
+# Changing the model rebuilds the vector index from scratch.
+model = "sentence-transformers/all-MiniLM-L6-v2"
+
+# Paths of the model + tokenizer files within the repo (standard layout).
+onnx_file = "onnx/model.onnx"
+tokenizer_file = "tokenizer.json"
+
+# Execution device for ONNX inference.
+# Accepts: "cpu" (default), "cuda:N" (NVIDIA GPU), "tensorrt:N".
+device = "cpu"
+
+# How many nearest sentence vectors to retrieve per query before merging.
+knn_k = 200

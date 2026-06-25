@@ -42,6 +42,18 @@ serde_json = "1"
 toml = "0.8"
 blake3 = "1"
 
+# Semantic search
+# sqlite-vec: bundled vec0 virtual-table extension for vector KNN / distance.
+sqlite-vec = "0.1"
+# hf-hub: blocking (ureq) HuggingFace Hub downloader — no tokio, matches the
+# std::thread architecture.  rustls keeps TLS pure-Rust (no system openssl).
+hf-hub = { version = "0.5", default-features = false, features = ["ureq", "rustls-tls"] }
+# tokenizers: load tokenizer.json and encode text.  default-features = false
+# drops the optional progressbar/onig C deps and the (already-off) `http`
+# feature, so no reqwest/tokio is pulled in.  fancy-regex is the pure-Rust
+# regex backend (required by the tokenizer; avoids the oniguruma C build).
+tokenizers = { version = "0.23", default-features = false, features = ["fancy-regex"] }
+
 # Logging
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }

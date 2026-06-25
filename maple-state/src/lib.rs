@@ -289,6 +289,75 @@ impl Default for CollectionSettings {
     }
 }
 
+/// Semantic search settings.
+///
+/// Stored under `[semantic]` in `settings.toml`.
+///
+/// Encodes each sentence of every AI description into a dense vector with a
+/// sentence-transformer model and stores it in a `sqlite-vec` table, so search
+/// can rank images by vector distance (merged with keyword results).
+///
+/// `model` is a HuggingFace repo id.  The ONNX model and tokenizer are
+/// downloaded automatically and cached under `~/.config/maple/models/`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SemanticSettings {
+    /// Whether the sentence embedder starts automatically when the library opens.
+    #[serde(default)]
+    pub enabled: bool,
+    /// HuggingFace repo id of the sentence-transformer model.
+    /// e.g. `"sentence-transformers/all-MiniLM-L6-v2"` (384-dim, fast) or
+    /// `"sentence-transformers/all-mpnet-base-v2"` (768-dim, higher quality).
+    #[serde(default = "SemanticSettings::default_model")]
+    pub model: String,
+    /// Path of the ONNX model file within the repo.
+    #[serde(default = "SemanticSettings::default_onnx_file")]
+    pub onnx_file: String,
+    /// Path of the tokenizer file within the repo.
+    #[serde(default = "SemanticSettings::default_tokenizer_file")]
+    pub tokenizer_file: String,
+    /// Execution device for ONNX inference (`"cpu"`, `"cuda:N"`, `"tensorrt:N"`).
+    #[serde(default = "SemanticSettings::default_device")]
+    pub device: String,
+    /// How many nearest sentence vectors to retrieve per query before merging.
+    #[serde(default = "SemanticSettings::default_knn_k")]
+    pub knn_k: usize,
+}
+
+impl SemanticSettings {
+    fn default_model() -> String {
+        "sentence-transformers/all-MiniLM-L6-v2".into()
+    }
+
+    fn default_onnx_file() -> String {
+        "onnx/model.onnx".into()
+    }
+
+    fn default_tokenizer_file() -> String {
+        "tokenizer.json".into()
+    }
+
+    fn default_device() -> String {
+        "cpu".into()
+    }
+
+    fn default_knn_k() -> usize {
+        200
+    }
+}
+
+impl Default for SemanticSettings {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            model: Self::default_model(),
+            onnx_file: Self::default_onnx_file(),
+            tokenizer_file: Self::default_tokenizer_file(),
+            device: Self::default_device(),
+            knn_k: Self::default_knn_k(),
+        }
+    }
+}
+
 /// The bundled defaults.toml — written to disk on first launch so users
 /// can discover and edit every setting.
 const DEFAULTS_TOML: &str = include_str!("../defaults.toml");
@@ -331,6 +400,9 @@ pub struct Settings {
     /// Collection hotkey settings.
     #[serde(default)]
     pub collections: CollectionSettings,
+    /// Semantic search settings.
+    #[serde(default)]
+    pub semantic: SemanticSettings,
 }
 
 impl Settings {
@@ -414,6 +486,7 @@ impl Default for Settings {
             ai: AiSettings::default(),
             face: FaceSettings::default(),
             collections: CollectionSettings::default(),
+            semantic: SemanticSettings::default(),
         }
     }
 }

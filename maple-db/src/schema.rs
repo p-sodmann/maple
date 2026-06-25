@@ -7,6 +7,7 @@
 //!   3 → 4 : persons + face_detections tables (ONNX face recognition)
 //!   4 → 5 : raw_path column for companion RAW files
 //!   5 → 6 : collections + collection_images tables
+//!   6 → 7 : sentence_embeddings + semantic_meta + vec_sentences (sqlite-vec)
 
 use rusqlite::Connection;
 
@@ -159,6 +160,72 @@ const V6: &str = "
         ON collection_images(image_id);
 ";
 
+// ── V7: sentence embeddings (semantic search) ────────────────────
+//
+// Each sentence of an AI description is embedded into a dense vector and
+// stored in the `vec_sentences` sqlite-vec virtual table for KNN distance
+// search.  `sentence_embeddings` holds the metadata and links each vector
+// (by shared rowid) back to its image and description.
+//
+// `semantic_meta` records the active encoder model + vector dimension so the
+// index can be rebuilt when the model changes (see `Database::ensure_vec_table`).
+//
+// Invalidation is handled by triggers (robust regardless of the foreign_keys
+// pragma, which is not enabled): editing or deleting a description drops its
+// sentence rows, and deleting a sentence row drops its vector.
+
+/// Default vector dimension used when the table is first created (the
+/// `all-MiniLM-L6-v2` default model).  The table is recreated at the correct
+/// dimension when a model is actually loaded (see `ensure_vec_table`).
+const V7_DEFAULT_DIM: i64 = 384;
+
+const V7: &str = "
+    CREATE TABLE IF NOT EXISTS sentence_embeddings (
+        id             INTEGER PRIMARY KEY,
+        image_id       INTEGER NOT NULL,
+        description_id INTEGER NOT NULL,
+        encoder_model  TEXT    NOT NULL,
+        sentence_index INTEGER NOT NULL,
+        text           TEXT    NOT NULL,
+        created_at     INTEGER NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_sent_emb_desc  ON sentence_embeddings(description_id);
+    CREATE INDEX IF NOT EXISTS idx_sent_emb_image ON sentence_embeddings(image_id);
+
+    CREATE TABLE IF NOT EXISTS semantic_meta (
+        id            INTEGER PRIMARY KEY CHECK (id = 1),
+        encoder_model TEXT    NOT NULL,
+        dim           INTEGER NOT NULL
+    );
+
+    -- Invalidate a description's sentence rows when its text changes…
+    CREATE TRIGGER IF NOT EXISTS sentence_emb_desc_au
+        AFTER UPDATE OF description ON ai_descriptions
+        WHEN new.description <> old.description BEGIN
+            DELETE FROM sentence_embeddings WHERE description_id = old.id;
+        END;
+
+    -- …or when the description row is deleted.
+    CREATE TRIGGER IF NOT EXISTS sentence_emb_desc_ad
+        AFTER DELETE ON ai_descriptions BEGIN
+            DELETE FROM sentence_embeddings WHERE description_id = old.id;
+        END;
+
+    -- Deleting a sentence row drops its vector (rowid == sentence id).
+    CREATE TRIGGER IF NOT EXISTS sentence_emb_vec_ad
+        AFTER DELETE ON sentence_embeddings BEGIN
+            DELETE FROM vec_sentences WHERE rowid = old.id;
+        END;
+";
+
+/// Build the `vec_sentences` vec0 virtual-table DDL for a given dimension.
+pub(crate) fn vec_table_ddl(dim: i64) -> String {
+    format!(
+        "CREATE VIRTUAL TABLE IF NOT EXISTS vec_sentences \
+         USING vec0(embedding float[{dim}] distance_metric=cosine);"
+    )
+}
+
 // ── Migration runner ─────────────────────────────────────────────
 
 /// Apply all pending schema migrations to `conn`.
@@ -209,6 +276,19 @@ pub fn ensure_schema(conn: &Connection) -> anyhow::Result<()> {
     if version < 6 {
         conn.execute_batch(V6)?;
         conn.execute_batch("PRAGMA user_version = 6")?;
+    }
+
+    if version < 7 {
+        // Create the vec0 table first so the triggers that reference it
+        // resolve against an existing object.  (Requires the sqlite-vec
+        // extension, registered in `Database::open` before the connection.)
+        conn.execute_batch(&vec_table_ddl(V7_DEFAULT_DIM))?;
+        conn.execute_batch(V7)?;
+        conn.execute_batch(&format!(
+            "INSERT OR IGNORE INTO semantic_meta(id, encoder_model, dim) \
+             VALUES (1, '', {V7_DEFAULT_DIM});"
+        ))?;
+        conn.execute_batch("PRAGMA user_version = 7")?;
     }
 
     Ok(())

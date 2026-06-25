@@ -25,6 +25,14 @@ pub struct SearchQuery {
     pub offset: Option<usize>,
     /// When set, restrict results to images in this collection.
     pub collection_id: Option<i64>,
+    /// Dense embedding of the query text.  When present alongside `text`,
+    /// `search_images` runs hybrid search: keyword + semantic vector results
+    /// are merged with reciprocal rank fusion.  Populated by the UI from the
+    /// resident sentence encoder; left `None` when no encoder is loaded.
+    pub semantic_embedding: Option<Vec<f32>>,
+    /// Number of nearest sentence vectors to retrieve for the semantic side
+    /// (0 falls back to a built-in default).
+    pub semantic_k: usize,
 }
 
 impl SearchQuery {
@@ -53,6 +61,13 @@ impl SearchQuery {
 
     pub fn with_collection(mut self, id: i64) -> Self {
         self.collection_id = Some(id);
+        self
+    }
+
+    /// Attach a query embedding (and KNN depth) to enable hybrid search.
+    pub fn with_semantic(mut self, embedding: Vec<f32>, k: usize) -> Self {
+        self.semantic_embedding = Some(embedding);
+        self.semantic_k = k;
         self
     }
 

@@ -31,7 +31,7 @@ use maple_state::DetectorKind;
 use super::{
     detection::{DetectionModel, OnnxFaceDetector},
     device::ModelDevice,
-    embedding::{EmbeddingModel, OnnxFaceEmbedder},
+    embedding::{EmbeddingModel, OnnxFaceEmbedder, OnnxTextEmbedder, TextEmbeddingModel},
     scrfd::ScrfdDetector,
     session::OnnxSession,
 };
@@ -127,6 +127,22 @@ impl ModelFactory {
     /// pipeline (e.g. a custom detector).
     pub fn build_face_embedder(&self, model_path: &Path) -> Result<Box<dyn EmbeddingModel>> {
         Ok(Box::new(OnnxFaceEmbedder::load(model_path, &self.device)?))
+    }
+
+    // ── Text embedding ────────────────────────────────────────────────────
+
+    /// Build a sentence-transformer text embedder from an ONNX model and its
+    /// tokenizer (e.g. all-MiniLM-L6-v2).  Used by semantic search.
+    pub fn build_text_embedder(
+        &self,
+        onnx_path: &Path,
+        tokenizer_path: &Path,
+    ) -> Result<Box<dyn TextEmbeddingModel>> {
+        Ok(Box::new(OnnxTextEmbedder::load(
+            onnx_path,
+            tokenizer_path,
+            &self.device,
+        )?))
     }
 
     // ── Raw ONNX session ──────────────────────────────────────────────────

@@ -59,16 +59,34 @@ pub fn build_library_page(
     let active_collection: Rc<Cell<Option<i64>>> = Rc::new(Cell::new(None));
     let search_text: Rc<RefCell<String>> = Rc::new(RefCell::new(String::new()));
 
+    // ── Semantic search state ─────────────────────────────────────
+    // The resident sentence encoder embeds search queries; the worker embeds
+    // descriptions in the background.  Both are populated only once the
+    // semantic index is built — until then, search falls back to keyword-only.
+    let semantic_encoder: Rc<RefCell<Option<maple_db::SemanticEncoder>>> =
+        Rc::new(RefCell::new(None));
+    let semantic_worker: Rc<RefCell<Option<maple_db::SentenceEmbedder>>> =
+        Rc::new(RefCell::new(None));
+    let semantic_k = settings.semantic.knn_k;
+
     // Helper closure to reload the grid with both text + collection filter.
     let reload_grid = {
         let grid = library_grid.clone();
         let active_collection = active_collection.clone();
         let search_text = search_text.clone();
+        let semantic_encoder = semantic_encoder.clone();
         Rc::new(move || {
             let mut q = SearchQuery::default();
             let text = search_text.borrow().clone();
             if !text.trim().is_empty() {
                 q = q.with_text(&text);
+                // Hybrid search: if a sentence encoder is loaded, embed the
+                // query so keyword + semantic results are merged.
+                if let Some(enc) = semantic_encoder.borrow().as_ref() {
+                    if let Some(embedding) = enc.embed_query(&text) {
+                        q = q.with_semantic(embedding, semantic_k);
+                    }
+                }
             }
             if let Some(cid) = active_collection.get() {
                 q = q.with_collection(cid);
@@ -104,6 +122,14 @@ pub fn build_library_page(
     let ai_button = gtk4::Button::with_label("Tag with AI");
     ai_button.set_tooltip_text(Some("Describe images with AI to improve search"));
     header.pack_end(&ai_button);
+
+    // ── Semantic index button ─────────────────────────────────────
+    let semantic_button = gtk4::Button::with_label("Build Semantic Index");
+    semantic_button.set_tooltip_text(Some(
+        "Embed AI descriptions for semantic search \
+         (downloads the sentence-transformer model on first use)",
+    ));
+    header.pack_end(&semantic_button);
 
     // ── Face tagger button ────────────────────────────────────────
     let face_detect_btn = gtk4::Button::with_label("Detect Faces");
@@ -402,12 +428,114 @@ pub fn build_library_page(
         }
     });
 
+    // ── Semantic index control ────────────────────────────────────
+    let start_semantic: Rc<dyn Fn()> = Rc::new({
+        let db = db.clone();
+        let semantic_encoder = semantic_encoder.clone();
+        let semantic_worker = semantic_worker.clone();
+        let semantic_button = semantic_button.clone();
+        let settings = settings.clone();
+        move || {
+            // If the model is already resident, just (re)start the worker.
+            if let Some(enc) = semantic_encoder.borrow().as_ref() {
+                *semantic_worker.borrow_mut() =
+                    Some(maple_db::spawn_sentence_embedder(db.clone(), enc.clone()));
+                semantic_button.set_label("Stop Semantic Index");
+                return;
+            }
+
+            let sem = settings.semantic.clone();
+            let device: maple_db::models::ModelDevice = sem.device.parse().unwrap_or_default();
+
+            semantic_button.set_sensitive(false);
+            semantic_button.set_label("Loading model…");
+
+            // Download + load the model off the main thread (network + ONNX
+            // graph compile are slow).
+            let (tx, rx) =
+                std::sync::mpsc::sync_channel::<Result<maple_db::SemanticEncoder, String>>(1);
+
+            std::thread::Builder::new()
+                .name("semantic-model-loader".to_owned())
+                .spawn(move || {
+                    let result = (|| -> Result<maple_db::SemanticEncoder, String> {
+                        let (onnx, tokenizer) = maple_db::models::fetch_sentence_model(
+                            &sem.model,
+                            &sem.onnx_file,
+                            &sem.tokenizer_file,
+                        )
+                        .map_err(|e| format!("{e:#}"))?;
+                        let model = maple_db::models::ModelFactory::new()
+                            .with_device(device)
+                            .build_text_embedder(&onnx, &tokenizer)
+                            .map_err(|e| format!("{e:#}"))?;
+                        Ok(maple_db::SemanticEncoder::new(model, sem.model.clone()))
+                    })();
+                    let _ = tx.send(result);
+                })
+                .expect("failed to spawn semantic model loader thread");
+
+            glib::timeout_add_local(Duration::from_millis(200), {
+                let db = db.clone();
+                let semantic_encoder = semantic_encoder.clone();
+                let semantic_worker = semantic_worker.clone();
+                let semantic_button = semantic_button.clone();
+                move || match rx.try_recv() {
+                    Ok(Ok(encoder)) => {
+                        // Match the vector table to this model (rebuilds the
+                        // index if the model / dimension changed).
+                        if let Err(e) = maple_db::lock_db(&db)
+                            .ensure_vec_table(encoder.model_id(), encoder.dim())
+                        {
+                            tracing::warn!("semantic: ensure_vec_table failed: {e}");
+                        }
+                        *semantic_worker.borrow_mut() =
+                            Some(maple_db::spawn_sentence_embedder(db.clone(), encoder.clone()));
+                        *semantic_encoder.borrow_mut() = Some(encoder);
+                        semantic_button.set_label("Stop Semantic Index");
+                        semantic_button.set_sensitive(true);
+                        glib::ControlFlow::Break
+                    }
+                    Ok(Err(e)) => {
+                        tracing::warn!("Failed to load semantic model: {e}");
+                        semantic_button.set_label("Build Semantic Index");
+                        semantic_button.set_sensitive(true);
+                        glib::ControlFlow::Break
+                    }
+                    Err(std::sync::mpsc::TryRecvError::Empty) => glib::ControlFlow::Continue,
+                    Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                        semantic_button.set_label("Build Semantic Index");
+                        semantic_button.set_sensitive(true);
+                        glib::ControlFlow::Break
+                    }
+                }
+            });
+        }
+    });
+
+    semantic_button.connect_clicked({
+        let semantic_worker = semantic_worker.clone();
+        let semantic_button = semantic_button.clone();
+        let start_semantic = start_semantic.clone();
+        move |_| {
+            let mut guard = semantic_worker.borrow_mut();
+            if let Some(w) = guard.take() {
+                w.stop();
+                semantic_button.set_label("Build Semantic Index");
+            } else {
+                drop(guard);
+                start_semantic();
+            }
+        }
+    });
+
     // ── Initial load + background workers ─────────────────────────
     let loaded = Rc::new(Cell::new(false));
     page.connect_map({
         let reload_grid = reload_grid.clone();
         let db = db.clone();
         let tagger = tagger.clone();
+        let start_semantic = start_semantic.clone();
         move |_| {
             if !loaded.get() {
                 loaded.set(true);
@@ -422,6 +550,10 @@ pub fn build_library_page(
 
                 if settings.face.enabled && settings.face.models_available() {
                     start_face_detector();
+                }
+
+                if settings.semantic.enabled {
+                    start_semantic();
                 }
             }
         }

@@ -8,6 +8,7 @@
 
 mod scanner;
 mod schema;
+mod semantic_db;
 pub mod worker;
 
 pub mod ai;
@@ -17,6 +18,7 @@ pub mod faces;
 pub mod metadata;
 pub mod models;
 pub mod query;
+pub mod semantic;
 
 pub use ai::{spawn_ai_tagger, AiDescriber, AiTagger, LmStudioDescriber};
 pub use collections::Collection;
@@ -25,6 +27,7 @@ pub use faces::{best_person_match, best_person_matches, cosine_similarity, FaceD
 pub use metadata::{extract_metadata, spawn_metadata_filler, ImageMetadata};
 pub use query::SearchQuery;
 pub use scanner::LibraryScanner;
+pub use semantic::{spawn_sentence_embedder, split_sentences, SemanticEncoder, SentenceEmbedder};
 
 use rusqlite::{params, Connection};
 use std::path::{Path, PathBuf};
@@ -44,6 +47,29 @@ pub fn lock_db(db: &Mutex<Database>) -> MutexGuard<'_, Database> {
             poisoned.into_inner()
         }
     }
+}
+
+/// Register the sqlite-vec (`vec0`) extension as a SQLite auto-extension.
+///
+/// Auto-extensions are applied to every connection opened *after* this call,
+/// so `Database::open` invokes it before `Connection::open`.  Guarded by a
+/// `Once` so repeated `open` calls register it exactly once.
+fn register_sqlite_vec() {
+    use std::sync::Once;
+    static REGISTER: Once = Once::new();
+    REGISTER.call_once(|| {
+        // SAFETY: `sqlite3_vec_init` has the signature expected by
+        // `sqlite3_auto_extension`; the transmute matches the documented
+        // sqlite-vec + rusqlite integration pattern.  The target fn-pointer
+        // type lives in rusqlite's private ffi, so an inline annotation would
+        // be brittle — hence the scoped allow.
+        #[allow(clippy::missing_transmute_annotations)]
+        unsafe {
+            rusqlite::ffi::sqlite3_auto_extension(Some(std::mem::transmute(
+                sqlite_vec::sqlite3_vec_init as *const (),
+            )));
+        }
+    });
 }
 
 // ── Status ───────────────────────────────────────────────────────
@@ -112,6 +138,9 @@ impl Database {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
+        // Register the sqlite-vec (`vec0`) extension before opening any
+        // connection so the schema migration can create the vector table.
+        register_sqlite_vec();
         let conn = Connection::open(path)?;
         conn.execute_batch("PRAGMA journal_mode=WAL;")?;
         schema::ensure_schema(&conn)?;
@@ -244,9 +273,23 @@ impl Database {
     ///   least one of: filename, make, model, lens, any AI description, or
     ///   any assigned person name.
     pub fn search_images(&self, query: &SearchQuery) -> anyhow::Result<Vec<LibraryImage>> {
-        match &query.text {
-            Some(text) => self.search_images_text(text, query.limit, query.offset, query.collection_id),
-            None => self.search_images_all(query.limit, query.offset, query.collection_id),
+        match (&query.text, &query.semantic_embedding) {
+            // Hybrid: keyword + semantic vector results, merged.
+            (Some(text), Some(embedding)) => {
+                let k = if query.semantic_k == 0 { 200 } else { query.semantic_k };
+                self.search_images_hybrid(
+                    text,
+                    embedding,
+                    k,
+                    query.limit,
+                    query.offset,
+                    query.collection_id,
+                )
+            }
+            (Some(text), None) => {
+                self.search_images_text(text, query.limit, query.offset, query.collection_id)
+            }
+            (None, _) => self.search_images_all(query.limit, query.offset, query.collection_id),
         }
     }
 
