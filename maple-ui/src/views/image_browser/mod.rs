@@ -36,6 +36,7 @@ use std::rc::Rc;
 use std::sync::{mpsc, Arc, Mutex};
 use std::time::Duration;
 
+
 use gtk4::gdk;
 use gtk4::glib;
 use gtk4::prelude::*;
@@ -44,7 +45,7 @@ use adw::prelude::*;
 
 use filmstrip::{update_strip_opacity, update_strip_visibility};
 use preview::{apply_zoom, compute_buffer_window, update_preview};
-use scan::{scan_summary_text, start_scan};
+use scan::{scan_summary_text, start_scan, start_scan_from_files};
 
 // ── Thumbnail size constants ────────────────────────────────────
 
@@ -59,7 +60,9 @@ enum ScanMsg {
         index: usize,
         path: PathBuf,
         companions: Vec<PathBuf>,
-        png_bytes: Vec<u8>,
+        rgb: Vec<u8>,
+        width: u32,
+        height: u32,
         content_hash: [u8; 32],
         imported: bool,
         rejected: bool,
@@ -232,11 +235,50 @@ impl BrowserState {
     }
 }
 
+// ── Source variant ───────────────────────────────────────────────
+
+enum BrowserSource {
+    /// Walk a directory with `maple_import::scan_grouped`.
+    Directory(PathBuf),
+    /// Use a pre-supplied list of paths (e.g. from a drag-and-drop).
+    Files(Vec<PathBuf>),
+}
+
 // ── Public API ──────────────────────────────────────────────────
 
-/// Build the image browser page and start scanning.
+/// Build the image browser page scanning a source directory.
 pub fn build_browser_page(
     source: &Path,
+    destination: &Path,
+    toast_overlay: &adw::ToastOverlay,
+    db: std::sync::Arc<std::sync::Mutex<maple_db::Database>>,
+) -> adw::NavigationPage {
+    build_browser_page_impl(
+        BrowserSource::Directory(source.to_path_buf()),
+        destination,
+        toast_overlay,
+        db,
+    )
+}
+
+/// Build the image browser pre-loaded with the given file paths (drag-and-drop
+/// import).  The destination is used as the copy target directory.
+pub fn build_browser_page_from_files(
+    files: Vec<PathBuf>,
+    destination: &Path,
+    toast_overlay: &adw::ToastOverlay,
+    db: std::sync::Arc<std::sync::Mutex<maple_db::Database>>,
+) -> adw::NavigationPage {
+    build_browser_page_impl(
+        BrowserSource::Files(files),
+        destination,
+        toast_overlay,
+        db,
+    )
+}
+
+fn build_browser_page_impl(
+    source: BrowserSource,
     destination: &Path,
     toast_overlay: &adw::ToastOverlay,
     db: std::sync::Arc<std::sync::Mutex<maple_db::Database>>,
@@ -378,8 +420,12 @@ pub fn build_browser_page(
     toolbar_view.add_bottom_bar(&progress_bar);
     toolbar_view.set_content(Some(&hbox));
 
+    let page_title = match &source {
+        BrowserSource::Files(_) => "Import Dropped Photos",
+        BrowserSource::Directory(_) => "Browse Images",
+    };
     let page = adw::NavigationPage::builder()
-        .title("Browse Images")
+        .title(page_title)
         .child(&toolbar_view)
         .build();
 
@@ -869,19 +915,34 @@ pub fn build_browser_page(
     }
 
     // ── Kick off background scan ────────────────────────────────
-    start_scan(
-        source,
-        &state,
-        &preview_picture,
-        &preview_scroll,
-        &filename_label,
-        &selected_label,
-        &counter_label,
-        &strip_box,
-        &strip_scroll,
-        &progress_bar,
-        toast_overlay,
-    );
+    match source {
+        BrowserSource::Directory(path) => start_scan(
+            &path,
+            &state,
+            &preview_picture,
+            &preview_scroll,
+            &filename_label,
+            &selected_label,
+            &counter_label,
+            &strip_box,
+            &strip_scroll,
+            &progress_bar,
+            toast_overlay,
+        ),
+        BrowserSource::Files(files) => start_scan_from_files(
+            files,
+            &state,
+            &preview_picture,
+            &preview_scroll,
+            &filename_label,
+            &selected_label,
+            &counter_label,
+            &strip_box,
+            &strip_scroll,
+            &progress_bar,
+            toast_overlay,
+        ),
+    }
 
     page
 }

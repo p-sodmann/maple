@@ -9,6 +9,7 @@
 mod scanner;
 mod schema;
 mod semantic_db;
+mod thumb_cache;
 pub mod worker;
 
 pub mod ai;
@@ -21,12 +22,14 @@ pub mod query;
 pub mod semantic;
 
 pub use ai::{spawn_ai_tagger, AiDescriber, AiTagger, LmStudioDescriber};
+pub use metadata::rotate_image_file;
 pub use collections::Collection;
 pub use face_detector::{spawn_face_tagger, DetectedFace, FaceDetector, FaceTagger};
 pub use faces::{best_person_match, best_person_matches, cosine_similarity, FaceDetection, Person};
 pub use metadata::{extract_metadata, spawn_metadata_filler, ImageMetadata};
 pub use query::SearchQuery;
 pub use scanner::LibraryScanner;
+pub use thumb_cache::ThumbnailCache;
 pub use semantic::{spawn_sentence_embedder, split_sentences, SemanticEncoder, SentenceEmbedder};
 
 use rusqlite::{params, Connection};
@@ -121,6 +124,9 @@ pub struct LibraryImage {
     pub added_at: i64,
     pub status: ImageStatus,
     pub meta: ImageMetadata,
+    /// BLAKE3 content hash — used as the thumbnail cache key.
+    /// `None` only if the DB row has a corrupt/missing hash (should not happen).
+    pub hash: Option<[u8; 32]>,
     /// Cosine similarity (0–1) to the query, set only by semantic/hybrid
     /// search; `None` for plain listing or keyword-only results.
     pub similarity: Option<f32>,
@@ -249,6 +255,21 @@ impl Database {
         Ok(())
     }
 
+    /// Update the content hash and EXIF orientation for a record after a
+    /// lossless in-place rotation.
+    pub fn update_image_hash_and_orientation(
+        &self,
+        id: i64,
+        hash: &[u8; 32],
+        orientation: i64,
+    ) -> anyhow::Result<()> {
+        self.conn.execute(
+            "UPDATE images SET hash = ?1, orientation = ?2 WHERE id = ?3",
+            params![hash.as_slice(), orientation, id],
+        )?;
+        Ok(())
+    }
+
     /// Mark a record as missing (file deleted from disk).
     pub fn mark_missing(&self, path: &Path) -> anyhow::Result<()> {
         self.conn.execute(
@@ -318,7 +339,7 @@ impl Database {
             "SELECT id, path, added_at, status,
                     filename, taken_at, make, model, lens,
                     focal_length, aperture, iso,
-                    width, height, orientation, raw_path
+                    width, height, orientation, raw_path, hash
              FROM images
              WHERE status = 'present'{coll_clause}
              ORDER BY added_at DESC
@@ -395,7 +416,7 @@ impl Database {
             "SELECT DISTINCT i.id, i.path, i.added_at, i.status,
                     i.filename, i.taken_at, i.make, i.model, i.lens,
                     i.focal_length, i.aperture, i.iso,
-                    i.width, i.height, i.orientation, i.raw_path
+                    i.width, i.height, i.orientation, i.raw_path, i.hash
              FROM images i
              LEFT JOIN ai_descriptions ad ON ad.image_id = i.id
              LEFT JOIN face_detections fd ON fd.image_id = i.id
@@ -571,17 +592,19 @@ impl Database {
         Ok(records)
     }
 
-    /// Return all `(path, status)` pairs — used by the scanner for
-    /// reconciliation.
-    pub fn all_paths(&self) -> anyhow::Result<Vec<(PathBuf, ImageStatus)>> {
-        let mut stmt = self.conn.prepare("SELECT path, status FROM images")?;
+    /// Return all `(path, status, hash)` triples — used by the scanner for
+    /// reconciliation and thumbnail cache eviction.
+    pub fn all_paths(&self) -> anyhow::Result<Vec<(PathBuf, ImageStatus, Option<[u8; 32]>)>> {
+        let mut stmt = self.conn.prepare("SELECT path, status, hash FROM images")?;
         let rows = stmt
             .query_map([], |row| {
                 let path: String = row.get(0)?;
                 let status: String = row.get(1)?;
-                Ok((PathBuf::from(path), ImageStatus::from_str(&status)))
+                let hash_bytes: Vec<u8> = row.get(2)?;
+                Ok((PathBuf::from(path), ImageStatus::from_str(&status), hash_bytes))
             })?
             .filter_map(|r| r.ok())
+            .map(|(p, s, h)| (p, s, h.try_into().ok()))
             .collect();
         Ok(rows)
     }
@@ -592,7 +615,7 @@ impl Database {
             "SELECT id, path, added_at, status,
                     filename, taken_at, make, model, lens,
                     focal_length, aperture, iso,
-                    width, height, orientation, raw_path
+                    width, height, orientation, raw_path, hash
              FROM images
              WHERE id = ?1",
         )?;
@@ -638,6 +661,8 @@ fn row_to_library_image(row: &rusqlite::Row<'_>) -> rusqlite::Result<LibraryImag
         orientation: row.get(14)?,
     };
     let raw_path: Option<String> = row.get(15)?;
+    let hash_bytes: Vec<u8> = row.get(16)?;
+    let hash: Option<[u8; 32]> = hash_bytes.try_into().ok();
     Ok(LibraryImage {
         id: row.get(0)?,
         path: PathBuf::from(row.get::<_, String>(1)?),
@@ -645,6 +670,7 @@ fn row_to_library_image(row: &rusqlite::Row<'_>) -> rusqlite::Result<LibraryImag
         added_at: row.get(2)?,
         status: ImageStatus::from_str(&status_str),
         meta,
+        hash,
         similarity: None,
     })
 }

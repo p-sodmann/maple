@@ -9,8 +9,6 @@ use gtk4::glib;
 use gtk4::prelude::*;
 use libadwaita as adw;
 
-use crate::thumbnail::generate_thumbnail;
-
 // ── Messages from the worker thread ─────────────────────────────
 
 enum ScanMsg {
@@ -20,7 +18,9 @@ enum ScanMsg {
     Thumb {
         index: usize,
         path: PathBuf,
-        png_bytes: Vec<u8>,
+        rgb: Vec<u8>,
+        width: u32,
+        height: u32,
     },
     /// All thumbnails have been generated.
     Done,
@@ -128,12 +128,14 @@ fn start_scan(
                     for chunk in indexed.chunks(chunk_size) {
                         scope.spawn(move || {
                             for (img, idx) in chunk {
-                                match generate_thumbnail(&img.path, 256) {
-                                    Ok(bytes) => {
+                                match crate::thumbnail::render_to_rgb(&img.path, 256) {
+                                    Ok((rgb, width, height)) => {
                                         let _ = sender.send(ScanMsg::Thumb {
                                             index: *idx,
                                             path: img.path.clone(),
-                                            png_bytes: bytes,
+                                            rgb,
+                                            width,
+                                            height,
                                         });
                                     }
                                     Err(e) => {
@@ -183,7 +185,7 @@ fn start_scan(
                     )));
                 }
 
-                ScanMsg::Thumb { index, path, png_bytes } => {
+                ScanMsg::Thumb { index, path, rgb, width, height } => {
                     generated += 1;
                     let frac = if total > 0 {
                         generated as f64 / total as f64
@@ -196,17 +198,20 @@ fn start_scan(
                     )));
 
                     // Replace the placeholder at `index` with the real thumbnail.
-                    let bytes = glib::Bytes::from(&png_bytes);
-                    match gdk::Texture::from_bytes(&bytes) {
-                        Ok(texture) => {
-                            if let Some(child) = flow_box.child_at_index(index as i32) {
-                                let card = build_image_card(&texture, &path);
-                                child.set_child(Some(&card));
-                            }
-                        }
-                        Err(e) => {
-                            tracing::warn!("Texture creation failed: {e}");
-                        }
+                    let bytes = glib::Bytes::from(&rgb);
+                    let pixbuf = gtk4::gdk_pixbuf::Pixbuf::from_bytes(
+                        &bytes,
+                        gtk4::gdk_pixbuf::Colorspace::Rgb,
+                        false,
+                        8,
+                        width as i32,
+                        height as i32,
+                        (width * 3) as i32,
+                    );
+                    let texture = gdk::Texture::for_pixbuf(&pixbuf);
+                    if let Some(child) = flow_box.child_at_index(index as i32) {
+                        let card = build_image_card(&texture, &path);
+                        child.set_child(Some(&card));
                     }
                 }
 

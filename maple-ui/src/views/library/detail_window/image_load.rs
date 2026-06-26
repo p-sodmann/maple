@@ -21,6 +21,9 @@ const CHROME_H: i32 = 82;
 
 /// Load `path` asynchronously, apply EXIF orientation, display it in
 /// `picture`, resize the window to fit, and reset zoom/pan.
+///
+/// `on_done` is called on the main thread once loading finishes (whether
+/// successful or not), so callers can clear a loading guard.
 pub(super) fn load_image(
     path: PathBuf,
     picture: &gtk4::Picture,
@@ -28,6 +31,7 @@ pub(super) fn load_image(
     zoom: &Rc<Cell<f64>>,
     img_dims: &Rc<Cell<(i32, i32)>>,
     window: &adw::Window,
+    on_done: impl Fn() + 'static,
 ) {
     let scrolled = scrolled.clone();
     let zoom = zoom.clone();
@@ -38,6 +42,7 @@ pub(super) fn load_image(
         let (dw, dh) = display_size(img_w, img_h);
         window.set_default_size(dw, dh);
         reset_zoom(&picture_ref, &scrolled, &zoom);
+        on_done();
     });
 }
 

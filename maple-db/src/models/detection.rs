@@ -22,7 +22,7 @@ use std::io::Cursor;
 use anyhow::{Context, Result};
 use image::{DynamicImage, ImageDecoder, ImageReader};
 use maple_import::{is_raw_format, loadable_image_bytes};
-use ndarray::{Array3, Array4, ArrayView2, ArrayView4};
+use ndarray::{Array3, ArrayView2, ArrayView4};
 use tracing::{debug, info, warn};
 
 use super::{

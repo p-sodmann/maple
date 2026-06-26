@@ -1,8 +1,9 @@
 use std::sync::{Arc, Mutex};
 
 use libadwaita as adw;
+use gtk4::prelude::*;
 
-use crate::views::home;
+use crate::views::{drop_import, home};
 
 /// Build the main application window.
 pub fn build_window(app: &adw::Application) -> adw::ApplicationWindow {
@@ -26,14 +27,38 @@ pub fn build_window(app: &adw::Application) -> adw::ApplicationWindow {
         }
     };
 
+    // Open the thumbnail cache alongside the database.
+    let cache_dir = settings.library_dir.join(".thumbcache");
+    let cache = std::sync::Arc::new(
+        maple_db::ThumbnailCache::open(&cache_dir).unwrap_or_else(|e| {
+            tracing::warn!("Thumbnail cache unavailable at {}: {e}", cache_dir.display());
+            // Fall back to a temp-dir cache so the rest of the UI still works.
+            let fallback = std::env::temp_dir().join("maple_thumbcache_fallback");
+            maple_db::ThumbnailCache::open(&fallback)
+                .expect("could not open fallback thumbnail cache")
+        }),
+    );
+
     // Start the background library scanner immediately so the DB stays
     // in sync with the library directory from the moment the app launches.
-    maple_db::LibraryScanner::new(db.clone(), settings.library_dir).spawn();
+    maple_db::LibraryScanner::new(db.clone(), settings.library_dir, Some(cache.clone())).spawn();
 
     let toast_overlay = adw::ToastOverlay::new();
     let nav_view = adw::NavigationView::new();
 
-    let home_page = home::build_home_page(&nav_view, &toast_overlay, db);
+    // Register the app-wide import context so drag-and-drop works from any
+    // widget (including the detail window which is a separate OS window).
+    drop_import::set_import_ctx(drop_import::ImportCtx {
+        nav_view: nav_view.clone(),
+        toast_overlay: toast_overlay.clone(),
+        db: db.clone(),
+    });
+
+    // A single DropTarget on the root toast overlay covers every page in the
+    // main window (home, library, browser) without per-page wiring.
+    toast_overlay.add_controller(drop_import::make_drop_target());
+
+    let home_page = home::build_home_page(&nav_view, &toast_overlay, db, cache);
     nav_view.push(&home_page);
 
     toast_overlay.set_child(Some(&nav_view));

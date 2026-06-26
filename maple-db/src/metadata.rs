@@ -169,6 +169,160 @@ pub fn spawn_metadata_filler(db: Arc<Mutex<Database>>) {
         .ok();
 }
 
+// ── Rotation ─────────────────────────────────────────────────────
+
+/// Rotate the EXIF Orientation tag in a JPEG file 90° CW or CCW.
+///
+/// Patches the Orientation tag byte in-place — the JPEG pixel data is
+/// not re-encoded.  Returns `(new_orientation, new_blake3_hash)` so the
+/// caller can update the DB record in one shot.
+///
+/// Fails if the file is a raw format, is not a JPEG, or has no
+/// existing EXIF Orientation tag.
+pub fn rotate_image_file(path: &Path, clockwise: bool) -> anyhow::Result<(u16, [u8; 32])> {
+    if maple_import::is_raw_format(path) {
+        anyhow::bail!("RAW files cannot be rotated via EXIF");
+    }
+
+    let data = std::fs::read(path)?;
+    let current = read_exif_orientation_from_bytes(&data);
+    let new_orientation = if clockwise {
+        rotate_cw(current)
+    } else {
+        rotate_ccw(current)
+    };
+
+    let patched = patch_jpeg_exif_orientation(&data, new_orientation)
+        .ok_or_else(|| anyhow::anyhow!("No EXIF Orientation tag found in this image"))?;
+
+    std::fs::write(path, &patched)?;
+    let new_hash: [u8; 32] = *blake3::hash(&patched).as_bytes();
+    Ok((new_orientation, new_hash))
+}
+
+fn rotate_cw(o: u32) -> u16 {
+    match o {
+        1 => 6, 2 => 7, 3 => 8, 4 => 5,
+        5 => 2, 6 => 3, 7 => 4, 8 => 1,
+        _ => 6,
+    }
+}
+
+fn rotate_ccw(o: u32) -> u16 {
+    match o {
+        1 => 8, 2 => 5, 3 => 6, 4 => 7,
+        5 => 4, 6 => 1, 7 => 2, 8 => 3,
+        _ => 8,
+    }
+}
+
+/// Read the EXIF Orientation tag directly from JPEG bytes (no file I/O).
+fn read_exif_orientation_from_bytes(data: &[u8]) -> u32 {
+    jpeg_exif_tiff(data)
+        .and_then(|(tiff, le)| {
+            find_orientation_entry(tiff, le).map(|(val_off, _)| {
+                let b = &tiff[val_off..val_off + 2];
+                (if le { u16::from_le_bytes([b[0], b[1]]) } else { u16::from_be_bytes([b[0], b[1]]) }) as u32
+            })
+        })
+        .unwrap_or(1)
+}
+
+/// Patch the EXIF Orientation tag in JPEG bytes.  Returns `None` if the
+/// tag cannot be located.
+fn patch_jpeg_exif_orientation(data: &[u8], new_orientation: u16) -> Option<Vec<u8>> {
+    let (tiff, le) = jpeg_exif_tiff(data)?;
+    let tiff_offset = jpeg_exif_tiff_offset(data)?;
+    let (val_off, _) = find_orientation_entry(tiff, le)?;
+
+    let abs = tiff_offset + val_off;
+    if abs + 2 > data.len() {
+        return None;
+    }
+    let mut out = data.to_vec();
+    let encoded = if le { new_orientation.to_le_bytes() } else { new_orientation.to_be_bytes() };
+    out[abs] = encoded[0];
+    out[abs + 1] = encoded[1];
+    Some(out)
+}
+
+/// Return a slice pointing to the TIFF header inside the JPEG APP1/Exif
+/// segment together with a `little_endian` flag, or `None`.
+fn jpeg_exif_tiff(data: &[u8]) -> Option<(&[u8], bool)> {
+    let off = jpeg_exif_tiff_offset(data)?;
+    let tiff = &data[off..];
+    let le = if tiff.starts_with(b"II") {
+        true
+    } else if tiff.starts_with(b"MM") {
+        false
+    } else {
+        return None;
+    };
+    Some((tiff, le))
+}
+
+/// Absolute byte offset of the TIFF header within `data`.
+fn jpeg_exif_tiff_offset(data: &[u8]) -> Option<usize> {
+    if data.len() < 4 || data[0] != 0xFF || data[1] != 0xD8 {
+        return None;
+    }
+    let mut i = 2usize;
+    while i + 4 <= data.len() {
+        if data[i] != 0xFF {
+            return None;
+        }
+        let marker = data[i + 1];
+        if marker == 0xD9 || marker == 0xDA {
+            break;
+        }
+        let seg_len = u16::from_be_bytes([data[i + 2], data[i + 3]]) as usize;
+        if seg_len < 2 || i + 2 + seg_len > data.len() {
+            return None;
+        }
+        if marker == 0xE1 {
+            let payload = i + 4;
+            if data[payload..].starts_with(b"Exif\0\0") {
+                return Some(payload + 6);
+            }
+        }
+        i += 2 + seg_len;
+    }
+    None
+}
+
+/// Scan IFD0 for the Orientation tag (0x0112).
+///
+/// Returns `(value_field_offset_within_tiff, little_endian)` where
+/// `value_field_offset` is byte 8 of the matching 12-byte IFD entry.
+fn find_orientation_entry(tiff: &[u8], le: bool) -> Option<(usize, bool)> {
+    let ru16 = |off: usize| -> u16 {
+        if le { u16::from_le_bytes([tiff[off], tiff[off + 1]]) }
+        else   { u16::from_be_bytes([tiff[off], tiff[off + 1]]) }
+    };
+    let ru32 = |off: usize| -> u32 {
+        if le { u32::from_le_bytes([tiff[off], tiff[off+1], tiff[off+2], tiff[off+3]]) }
+        else  { u32::from_be_bytes([tiff[off], tiff[off+1], tiff[off+2], tiff[off+3]]) }
+    };
+
+    if tiff.len() < 8 { return None; }
+    if ru16(2) != 42 { return None; } // TIFF magic
+
+    let ifd0 = ru32(4) as usize;
+    if ifd0 + 2 > tiff.len() { return None; }
+
+    let count = ru16(ifd0) as usize;
+    let entries = ifd0 + 2;
+
+    for n in 0..count {
+        let e = entries + n * 12;
+        if e + 12 > tiff.len() { break; }
+        if ru16(e) == 0x0112 {
+            return Some((e + 8, le));
+        }
+    }
+    None
+}
+
 // ── Tests ────────────────────────────────────────────────────────
 
 #[cfg(test)]

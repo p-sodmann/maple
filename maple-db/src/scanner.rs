@@ -15,7 +15,7 @@ use std::time::Duration;
 
 use maple_import::{content_hash, scan_grouped};
 
-use crate::{Database, ImageStatus};
+use crate::{Database, ImageStatus, ThumbnailCache};
 
 /// How long the scanner sleeps between reconciliation passes.
 const SCAN_INTERVAL: Duration = Duration::from_secs(60);
@@ -23,11 +23,16 @@ const SCAN_INTERVAL: Duration = Duration::from_secs(60);
 pub struct LibraryScanner {
     db: Arc<Mutex<Database>>,
     library_dir: PathBuf,
+    cache: Option<Arc<ThumbnailCache>>,
 }
 
 impl LibraryScanner {
-    pub fn new(db: Arc<Mutex<Database>>, library_dir: PathBuf) -> Self {
-        Self { db, library_dir }
+    pub fn new(
+        db: Arc<Mutex<Database>>,
+        library_dir: PathBuf,
+        cache: Option<Arc<ThumbnailCache>>,
+    ) -> Self {
+        Self { db, library_dir, cache }
     }
 
     /// Spawn the scanner as a background thread.
@@ -63,10 +68,10 @@ impl LibraryScanner {
         tracing::info!("Library scan: reconciling {}", dir.display());
 
         // ── 1. Load all DB records ───────────────────────────────
-        let db_records: Vec<(PathBuf, ImageStatus)> =
+        let db_records: Vec<(PathBuf, ImageStatus, Option<[u8; 32]>)> =
             crate::lock_db(&self.db).all_paths().unwrap_or_default();
         // Build a set of all display paths known to the DB.
-        let db_path_set: HashSet<&PathBuf> = db_records.iter().map(|(p, _)| p).collect();
+        let db_path_set: HashSet<&PathBuf> = db_records.iter().map(|(p, _, _)| p).collect();
 
         // ── 2. Scan the library directory on disk (grouped) ───────
         let groups = match scan_grouped(dir) {
@@ -86,11 +91,20 @@ impl LibraryScanner {
             .collect();
 
         // ── 3. Reconcile DB records against disk ─────────────────
-        for (path, status) in &db_records {
+        for (path, status, hash) in &db_records {
             let on_disk = found_map.contains_key(path);
             match (on_disk, status) {
                 (false, ImageStatus::Present) => {
                     tracing::info!("Library scan: marking missing {}", path.display());
+                    // Evict the thumbnail from cache before marking missing.
+                    if let (Some(cache), Some(hash)) = (&self.cache, hash) {
+                        if let Err(e) = cache.remove(hash) {
+                            tracing::warn!(
+                                "Library scan: failed to evict thumbnail for {}: {e}",
+                                path.display()
+                            );
+                        }
+                    }
                     if let Err(e) = crate::lock_db(&self.db).mark_missing(path) {
                         tracing::warn!("Library scan: failed to mark missing {}: {e}", path.display());
                     }

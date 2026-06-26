@@ -6,6 +6,8 @@
 
 use std::sync::{Arc, Mutex};
 
+use maple_db::ThumbnailCache;
+
 use gtk4::prelude::*;
 use libadwaita as adw;
 
@@ -17,6 +19,7 @@ pub fn build_home_page(
     nav_view: &adw::NavigationView,
     toast_overlay: &adw::ToastOverlay,
     db: Arc<Mutex<maple_db::Database>>,
+    cache: Arc<ThumbnailCache>,
 ) -> adw::NavigationPage {
     let import_btn = gtk4::Button::builder()
         .child(&adw::ButtonContent::builder()
@@ -83,9 +86,10 @@ pub fn build_home_page(
     // ── Settings button ──────────────────────────────────────────
     settings_btn.connect_clicked({
         let db = db.clone();
+        let cache = cache.clone();
         move |btn| {
             if let Some(win) = btn.root().and_downcast::<gtk4::Window>() {
-                settings_window::open_settings(&win, &db, || {});
+                settings_window::open_settings(&win, &db, cache.clone(), || {});
             }
         }
     });
@@ -105,8 +109,9 @@ pub fn build_home_page(
     library_btn.connect_clicked({
         let nav_view = nav_view.clone();
         let db = db.clone();
+        let cache = cache.clone();
         move |_| {
-            let lib = library::build_library_page(&nav_view, db.clone());
+            let lib = library::build_library_page(&nav_view, db.clone(), cache.clone());
             nav_view.push(&lib);
         }
     });

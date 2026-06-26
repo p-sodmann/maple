@@ -77,6 +77,21 @@ device = "cpu"
 # Uses GTK key names (e.g. "a", "f", "space").
 add_hotkey = "a"
 
+# ── Thumbnail cache ─────────────────────────────────────────────
+# Thumbnails are stored as lossy WebP in an LMDB cache alongside the database.
+# The cache is keyed by the image's BLAKE3 content hash, so it invalidates
+# automatically when a file is replaced or rotated (EXIF write changes content).
+
+[thumbnails]
+# WebP lossy quality for cached previews (0 = smallest, 100 = best).
+# 80 is a good balance between file size and visual quality.
+quality = 80
+
+# Thumbnail longest-edge size in pixels.
+# Larger values = sharper grid cells at the cost of more cache space.
+# Changing this clears the thumbnail cache automatically.
+size = 200
+
 # ── Semantic search ─────────────────────────────────────────────
 # Encodes each sentence of every AI description into a vector with a
 # sentence-transformer and stores it in a sqlite-vec table.  Search then ranks

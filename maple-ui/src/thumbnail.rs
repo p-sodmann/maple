@@ -1,61 +1,147 @@
-//! Off-thread thumbnail generation.
+//! Thumbnail generation and codec helpers.
 //!
-//! Uses gdk-pixbuf (libjpeg-turbo) for fast scaled decoding — for JPEGs
-//! this leverages DCT downsampling so a 4000×3000 image can be thumbnailed
-//! without ever fully decoding all 12 megapixels.
+//! # Pipeline (cache miss)
 //!
-//! EXIF orientation is applied via `apply_embedded_orientation()`.
+//! 1. Decode via gdk-pixbuf at 2× target size — JPEGs use DCT downscaling
+//!    inside libjpeg-turbo, keeping peak memory low for large files.
+//! 2. Apply EXIF orientation (`apply_embedded_orientation`).
+//! 3. Strip alpha and row-padding → tight RGB byte buffer.
+//! 4. `fast_image_resize` Lanczos3 → target dimensions.
+//! 5. Encode as lossy WebP at the configured quality.
+//!
+//! # Cache round-trip
+//!
+//! On a cache hit, `decode_webp_rgb` turns stored WebP bytes back into an RGB
+//! pixel buffer that the grid sends to GTK without going through gdk-pixbuf
+//! format loaders (no system WebP loader required).
 
 use std::fs::File;
 use std::io::{BufReader, Cursor};
 use std::path::Path;
 
+use fast_image_resize as fir;
 use maple_import::{is_raw_format, loadable_image_bytes};
 
-/// Generate a PNG thumbnail for the given image file.
+// ── Public entry points ───────────────────────────────────────────
+
+/// Decode and resize `path` to at most `max_size`px on the longest edge.
 ///
-/// The thumbnail preserves aspect ratio with the longest edge ≤ `max_size` pixels.
+/// Returns `(rgb_pixels, width, height)` — 24-bit tightly-packed RGB.
 /// EXIF orientation is applied before resizing.
-/// Returns PNG-encoded bytes.
-///
-/// Uses gdk-pixbuf under the hood (`Pixbuf::from_file_at_scale`) which
-/// is backed by libjpeg-turbo and can downscale JPEGs during DCT decode.
-pub fn generate_thumbnail(path: &Path, max_size: u32) -> anyhow::Result<Vec<u8>> {
-    let size = max_size as i32;
+/// Lanczos3 filter is used for the final downsample step.
+pub fn render_to_rgb(path: &Path, max_size: u32) -> anyhow::Result<(Vec<u8>, u32, u32)> {
+    // Decode to 2× target so Lanczos3 has enough source detail.
+    let hint = (max_size * 2) as i32;
 
     let pixbuf = if is_raw_format(path) {
-        // Raw files: extract embedded JPEG preview, decode from memory.
         let bytes = loadable_image_bytes(path)?;
-        let stream = gtk4::gio::MemoryInputStream::from_bytes(&gtk4::glib::Bytes::from(&bytes));
+        let stream =
+            gtk4::gio::MemoryInputStream::from_bytes(&gtk4::glib::Bytes::from(&bytes));
         gtk4::gdk_pixbuf::Pixbuf::from_stream_at_scale(
             &stream,
-            size,
-            size,
+            hint,
+            hint,
             true,
             gtk4::gio::Cancellable::NONE,
         )
-        .map_err(|e| anyhow::anyhow!("Failed to decode {}: {}", path.display(), e))?
     } else {
-        // Standard formats: load directly from file for optimal DCT downscaling.
-        gtk4::gdk_pixbuf::Pixbuf::from_file_at_scale(path, size, size, true)
-            .map_err(|e| anyhow::anyhow!("Failed to decode {}: {}", path.display(), e))?
-    };
+        gtk4::gdk_pixbuf::Pixbuf::from_file_at_scale(path, hint, hint, true)
+    }
+    .map_err(|e| anyhow::anyhow!("decode {}: {e}", path.display()))?;
 
-    // Apply EXIF orientation (rotation/flip).
     let pixbuf = pixbuf.apply_embedded_orientation().unwrap_or(pixbuf);
 
-    // Encode to PNG bytes.
-    let buf = pixbuf
-        .save_to_bufferv("png", &[])
-        .map_err(|e| anyhow::anyhow!("PNG encode failed: {e}"))?;
+    let src_w = pixbuf.width() as u32;
+    let src_h = pixbuf.height() as u32;
+    let rowstride = pixbuf.rowstride() as usize;
+    let has_alpha = pixbuf.has_alpha();
+    let src_ch: usize = if has_alpha { 4 } else { 3 };
 
-    Ok(buf)
+    let Some(raw) = pixbuf.pixel_bytes() else {
+        anyhow::bail!("no pixel data for {}", path.display());
+    };
+
+    // Unpack rows (strip row padding) and convert to tight RGB.
+    let mut rgb = Vec::with_capacity((src_w * src_h * 3) as usize);
+    for y in 0..src_h as usize {
+        let row = &raw[y * rowstride..y * rowstride + src_w as usize * src_ch];
+        if has_alpha {
+            for px in row.chunks_exact(4) {
+                rgb.extend_from_slice(&px[..3]);
+            }
+        } else {
+            rgb.extend_from_slice(row);
+        }
+    }
+    drop(raw);
+    drop(pixbuf);
+
+    let (dst_w, dst_h) = fit_dims(src_w, src_h, max_size);
+
+    let src_img =
+        fir::images::ImageRef::new(src_w, src_h, &rgb, fir::PixelType::U8x3)
+            .map_err(|e| anyhow::anyhow!("fir src: {e}"))?;
+    let mut dst_img = fir::images::Image::new(dst_w, dst_h, fir::PixelType::U8x3);
+    fir::Resizer::new()
+        .resize(
+            &src_img,
+            &mut dst_img,
+            &fir::ResizeOptions::new()
+                .resize_alg(fir::ResizeAlg::Convolution(fir::FilterType::Lanczos3)),
+        )
+        .map_err(|e| anyhow::anyhow!("fir resize: {e}"))?;
+
+    Ok((dst_img.into_vec(), dst_w, dst_h))
 }
 
-/// Fallback: generate a thumbnail using the `image` crate (pure Rust).
+/// Encode `rgb` pixels as lossy WebP at the given quality (0–100).
+pub fn encode_webp_rgb(rgb: &[u8], width: u32, height: u32, quality: u8) -> Vec<u8> {
+    webp::Encoder::from_rgb(rgb, width, height)
+        .encode(quality as f32)
+        .to_vec()
+}
+
+/// Decode cached WebP bytes back to tight RGB pixels.
 ///
-/// Kept for any format gdk-pixbuf can't handle, and for tests that
-/// don't have a GTK main loop.
+/// Returns `(rgb_pixels, width, height)`.
+pub fn decode_webp_rgb(webp: &[u8]) -> anyhow::Result<(Vec<u8>, u32, u32)> {
+    let img = image::load_from_memory(webp)?;
+    let rgb = img.into_rgb8();
+    let (w, h) = rgb.dimensions();
+    Ok((rgb.into_raw(), w, h))
+}
+
+/// Convenience: render + encode WebP in one call.
+///
+/// Returns WebP bytes ready to store in the cache.
+pub fn generate_thumbnail(path: &Path, max_size: u32, quality: u8) -> anyhow::Result<Vec<u8>> {
+    let (rgb, w, h) = render_to_rgb(path, max_size)?;
+    Ok(encode_webp_rgb(&rgb, w, h, quality))
+}
+
+// ── Internals ─────────────────────────────────────────────────────
+
+/// Compute output dimensions preserving aspect ratio.
+fn fit_dims(w: u32, h: u32, max: u32) -> (u32, u32) {
+    if w == 0 || h == 0 {
+        return (max, max);
+    }
+    if w <= max && h <= max {
+        return (w, h);
+    }
+    if w >= h {
+        (max, ((h as u64 * max as u64) / w as u64).max(1) as u32)
+    } else {
+        (((w as u64 * max as u64) / h as u64).max(1) as u32, max)
+    }
+}
+
+// ── Legacy fallback (pure-Rust, used in tests) ────────────────────
+
+/// Generate a thumbnail using the `image` crate (pure Rust, no GTK).
+///
+/// Slower than the gdk-pixbuf path but usable in test contexts without a
+/// GTK main loop.  Returns PNG-encoded bytes.
 #[allow(dead_code)]
 pub fn generate_thumbnail_image_crate(path: &Path, max_size: u32) -> anyhow::Result<Vec<u8>> {
     let img = image::open(path)
@@ -88,17 +174,7 @@ pub fn read_exif_orientation(path: &Path) -> u32 {
         .unwrap_or(1)
 }
 
-/// Apply EXIF orientation transform.
-///
-/// See <https://www.exif.org/Exif2-2.PDF> (page 18) for the 8 values:
-///   1 = normal
-///   2 = flipped horizontally
-///   3 = rotated 180°
-///   4 = flipped vertically
-///   5 = transposed (flip H + rotate 270° CW)
-///   6 = rotated 90° CW
-///   7 = transverse (flip H + rotate 90° CW)
-///   8 = rotated 270° CW
+/// Apply EXIF orientation transform to a `DynamicImage`.
 pub fn apply_orientation(img: image::DynamicImage, orientation: u32) -> image::DynamicImage {
     match orientation {
         1 => img,
@@ -109,7 +185,7 @@ pub fn apply_orientation(img: image::DynamicImage, orientation: u32) -> image::D
         6 => img.rotate90(),
         7 => img.fliph().rotate90(),
         8 => img.rotate270(),
-        _ => img, // unknown value → leave as-is
+        _ => img,
     }
 }
 
@@ -118,7 +194,6 @@ mod tests {
     use super::*;
     use std::io::Cursor;
 
-    /// Create a minimal valid PNG in a temp file with a `.png` extension.
     fn create_test_png(w: u32, h: u32) -> tempfile::TempDir {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("test.png");
@@ -142,7 +217,6 @@ mod tests {
     fn thumbnail_produces_valid_png() {
         let dir = create_test_png(640, 480);
         let bytes = generate_thumbnail_image_crate(&test_png_path(&dir), 128).unwrap();
-        // Should start with PNG magic bytes
         assert!(bytes.starts_with(&[0x89, b'P', b'N', b'G']));
     }
 
@@ -154,7 +228,6 @@ mod tests {
         let img = image::load_from_memory(&bytes).unwrap();
         assert!(img.width() <= 100);
         assert!(img.height() <= 100);
-        // Aspect ratio: 800×400 → 100×50
         assert_eq!(img.width(), 100);
         assert_eq!(img.height(), 50);
     }
@@ -163,5 +236,20 @@ mod tests {
     fn thumbnail_bad_path_errors() {
         let result = generate_thumbnail_image_crate(Path::new("/nonexistent/photo.jpg"), 128);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn fit_dims_landscape() {
+        assert_eq!(fit_dims(800, 400, 200), (200, 100));
+    }
+
+    #[test]
+    fn fit_dims_portrait() {
+        assert_eq!(fit_dims(400, 800, 200), (100, 200));
+    }
+
+    #[test]
+    fn fit_dims_small_image_unchanged() {
+        assert_eq!(fit_dims(100, 80, 200), (100, 80));
     }
 }

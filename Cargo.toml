@@ -64,6 +64,10 @@ anyhow = "1"
 # HTTP (blocking, for AI API calls)
 ureq = { version = "2", features = ["json"] }
 
+# Thumbnail cache
+heed = "0.20"
+webp = "0.3"
+
 # Encoding
 base64 = "0.22"
 

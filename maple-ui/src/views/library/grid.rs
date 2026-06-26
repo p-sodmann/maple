@@ -9,6 +9,15 @@
 //! Each `load()` call increments an internal generation counter.  The
 //! glib poller discards messages from superseded loads, so rapid search
 //! changes never produce stale or interleaved grid content.
+//!
+//! # Thumbnail cache
+//!
+//! Workers check the `ThumbnailCache` (LMDB) before decoding.  On a cache
+//! hit the WebP bytes are decoded in the worker thread to packed RGB.  On a
+//! miss the image is decoded, Lanczos3-resized, and encoded as WebP before
+//! being written to the cache.  The UI thread always receives plain RGB pixels
+//! and constructs a `gdk::Texture` from them without requiring any gdk-pixbuf
+//! format loader for WebP.
 
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
@@ -16,14 +25,14 @@ use std::sync::{mpsc, Arc, Mutex};
 use std::time::Duration;
 
 use gtk4::gdk;
+use gtk4::gdk_pixbuf;
 use gtk4::glib;
 use gtk4::prelude::*;
 
-use maple_db::{LibraryImage, SearchQuery};
+use maple_db::{LibraryImage, SearchQuery, ThumbnailCache};
 
-use crate::thumbnail::generate_thumbnail;
+use crate::thumbnail;
 
-const THUMB_PX: u32 = 200;
 const POLL_MS: u64 = 32;
 
 // ── Worker messages ──────────────────────────────────────────────
@@ -31,8 +40,13 @@ const POLL_MS: u64 = 32;
 enum GridMsg {
     /// Initial batch of DB results (establishes grid size).
     Records(Vec<LibraryImage>),
-    /// One thumbnail finished generating.
-    Thumb { index: usize, png_bytes: Vec<u8> },
+    /// One thumbnail finished — carries decoded RGB pixels.
+    Thumb {
+        index: usize,
+        rgb: Vec<u8>,
+        width: u32,
+        height: u32,
+    },
     /// All thumbnails have been generated.
     Done,
 }
@@ -47,21 +61,26 @@ enum GridMsg {
 pub struct LibraryGrid {
     widget: gtk4::FlowBox,
     db: Arc<Mutex<maple_db::Database>>,
-    /// Active records, shared with the child-activated signal handler.
     records: Rc<RefCell<Vec<LibraryImage>>>,
-    /// Monotonically increasing; stale poller closures detect mismatches.
     generation: Rc<Cell<u64>>,
+    cache: Arc<ThumbnailCache>,
+    thumb_quality: u8,
+    /// Longest-edge pixel size for generated and displayed thumbnails.
+    thumb_px: Rc<Cell<u32>>,
 }
 
 impl LibraryGrid {
     /// Create the grid.
     ///
     /// `on_activate` is called on the GTK main thread whenever the user clicks
-    /// a cell.  It receives the selected `LibraryImage` and the root
-    /// `gtk4::Window` (so callers can open a transient detail window).
+    /// a cell.  It receives the index of the activated image, a snapshot of all
+    /// currently loaded records, and the root `gtk4::Window`.
     pub fn new(
         db: Arc<Mutex<maple_db::Database>>,
-        on_activate: impl Fn(LibraryImage, gtk4::Window) + 'static,
+        cache: Arc<ThumbnailCache>,
+        thumb_quality: u8,
+        thumb_px: u32,
+        on_activate: impl Fn(usize, Vec<LibraryImage>, gtk4::Window) + 'static,
     ) -> Self {
         let flow_box = gtk4::FlowBox::builder()
             .valign(gtk4::Align::Start)
@@ -80,15 +99,14 @@ impl LibraryGrid {
 
         let records: Rc<RefCell<Vec<LibraryImage>>> = Rc::new(RefCell::new(Vec::new()));
 
-        // Wire the activation signal once — it always reads from the current
-        // `records` snapshot, so it stays valid across reloads.
         flow_box.connect_child_activated({
             let records = records.clone();
             move |fb, child| {
                 let idx = child.index() as usize;
-                if let Some(rec) = records.borrow().get(idx).cloned() {
+                let snap = records.borrow().clone();
+                if snap.get(idx).is_some() {
                     if let Some(window) = fb.root().and_downcast::<gtk4::Window>() {
-                        on_activate(rec, window);
+                        on_activate(idx, snap, window);
                     }
                 }
             }
@@ -99,6 +117,9 @@ impl LibraryGrid {
             db,
             records,
             generation: Rc::new(Cell::new(0)),
+            cache,
+            thumb_quality,
+            thumb_px: Rc::new(Cell::new(thumb_px)),
         }
     }
 
@@ -107,20 +128,26 @@ impl LibraryGrid {
         &self.widget
     }
 
+    /// Update the thumbnail render size.  Takes effect on the next `load()`.
+    pub fn set_thumb_size(&self, px: u32) {
+        self.thumb_px.set(px);
+    }
+
     /// Reload the grid from the database using `query`.
     ///
     /// Clears the grid immediately and cancels any in-progress previous load.
     pub fn load(&self, query: SearchQuery) {
-        // Bump generation so any running poller stops picking up old messages.
         let gen = self.generation.get() + 1;
         self.generation.set(gen);
 
-        // Clear existing cells right away.
         while let Some(child) = self.widget.first_child() {
             self.widget.remove(&child);
         }
 
         let db = self.db.clone();
+        let cache = self.cache.clone();
+        let quality = self.thumb_quality;
+        let thumb_px = self.thumb_px.get();
         let (tx, rx) = mpsc::channel::<GridMsg>();
 
         // ── Worker thread ─────────────────────────────────────────
@@ -145,15 +172,13 @@ impl LibraryGrid {
             std::thread::scope(|scope| {
                 for (chunk_start, chunk) in records.chunks(chunk_size).enumerate() {
                     let tx = tx.clone();
+                    let cache = cache.clone();
                     scope.spawn(move || {
                         for (i, rec) in chunk.iter().enumerate() {
                             let index = chunk_start * chunk_size + i;
-                            match generate_thumbnail(&rec.path, THUMB_PX) {
-                                Ok(bytes) => {
-                                    let _ = tx.send(GridMsg::Thumb {
-                                        index,
-                                        png_bytes: bytes,
-                                    });
+                            match load_thumbnail(rec, thumb_px, quality, &cache) {
+                                Ok((rgb, width, height)) => {
+                                    let _ = tx.send(GridMsg::Thumb { index, rgb, width, height });
                                 }
                                 Err(e) => {
                                     tracing::warn!(
@@ -174,10 +199,12 @@ impl LibraryGrid {
         let flow_box = self.widget.clone();
         let records_ref = self.records.clone();
         let generation = self.generation.clone();
+        // Snapshot size so placeholder and cells are consistent within one load.
+        let px = thumb_px;
 
         glib::timeout_add_local(Duration::from_millis(POLL_MS), move || {
             if generation.get() != gen {
-                return glib::ControlFlow::Break; // superseded load — stop polling
+                return glib::ControlFlow::Break;
             }
 
             while let Ok(msg) = rx.try_recv() {
@@ -187,20 +214,33 @@ impl LibraryGrid {
                         for rec in &records {
                             let child = gtk4::FlowBoxChild::new();
                             let name = rec.meta.filename.as_deref().unwrap_or("…");
-                            child.set_child(Some(&build_placeholder(name, rec.similarity)));
+                            child.set_child(Some(&build_placeholder(name, rec.similarity, px)));
                             flow_box.append(&child);
                         }
                     }
 
-                    GridMsg::Thumb { index, png_bytes } => {
+                    GridMsg::Thumb { index, rgb, width, height } => {
                         if let Some(child) = flow_box.child_at_index(index as i32) {
                             let records = records_ref.borrow();
                             if let Some(rec) = records.get(index) {
-                                let bytes = glib::Bytes::from(&png_bytes);
-                                if let Ok(texture) = gdk::Texture::from_bytes(&bytes) {
-                                    let name = rec.meta.filename.as_deref().unwrap_or("?");
-                                    child.set_child(Some(&build_cell(&texture, name, rec.similarity)));
-                                }
+                                let bytes = glib::Bytes::from(&rgb);
+                                let pixbuf = gdk_pixbuf::Pixbuf::from_bytes(
+                                    &bytes,
+                                    gdk_pixbuf::Colorspace::Rgb,
+                                    false,
+                                    8,
+                                    width as i32,
+                                    height as i32,
+                                    (width * 3) as i32,
+                                );
+                                let texture = gdk::Texture::for_pixbuf(&pixbuf);
+                                let name = rec.meta.filename.as_deref().unwrap_or("?");
+                                child.set_child(Some(&build_cell(
+                                    &texture,
+                                    name,
+                                    rec.similarity,
+                                    px,
+                                )));
                             }
                         }
                     }
@@ -214,9 +254,43 @@ impl LibraryGrid {
     }
 }
 
+// ── Thumbnail loading with cache ─────────────────────────────────
+
+/// Load a thumbnail for `rec`, using the LMDB cache when possible.
+///
+/// Cache hit: decode stored WebP to RGB.
+/// Cache miss: render from disk, encode WebP, store in cache, return RGB.
+fn load_thumbnail(
+    rec: &LibraryImage,
+    max_size: u32,
+    quality: u8,
+    cache: &ThumbnailCache,
+) -> anyhow::Result<(Vec<u8>, u32, u32)> {
+    // Try the cache first if we have a content hash.
+    if let Some(hash) = rec.hash {
+        if let Some(webp) = cache.get(&hash) {
+            return thumbnail::decode_webp_rgb(&webp);
+        }
+    }
+
+    // Cache miss — decode and resize from disk.
+    let (rgb, w, h) = thumbnail::render_to_rgb(&rec.path, max_size)?;
+
+    // Write to cache (best-effort — a write failure just means a cold miss
+    // next time, not a hard error).
+    if let Some(hash) = rec.hash {
+        let webp = thumbnail::encode_webp_rgb(&rgb, w, h, quality);
+        if let Err(e) = cache.insert(&hash, &webp) {
+            tracing::warn!("Thumbnail cache write failed for {}: {e}", rec.path.display());
+        }
+    }
+
+    Ok((rgb, w, h))
+}
+
 // ── Cell widgets ─────────────────────────────────────────────────
 
-fn build_placeholder(name: &str, similarity: Option<f32>) -> gtk4::Box {
+fn build_placeholder(name: &str, similarity: Option<f32>, px: u32) -> gtk4::Box {
     let spinner = gtk4::Spinner::builder()
         .spinning(true)
         .width_request(32)
@@ -229,8 +303,8 @@ fn build_placeholder(name: &str, similarity: Option<f32>) -> gtk4::Box {
     spinner.add_css_class("maple-slow-spinner");
 
     let frame = gtk4::Box::builder()
-        .width_request(THUMB_PX as i32)
-        .height_request(THUMB_PX as i32)
+        .width_request(px as i32)
+        .height_request(px as i32)
         .hexpand(true)
         .vexpand(true)
         .css_classes(["maple-placeholder"])
@@ -240,9 +314,9 @@ fn build_placeholder(name: &str, similarity: Option<f32>) -> gtk4::Box {
     labeled_cell(&frame, name, similarity)
 }
 
-fn build_cell(texture: &gdk::Texture, name: &str, similarity: Option<f32>) -> gtk4::Box {
+fn build_cell(texture: &gdk::Texture, name: &str, similarity: Option<f32>, px: u32) -> gtk4::Box {
     let picture = gtk4::Picture::for_paintable(texture);
-    picture.set_size_request(THUMB_PX as i32, THUMB_PX as i32);
+    picture.set_size_request(px as i32, px as i32);
     picture.set_content_fit(gtk4::ContentFit::Cover);
     picture.set_overflow(gtk4::Overflow::Hidden);
     picture.add_css_class("maple-thumb");
@@ -250,10 +324,6 @@ fn build_cell(texture: &gdk::Texture, name: &str, similarity: Option<f32>) -> gt
     labeled_cell(&picture, name, similarity)
 }
 
-/// Wrap any widget in a rounded card with a caption label beneath it.
-///
-/// When `similarity` is set (semantic/hybrid search), a "NN% match" score is
-/// shown under the filename.
 fn labeled_cell(
     content: &impl IsA<gtk4::Widget>,
     name: &str,

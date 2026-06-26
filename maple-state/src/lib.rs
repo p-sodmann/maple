@@ -264,6 +264,39 @@ impl Default for AiSettings {
     }
 }
 
+/// Thumbnail cache settings.
+///
+/// Stored under `[thumbnails]` in `settings.toml`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ThumbnailSettings {
+    /// WebP lossy quality for cached thumbnails (0–100). Default: 80.
+    #[serde(default = "ThumbnailSettings::default_quality")]
+    pub quality: u8,
+    /// Thumbnail longest-edge size in pixels. Default: 200.
+    /// Changing this value invalidates the cache (clear it via Settings).
+    #[serde(default = "ThumbnailSettings::default_size")]
+    pub size: u32,
+}
+
+impl ThumbnailSettings {
+    fn default_quality() -> u8 {
+        80
+    }
+
+    fn default_size() -> u32 {
+        200
+    }
+}
+
+impl Default for ThumbnailSettings {
+    fn default() -> Self {
+        Self {
+            quality: Self::default_quality(),
+            size: Self::default_size(),
+        }
+    }
+}
+
 /// Collection hotkey settings.
 ///
 /// Stored under `[collections]` in `settings.toml`.
@@ -403,6 +436,9 @@ pub struct Settings {
     /// Semantic search settings.
     #[serde(default)]
     pub semantic: SemanticSettings,
+    /// Thumbnail cache settings.
+    #[serde(default)]
+    pub thumbnails: ThumbnailSettings,
 }
 
 impl Settings {
@@ -487,6 +523,7 @@ impl Default for Settings {
             face: FaceSettings::default(),
             collections: CollectionSettings::default(),
             semantic: SemanticSettings::default(),
+            thumbnails: ThumbnailSettings::default(),
         }
     }
 }

@@ -95,7 +95,10 @@ pub fn load_image_async(
                 glib::ControlFlow::Break
             }
             Err(mpsc::TryRecvError::Empty) => glib::ControlFlow::Continue,
-            Err(mpsc::TryRecvError::Disconnected) => glib::ControlFlow::Break,
+            Err(mpsc::TryRecvError::Disconnected) => {
+                on_loaded(0, 0);
+                glib::ControlFlow::Break
+            }
         }
     });
 }

@@ -1,6 +1,8 @@
-//! Background scan — walks source directory, generates thumbnails, reports progress.
+//! Background scan — walks source directory (or processes a dropped file list),
+//! generates thumbnails, and reports progress via `ScanMsg`.
 
 use std::cell::RefCell;
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::mpsc;
@@ -10,8 +12,6 @@ use gtk4::gdk;
 use gtk4::glib;
 use gtk4::prelude::*;
 use libadwaita as adw;
-
-use crate::thumbnail::generate_thumbnail;
 
 use super::filmstrip::{build_strip_placeholder, replace_strip_thumb};
 use super::preview::update_preview;
@@ -29,6 +29,8 @@ pub(super) fn scan_summary_text(st: &BrowserState) -> String {
         format!("{} images", st.generated)
     }
 }
+
+// ── Directory scan ───────────────────────────────────────────────
 
 #[allow(clippy::too_many_arguments)]
 pub(super) fn start_scan(
@@ -49,8 +51,6 @@ pub(super) fn start_scan(
     let imported_set = state.borrow().imported_set.clone();
     let rejected_set = state.borrow().rejected_set.clone();
 
-    // Worker thread: scan, generate thumbnails, and check seen status.
-    // Uses scan_grouped so that JPG+RAF pairs are shown as a single entry.
     std::thread::spawn(move || {
         match maple_import::scan_grouped(&source) {
             Ok(groups) => {
@@ -67,17 +67,14 @@ pub(super) fn start_scan(
                     let rejected_set = &rejected_set;
                     let groups = &groups;
 
-                    // Round-robin: thread T processes groups T, T+P, T+2P, …
-                    // so all threads start near the beginning of the list and
-                    // thumbnails arrive roughly in order.
                     for thread_id in 0..parallelism {
                         scope.spawn(move || {
                             let mut idx = thread_id;
                             while idx < groups.len() {
                                 let group = &groups[idx];
                                 let display_path = &group.display.path;
-                                match generate_thumbnail(display_path, THUMB_SIZE) {
-                                    Ok(bytes) => {
+                                match crate::thumbnail::render_to_rgb(display_path, THUMB_SIZE) {
+                                    Ok((rgb, width, height)) => {
                                         let (content_hash, imported, rejected) =
                                             match maple_import::content_hash(display_path) {
                                                 Ok(hash) => {
@@ -101,7 +98,9 @@ pub(super) fn start_scan(
                                                 .iter()
                                                 .map(|c| c.path.clone())
                                                 .collect(),
-                                            png_bytes: bytes,
+                                            rgb,
+                                            width,
+                                            height,
                                             content_hash,
                                             imported,
                                             rejected,
@@ -128,18 +127,188 @@ pub(super) fn start_scan(
         }
     });
 
-    // UI-thread receiver
-    let state = state.clone();
-    let preview = preview.clone();
-    let preview_scroll = preview_scroll.clone();
-    let filename_label = filename_label.clone();
-    let selected_label = selected_label.clone();
-    let counter_label = counter_label.clone();
-    let strip_box = strip_box.clone();
-    let strip_scroll = strip_scroll.clone();
-    let progress_bar = progress_bar.clone();
-    let toast_overlay = toast_overlay.clone();
+    start_scan_poller(
+        receiver,
+        state.clone(),
+        preview.clone(),
+        preview_scroll.clone(),
+        filename_label.clone(),
+        selected_label.clone(),
+        counter_label.clone(),
+        strip_box.clone(),
+        strip_scroll.clone(),
+        progress_bar.clone(),
+        toast_overlay.clone(),
+    );
+}
 
+// ── File-list scan (drag-and-drop) ───────────────────────────────
+
+/// Like `start_scan` but operates on an explicit list of files instead of
+/// walking a source directory.  Files are grouped so that JPG+RAW pairs with
+/// matching stems appear as a single entry.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn start_scan_from_files(
+    files: Vec<PathBuf>,
+    state: &Rc<RefCell<BrowserState>>,
+    preview: &gtk4::Picture,
+    preview_scroll: &gtk4::ScrolledWindow,
+    filename_label: &gtk4::Label,
+    selected_label: &gtk4::Label,
+    counter_label: &gtk4::Label,
+    strip_box: &gtk4::Box,
+    strip_scroll: &gtk4::ScrolledWindow,
+    progress_bar: &gtk4::ProgressBar,
+    toast_overlay: &adw::ToastOverlay,
+) {
+    let (sender, receiver) = mpsc::channel::<ScanMsg>();
+    let imported_set = state.borrow().imported_set.clone();
+    let rejected_set = state.borrow().rejected_set.clone();
+
+    std::thread::spawn(move || {
+        let groups = group_dropped_files(files);
+        let total = groups.len();
+        let _ = sender.send(ScanMsg::Count(total));
+
+        let parallelism = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(4);
+
+        std::thread::scope(|scope| {
+            let sender = &sender;
+            let imported_set = &imported_set;
+            let rejected_set = &rejected_set;
+            let groups = &groups;
+
+            for thread_id in 0..parallelism {
+                scope.spawn(move || {
+                    let mut idx = thread_id;
+                    while idx < groups.len() {
+                        let (display_path, companions) = &groups[idx];
+                        match crate::thumbnail::render_to_rgb(display_path, THUMB_SIZE) {
+                            Ok((rgb, width, height)) => {
+                                let (content_hash, imported, rejected) =
+                                    match maple_import::content_hash(display_path) {
+                                        Ok(hash) => {
+                                            let imported = imported_set
+                                                .lock()
+                                                .unwrap()
+                                                .probably_contains(&hash);
+                                            let rejected = rejected_set
+                                                .lock()
+                                                .unwrap()
+                                                .probably_contains(&hash);
+                                            (hash, imported, rejected)
+                                        }
+                                        Err(_) => ([0u8; 32], false, false),
+                                    };
+                                let _ = sender.send(ScanMsg::Thumb {
+                                    index: idx,
+                                    path: display_path.clone(),
+                                    companions: companions.clone(),
+                                    rgb,
+                                    width,
+                                    height,
+                                    content_hash,
+                                    imported,
+                                    rejected,
+                                });
+                            }
+                            Err(e) => {
+                                tracing::warn!(
+                                    "Thumbnail failed for {}: {e}",
+                                    display_path.display()
+                                );
+                            }
+                        }
+                        idx += parallelism;
+                    }
+                });
+            }
+        });
+
+        let _ = sender.send(ScanMsg::Done);
+    });
+
+    start_scan_poller(
+        receiver,
+        state.clone(),
+        preview.clone(),
+        preview_scroll.clone(),
+        filename_label.clone(),
+        selected_label.clone(),
+        counter_label.clone(),
+        strip_box.clone(),
+        strip_scroll.clone(),
+        progress_bar.clone(),
+        toast_overlay.clone(),
+    );
+}
+
+/// Group a flat file list into (display, companions) pairs.
+///
+/// Non-raw files are displays; raw files with a matching stem become
+/// companions of the display.  Orphan raw files (no matching display) get
+/// their own entry.
+fn group_dropped_files(files: Vec<PathBuf>) -> Vec<(PathBuf, Vec<PathBuf>)> {
+    let mut displays: Vec<PathBuf> = Vec::new();
+    let mut raws: Vec<PathBuf> = Vec::new();
+
+    for path in files {
+        if maple_import::is_raw_format(&path) {
+            raws.push(path);
+        } else {
+            displays.push(path);
+        }
+    }
+
+    let mut used_raws: HashSet<usize> = HashSet::new();
+    let mut groups: Vec<(PathBuf, Vec<PathBuf>)> = Vec::new();
+
+    for display in &displays {
+        let stem = display.file_stem().unwrap_or_default();
+        let companions: Vec<PathBuf> = raws
+            .iter()
+            .enumerate()
+            .filter_map(|(i, raw)| {
+                if !used_raws.contains(&i) && raw.file_stem().unwrap_or_default() == stem {
+                    used_raws.insert(i);
+                    Some(raw.clone())
+                } else {
+                    None
+                }
+            })
+            .collect();
+        groups.push((display.clone(), companions));
+    }
+
+    for (i, raw) in raws.iter().enumerate() {
+        if !used_raws.contains(&i) {
+            groups.push((raw.clone(), vec![]));
+        }
+    }
+
+    groups
+}
+
+// ── Shared UI poller ─────────────────────────────────────────────
+
+/// Register the glib timeout poller that drains `receiver` and updates all
+/// scan-related widgets.  Shared by both `start_scan` and `start_scan_from_files`.
+#[allow(clippy::too_many_arguments)]
+fn start_scan_poller(
+    receiver: mpsc::Receiver<ScanMsg>,
+    state: Rc<RefCell<BrowserState>>,
+    preview: gtk4::Picture,
+    preview_scroll: gtk4::ScrolledWindow,
+    filename_label: gtk4::Label,
+    selected_label: gtk4::Label,
+    counter_label: gtk4::Label,
+    strip_box: gtk4::Box,
+    strip_scroll: gtk4::ScrolledWindow,
+    progress_bar: gtk4::ProgressBar,
+    toast_overlay: adw::ToastOverlay,
+) {
     glib::timeout_add_local(Duration::from_millis(32), move || {
         while let Ok(msg) = receiver.try_recv() {
             match msg {
@@ -151,8 +320,6 @@ pub(super) fn start_scan(
                         progress_bar.set_text(Some("No images found"));
                         return glib::ControlFlow::Break;
                     }
-                    // Pre-populate image entries (no texture yet)
-                    // and add placeholder thumbnails to the strip.
                     for _ in 0..n {
                         st.images.push(ImageEntry {
                             path: PathBuf::new(),
@@ -173,21 +340,25 @@ pub(super) fn start_scan(
                     index,
                     path,
                     companions,
-                    png_bytes,
+                    rgb,
+                    width,
+                    height,
                     content_hash,
                     imported,
                     rejected,
                 } => {
-                    let bytes = glib::Bytes::from(&png_bytes);
-                    let texture = match gdk::Texture::from_bytes(&bytes) {
-                        Ok(t) => t,
-                        Err(e) => {
-                            tracing::warn!("Texture failed: {e}");
-                            continue;
-                        }
-                    };
+                    let bytes = glib::Bytes::from(&rgb);
+                    let pixbuf = gtk4::gdk_pixbuf::Pixbuf::from_bytes(
+                        &bytes,
+                        gtk4::gdk_pixbuf::Colorspace::Rgb,
+                        false,
+                        8,
+                        width as i32,
+                        height as i32,
+                        (width * 3) as i32,
+                    );
+                    let texture = gdk::Texture::for_pixbuf(&pixbuf);
 
-                    // Store in state
                     {
                         let mut st = state.borrow_mut();
                         if index < st.images.len() {
@@ -201,8 +372,12 @@ pub(super) fn start_scan(
                             };
                         }
                         st.generated += 1;
-                        if imported { st.imported_count += 1; }
-                        if rejected { st.rejected_count += 1; }
+                        if imported {
+                            st.imported_count += 1;
+                        }
+                        if rejected {
+                            st.rejected_count += 1;
+                        }
                         let frac = if st.total > 0 {
                             st.generated as f64 / st.total as f64
                         } else {
@@ -223,10 +398,8 @@ pub(super) fn start_scan(
                         }
                     }
 
-                    // Replace strip placeholder (dim if imported or rejected)
                     replace_strip_thumb(&strip_box, index, &texture, &path, imported, rejected);
 
-                    // If this is the current image, update the preview
                     let cur = state.borrow().current;
                     if index == cur {
                         update_preview(
@@ -248,7 +421,6 @@ pub(super) fn start_scan(
                     progress_bar.set_text(Some(&scan_summary_text(&st)));
                     drop(st);
 
-                    // Show first image
                     update_preview(
                         &state,
                         &preview,

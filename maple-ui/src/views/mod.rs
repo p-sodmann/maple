@@ -1,3 +1,4 @@
+pub mod drop_import;
 pub mod home;
 pub mod image_browser;
 pub mod library;

@@ -205,7 +205,7 @@ impl Database {
             "SELECT id, path, added_at, status,
                     filename, taken_at, make, model, lens,
                     focal_length, aperture, iso,
-                    width, height, orientation, raw_path
+                    width, height, orientation, raw_path, hash
              FROM images
              WHERE id IN ({placeholders}) AND status = 'present'{coll_clause}"
         );

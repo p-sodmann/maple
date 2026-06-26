@@ -23,9 +23,10 @@ use gtk4::prelude::*;
 use libadwaita as adw;
 use adw::prelude::*;
 
-use maple_db::SearchQuery;
+use maple_db::{SearchQuery, ThumbnailCache};
 
 use super::{build_face_tagging_page, collection_manager, detail_window, grid::LibraryGrid, search_bar};
+use crate::views::settings_window;
 
 /// Shared slot holding the "load the semantic model" action, so `reload_grid`
 /// (defined first) can lazily trigger it on the first search without a
@@ -42,16 +43,24 @@ type SemanticStartSlot = Rc<RefCell<Option<Rc<dyn Fn()>>>>;
 pub fn build_library_page(
     nav_view: &adw::NavigationView,
     db: Arc<Mutex<maple_db::Database>>,
+    cache: Arc<ThumbnailCache>,
 ) -> adw::NavigationPage {
     let settings = maple_state::Settings::load();
 
     // ── Grid ──────────────────────────────────────────────────────
-    let library_grid = LibraryGrid::new(db.clone(), {
-        let db = db.clone();
-        move |image, window| {
-            detail_window::open(&image, &window, &db);
-        }
-    });
+    let library_grid = LibraryGrid::new(
+        db.clone(),
+        cache.clone(),
+        settings.thumbnails.quality,
+        settings.thumbnails.size,
+        {
+            let db = db.clone();
+            move |index, images, window| {
+                let image = images[index].clone();
+                detail_window::open(&image, index, images, &window, &db);
+            }
+        },
+    );
 
     let scrolled = gtk4::ScrolledWindow::builder()
         .hscrollbar_policy(gtk4::PolicyType::Never)
@@ -191,6 +200,32 @@ pub fn build_library_page(
                 settings.face.tagging_top_k,
             );
             nav_view.push(&page);
+        }
+    });
+
+    // ── Settings button ───────────────────────────────────────────
+    let settings_btn = gtk4::Button::builder()
+        .icon_name("preferences-system-symbolic")
+        .tooltip_text("Settings")
+        .css_classes(["flat"])
+        .build();
+    header.pack_start(&settings_btn);
+
+    settings_btn.connect_clicked({
+        let db = db.clone();
+        let cache = cache.clone();
+        let library_grid = library_grid.clone();
+        let reload_grid = reload_grid.clone();
+        move |btn| {
+            if let Some(win) = btn.root().and_downcast::<gtk4::Window>() {
+                let grid = library_grid.clone();
+                let reload = reload_grid.clone();
+                settings_window::open_settings(&win, &db, cache.clone(), move || {
+                    let new_size = maple_state::Settings::load().thumbnails.size;
+                    grid.set_thumb_size(new_size);
+                    reload();
+                });
+            }
         }
     });
 

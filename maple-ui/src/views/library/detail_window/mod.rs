@@ -5,13 +5,15 @@
 //!
 //! Controls:
 //!   • Scroll wheel      — zoom in / out
-//!   • Left-button drag  — pan when zoomed in
-//!   • Open button       — launch in default application
-//!   • Copy path button  — write absolute path to clipboard
-//!   • Persons button    — toggle face-detection overlay (green = assigned,
-//!                         blue = unknown); click a box to assign a person
-//!   • Collections button — open window to manage image collections
-//!   • Fullscreen button — toggle borderless fullscreen
+//!   • Arrow Left / Up   — previous image
+//!   • Arrow Right / Down — next image
+//!   • Left-button drag         — pan when zoomed in
+//!   • Open button              — launch in default application
+//!   • Copy path button         — write absolute path to clipboard
+//!   • Persons button           — toggle face-detection overlay (green = assigned,
+//!                                blue = unknown); click a box to assign a person
+//!   • Collections button       — open window to manage image collections
+//!   • Fullscreen button        — toggle borderless fullscreen
 //!   • Configurable hotkey (default "a") — add image to last-used collection
 
 mod collections;
@@ -24,9 +26,11 @@ mod zoom_pan;
 use std::cell::{Cell, RefCell};
 use std::path::PathBuf;
 use std::rc::Rc;
-use std::sync::{Arc, Mutex};
+use std::sync::{mpsc, Arc, Mutex};
+use std::time::Duration;
 
 use gtk4::gdk;
+use gtk4::glib;
 use gtk4::gio;
 use gtk4::prelude::*;
 use libadwaita as adw;
@@ -61,7 +65,6 @@ struct DetailContext {
     /// Filename label in the bottom bar.
     filename_label: gtk4::Label,
     /// Database handle.
-    #[allow(dead_code)]
     db: Arc<Mutex<maple_db::Database>>,
     /// Header bar reference — kept alive for fullscreen toggling.
     #[allow(dead_code)]
@@ -69,6 +72,12 @@ struct DetailContext {
     /// Whether the window is currently in borderless fullscreen mode.
     #[allow(dead_code)]
     is_fullscreen: Rc<Cell<bool>>,
+    /// Ordered list of images visible in the grid at the time this image was opened.
+    images: Rc<RefCell<Vec<LibraryImage>>>,
+    /// Position of the currently displayed image within `images`.
+    current_index: Rc<Cell<usize>>,
+    /// True while an image load is in flight; navigation is blocked until cleared.
+    is_loading: Rc<Cell<bool>>,
 }
 
 thread_local! {
@@ -78,7 +87,16 @@ thread_local! {
 // ── Public API ───────────────────────────────────────────────────
 
 /// Open (or update) the singleton detail window for `image`.
-pub fn open(image: &LibraryImage, parent: &gtk4::Window, db: &Arc<Mutex<maple_db::Database>>) {
+///
+/// `index` is the position of `image` within `images`; the full `images` list
+/// enables previous/next navigation from inside the detail window.
+pub fn open(
+    image: &LibraryImage,
+    index: usize,
+    images: Vec<LibraryImage>,
+    parent: &gtk4::Window,
+    db: &Arc<Mutex<maple_db::Database>>,
+) {
     // Reuse an existing visible window.
     let ctx = DETAIL_CTX.with(|cell| {
         cell.borrow()
@@ -88,12 +106,14 @@ pub fn open(image: &LibraryImage, parent: &gtk4::Window, db: &Arc<Mutex<maple_db
     });
 
     if let Some(ctx) = ctx {
+        ctx.current_index.set(index);
+        *ctx.images.borrow_mut() = images;
         update_context(&ctx, image, db);
         ctx.window.present();
         return;
     }
 
-    let ctx = build_window(image, parent, db);
+    let ctx = build_window(image, index, images, parent, db);
 
     // Clear the singleton when this window closes.
     let window_ref = ctx.window.clone();
@@ -117,6 +137,8 @@ pub fn open(image: &LibraryImage, parent: &gtk4::Window, db: &Arc<Mutex<maple_db
 
 fn build_window(
     image: &LibraryImage,
+    index: usize,
+    images: Vec<LibraryImage>,
     parent: &gtk4::Window,
     db: &Arc<Mutex<maple_db::Database>>,
 ) -> DetailContext {
@@ -125,6 +147,9 @@ fn build_window(
     let zoom: Rc<Cell<f64>> = Rc::new(Cell::new(1.0));
     let img_dims: Rc<Cell<(i32, i32)>> = Rc::new(Cell::new((0, 0)));
     let is_fullscreen: Rc<Cell<bool>> = Rc::new(Cell::new(false));
+    let images: Rc<RefCell<Vec<LibraryImage>>> = Rc::new(RefCell::new(images));
+    let current_index: Rc<Cell<usize>> = Rc::new(Cell::new(index));
+    let is_loading: Rc<Cell<bool>> = Rc::new(Cell::new(true));
 
     // ── Picture widget inside a scrolled container ────────────────
     let picture = gtk4::Picture::builder()
@@ -160,6 +185,9 @@ fn build_window(
 
     // ── Toast overlay ─────────────────────────────────────────────
     let toast_overlay = adw::ToastOverlay::new();
+    // Drop target: files dropped on the detail window open the import browser
+    // in the main window via the app-wide ImportCtx registered in window.rs.
+    toast_overlay.add_controller(crate::views::drop_import::make_drop_target());
 
     // ── Collection bar ────────────────────────────────────────────
     let collection_bar = CollectionBar::new(
@@ -202,6 +230,18 @@ fn build_window(
     let fullscreen_btn = gtk4::Button::builder()
         .icon_name("view-fullscreen-symbolic")
         .tooltip_text("Toggle fullscreen")
+        .css_classes(["flat"])
+        .build();
+
+    let rotate_ccw_btn = gtk4::Button::builder()
+        .icon_name("object-rotate-left-symbolic")
+        .tooltip_text("Rotate 90° counter-clockwise")
+        .css_classes(["flat"])
+        .build();
+
+    let rotate_cw_btn = gtk4::Button::builder()
+        .icon_name("object-rotate-right-symbolic")
+        .tooltip_text("Rotate 90° clockwise")
         .css_classes(["flat"])
         .build();
 
@@ -255,6 +295,8 @@ fn build_window(
     header.pack_end(&fullscreen_btn);
     header.pack_start(&persons_btn);
     header.pack_start(&collections_btn);
+    header.pack_start(&rotate_ccw_btn);
+    header.pack_start(&rotate_cw_btn);
 
     // ── Metadata info strip ───────────────────────────────────────
     let info_bar = info_bar::build_empty_info_bar();
@@ -341,6 +383,10 @@ fn build_window(
         &zoom,
         &img_dims,
         &window,
+        {
+            let is_loading = is_loading.clone();
+            move || is_loading.set(false)
+        },
     );
 
     let ctx = DetailContext {
@@ -359,6 +405,9 @@ fn build_window(
         db: db.clone(),
         header,
         is_fullscreen,
+        images,
+        current_index,
+        is_loading,
     };
 
     // Load initial collection chips.
@@ -366,6 +415,12 @@ fn build_window(
 
     // ── Hotkey controller ────────────────────────────────────────
     wire_hotkey(&ctx, &settings);
+
+    // ── Navigation (arrow keys) ───────────────────────────────────
+    wire_navigation(&ctx);
+
+    // ── Rotation buttons ─────────────────────────────────────────
+    wire_rotation(&ctx, &rotate_cw_btn, &rotate_ccw_btn);
 
     ctx
 }
@@ -384,6 +439,7 @@ fn update_context(
     info_bar::fill_info_bar(&ctx.info_bar, image);
     *ctx.current_image.borrow_mut() = image.clone();
     zoom_pan::reset_zoom(&ctx.picture, &ctx.scrolled, &ctx.zoom);
+    ctx.is_loading.set(true);
     image_load::load_image(
         image.path.clone(),
         &ctx.picture,
@@ -391,11 +447,145 @@ fn update_context(
         &ctx.zoom,
         &ctx.img_dims,
         &ctx.window,
+        {
+            let is_loading = ctx.is_loading.clone();
+            move || is_loading.set(false)
+        },
     );
     // Reload face detections for the new image.
     ctx.face_overlay.load_for_image(image.id, db);
     // Reload collection chips.
     ctx.collection_bar.reload();
+}
+
+// ── Navigation ───────────────────────────────────────────────────
+
+/// Move `delta` steps in the image list (+1 = next, -1 = prev).
+///
+/// No-ops while a load is in flight so rapid key/scroll presses do not
+/// queue up multiple image transitions.
+fn navigate_relative(ctx: &DetailContext, delta: i32) {
+    if ctx.is_loading.get() {
+        return;
+    }
+    let cur = ctx.current_index.get();
+    let new_image = {
+        let images = ctx.images.borrow();
+        let len = images.len();
+        if len == 0 {
+            return;
+        }
+        let new_idx = (cur as i64 + delta as i64).clamp(0, len as i64 - 1) as usize;
+        if new_idx == cur {
+            return;
+        }
+        ctx.current_index.set(new_idx);
+        images[new_idx].clone()
+    };
+    update_context(ctx, &new_image, &ctx.db.clone());
+}
+
+// ── Rotation ─────────────────────────────────────────────────────
+
+fn wire_rotation(ctx: &DetailContext, cw_btn: &gtk4::Button, ccw_btn: &gtk4::Button) {
+    for (btn, clockwise) in [(&cw_btn.clone(), true), (&ccw_btn.clone(), false)] {
+        btn.connect_clicked({
+            let ctx = ctx.clone();
+            let cw_btn = cw_btn.clone();
+            let ccw_btn = ccw_btn.clone();
+            move |_| rotate_image(&ctx, clockwise, &cw_btn, &ccw_btn)
+        });
+    }
+}
+
+fn rotate_image(ctx: &DetailContext, clockwise: bool, cw_btn: &gtk4::Button, ccw_btn: &gtk4::Button) {
+    let image_id = ctx.current_image.borrow().id;
+    let path = ctx.current_path.borrow().clone();
+
+    cw_btn.set_sensitive(false);
+    ccw_btn.set_sensitive(false);
+
+    let (tx, rx) = mpsc::channel::<Result<(u16, [u8; 32]), String>>();
+    std::thread::spawn(move || {
+        let _ = tx.send(
+            maple_db::rotate_image_file(&path, clockwise).map_err(|e| e.to_string()),
+        );
+    });
+
+    let ctx = ctx.clone();
+    let cw_btn = cw_btn.clone();
+    let ccw_btn = ccw_btn.clone();
+
+    glib::timeout_add_local(Duration::from_millis(32), move || {
+        match rx.try_recv() {
+            Ok(Ok((new_orientation, new_hash))) => {
+                if let Err(e) = maple_db::lock_db(&ctx.db)
+                    .update_image_hash_and_orientation(image_id, &new_hash, new_orientation as i64)
+                {
+                    tracing::warn!("Failed to update DB after rotation: {e}");
+                }
+                {
+                    let mut img = ctx.current_image.borrow_mut();
+                    img.meta.orientation = Some(new_orientation as i64);
+                    img.hash = Some(new_hash);
+                }
+                {
+                    let idx = ctx.current_index.get();
+                    let mut images = ctx.images.borrow_mut();
+                    if let Some(img) = images.get_mut(idx) {
+                        img.meta.orientation = Some(new_orientation as i64);
+                        img.hash = Some(new_hash);
+                    }
+                }
+                ctx.is_loading.set(true);
+                let is_loading = ctx.is_loading.clone();
+                image_load::load_image(
+                    ctx.current_path.borrow().clone(),
+                    &ctx.picture,
+                    &ctx.scrolled,
+                    &ctx.zoom,
+                    &ctx.img_dims,
+                    &ctx.window,
+                    move || is_loading.set(false),
+                );
+                cw_btn.set_sensitive(true);
+                ccw_btn.set_sensitive(true);
+                glib::ControlFlow::Break
+            }
+            Ok(Err(msg)) => {
+                let toast = adw::Toast::new(&format!("Rotation failed: {msg}"));
+                ctx.toast_overlay.add_toast(toast);
+                cw_btn.set_sensitive(true);
+                ccw_btn.set_sensitive(true);
+                glib::ControlFlow::Break
+            }
+            Err(mpsc::TryRecvError::Empty) => glib::ControlFlow::Continue,
+            Err(mpsc::TryRecvError::Disconnected) => {
+                cw_btn.set_sensitive(true);
+                ccw_btn.set_sensitive(true);
+                glib::ControlFlow::Break
+            }
+        }
+    });
+}
+
+fn wire_navigation(ctx: &DetailContext) {
+    let key_ctrl = gtk4::EventControllerKey::new();
+    key_ctrl.connect_key_pressed({
+        let ctx = ctx.clone();
+        move |_, key, _, _| match key {
+            gdk::Key::Left | gdk::Key::Up => {
+                navigate_relative(&ctx, -1);
+                glib::Propagation::Stop
+            }
+            gdk::Key::Right | gdk::Key::Down => {
+                navigate_relative(&ctx, 1);
+                glib::Propagation::Stop
+            }
+            _ => glib::Propagation::Proceed,
+        }
+    });
+    ctx.window.add_controller(key_ctrl);
 }
 
 // ── Hotkey ───────────────────────────────────────────────────────
