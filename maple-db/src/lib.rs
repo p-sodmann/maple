@@ -114,6 +114,20 @@ pub struct ImageRecord {
     pub status: ImageStatus,
 }
 
+/// How an image matched the current search query.
+#[derive(Debug, Clone)]
+pub enum SearchHit {
+    /// The image matched one or more keyword tokens in its metadata or description.
+    /// `field` names the first field that matched ("filename", "camera", "lens",
+    /// "description", or "person name").  `snippet` is the matching sentence from
+    /// the AI description when the match was in a description field.
+    Direct { field: String, snippet: Option<String> },
+    /// The image was retrieved by vector similarity.
+    /// `similarity` is the cosine similarity (0–1); `sentence` is the embedded
+    /// sentence from the AI description that was nearest to the query.
+    Semantic { similarity: f32, sentence: String },
+}
+
 /// Full record including EXIF metadata — returned by `Database::search_images`.
 #[derive(Debug, Clone)]
 pub struct LibraryImage {
@@ -127,9 +141,9 @@ pub struct LibraryImage {
     /// BLAKE3 content hash — used as the thumbnail cache key.
     /// `None` only if the DB row has a corrupt/missing hash (should not happen).
     pub hash: Option<[u8; 32]>,
-    /// Cosine similarity (0–1) to the query, set only by semantic/hybrid
-    /// search; `None` for plain listing or keyword-only results.
-    pub similarity: Option<f32>,
+    /// How this image matched the active search query.  `None` for plain
+    /// (unfiltered) listings and keyword-only results without semantic search.
+    pub search_hit: Option<SearchHit>,
 }
 
 // ── Database ─────────────────────────────────────────────────────
@@ -441,11 +455,24 @@ impl Database {
             .chain([Value::Integer(limit), Value::Integer(offset)])
             .collect();
 
+        let tokens: Vec<String> = text
+            .split_whitespace()
+            .map(|t| t.to_lowercase())
+            .collect();
+
         let mut stmt = self.conn.prepare(&sql)?;
-        let rows = stmt
+        let mut rows: Vec<LibraryImage> = stmt
             .query_map(rusqlite::params_from_iter(params), row_to_library_image)?
             .filter_map(|r| r.ok())
             .collect();
+        for img in &mut rows {
+            let (field, snippet) = if let Some(f) = detect_exif_field(img, &tokens) {
+                (f, None)
+            } else {
+                find_description_match(&self.conn, img.id, &tokens)
+            };
+            img.search_hit = Some(SearchHit::Direct { field, snippet });
+        }
         Ok(rows)
     }
 
@@ -634,6 +661,85 @@ impl Database {
 
 // ── Helpers ──────────────────────────────────────────────────────
 
+/// Return the EXIF field name that first satisfies any of `tokens`, or `None`
+/// when the match must have come from an AI description or a person name.
+pub(crate) fn detect_exif_field(img: &LibraryImage, tokens: &[String]) -> Option<String> {
+    let meta = &img.meta;
+    for token in tokens {
+        if meta
+            .filename
+            .as_deref()
+            .map(|s| s.to_lowercase().contains(token.as_str()))
+            .unwrap_or(false)
+        {
+            return Some("filename".to_owned());
+        }
+        let camera = format!(
+            "{} {}",
+            meta.make.as_deref().unwrap_or(""),
+            meta.model.as_deref().unwrap_or("")
+        )
+        .to_lowercase();
+        if camera.trim().contains(token.as_str()) {
+            return Some("camera".to_owned());
+        }
+        if meta
+            .lens
+            .as_deref()
+            .map(|s| s.to_lowercase().contains(token.as_str()))
+            .unwrap_or(false)
+        {
+            return Some("lens".to_owned());
+        }
+    }
+    None
+}
+
+/// Search AI descriptions for `image_id` to find the best matching sentence.
+///
+/// Prefers a sentence that contains ALL tokens (so "orange cat" shows a
+/// sentence with both words).  Falls back to the first sentence that contains
+/// any token when no all-match sentence exists.
+/// Returns `("description", Some(sentence))` when found or
+/// `("person name", None)` when no description text matches (meaning the
+/// keyword hit came from a joined person name instead).
+fn find_description_match(
+    conn: &Connection,
+    image_id: i64,
+    tokens: &[String],
+) -> (String, Option<String>) {
+    let descriptions: Vec<String> = conn
+        .prepare("SELECT description FROM ai_descriptions WHERE image_id = ?1")
+        .ok()
+        .and_then(|mut stmt| {
+            stmt.query_map(params![image_id], |row| row.get::<_, String>(0))
+                .ok()
+                .map(|rows| rows.filter_map(|r| r.ok()).collect())
+        })
+        .unwrap_or_default();
+
+    let mut any_match: Option<String> = None;
+
+    for desc in &descriptions {
+        for sentence in crate::semantic::split_sentences(desc) {
+            let lower = sentence.to_lowercase();
+            // Ideal: a sentence that satisfies every token.
+            if tokens.iter().all(|t| lower.contains(t.as_str())) {
+                return ("description".to_owned(), Some(sentence));
+            }
+            // Keep the first partial match as a fallback.
+            if any_match.is_none() && tokens.iter().any(|t| lower.contains(t.as_str())) {
+                any_match = Some(sentence);
+            }
+        }
+    }
+
+    if let Some(sentence) = any_match {
+        return ("description".to_owned(), Some(sentence));
+    }
+    ("person name".to_owned(), None)
+}
+
 /// Escape SQL LIKE special characters in a search token.
 fn escape_like_token(token: &str) -> String {
     token
@@ -671,7 +777,7 @@ fn row_to_library_image(row: &rusqlite::Row<'_>) -> rusqlite::Result<LibraryImag
         status: ImageStatus::from_str(&status_str),
         meta,
         hash,
-        similarity: None,
+        search_hit: None,
     })
 }
 

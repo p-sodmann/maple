@@ -8,6 +8,7 @@
 //!   4 → 5 : raw_path column for companion RAW files
 //!   5 → 6 : collections + collection_images tables
 //!   6 → 7 : sentence_embeddings + semantic_meta + vec_sentences (sqlite-vec)
+//!   7 → 8 : skipped column on face_detections (remember skipped faces)
 
 use rusqlite::Connection;
 
@@ -226,6 +227,16 @@ pub(crate) fn vec_table_ddl(dim: i64) -> String {
     )
 }
 
+// ── V8: skipped flag on face_detections ─────────────────────────
+//
+// When the user clicks "Skip" in the face-tagging wizard the face is marked
+// `skipped = 1` so it is excluded from the default untagged queue.  A
+// separate "Review Skipped" mode shows only these faces.  Assigning a name
+// to any face clears the flag automatically.
+
+const V8_COLUMN: &str =
+    "ALTER TABLE face_detections ADD COLUMN skipped INTEGER NOT NULL DEFAULT 0";
+
 // ── Migration runner ─────────────────────────────────────────────
 
 /// Apply all pending schema migrations to `conn`.
@@ -289,6 +300,15 @@ pub fn ensure_schema(conn: &Connection) -> anyhow::Result<()> {
              VALUES (1, '', {V7_DEFAULT_DIM});"
         ))?;
         conn.execute_batch("PRAGMA user_version = 7")?;
+    }
+
+    if version < 8 {
+        if let Err(e) = conn.execute_batch(V8_COLUMN) {
+            if !e.to_string().to_lowercase().contains("duplicate column") {
+                return Err(e.into());
+            }
+        }
+        conn.execute_batch("PRAGMA user_version = 8")?;
     }
 
     Ok(())

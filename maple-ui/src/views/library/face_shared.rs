@@ -211,14 +211,31 @@ pub fn face_screen_rect(
     ))
 }
 
-/// Find the next unassigned real detection index, starting from `start_idx`.
+/// Find the next unassigned, non-skipped real detection index, starting from `start_idx`.
 pub fn next_untagged_index(faces: &[FaceDetection], start_idx: usize) -> Option<usize> {
     faces
         .iter()
         .enumerate()
         .skip(start_idx)
         .find_map(|(idx, face)| {
-            if is_real_detection(face) && face.person_id.is_none() {
+            if is_real_detection(face) && face.person_id.is_none() && !face.skipped {
+                Some(idx)
+            } else {
+                None
+            }
+        })
+}
+
+/// Find the next skipped real detection index, starting from `start_idx`.
+///
+/// Used in "Review Skipped Faces" mode to iterate over previously skipped faces.
+pub fn next_skipped_index(faces: &[FaceDetection], start_idx: usize) -> Option<usize> {
+    faces
+        .iter()
+        .enumerate()
+        .skip(start_idx)
+        .find_map(|(idx, face)| {
+            if is_real_detection(face) && face.person_id.is_none() && face.skipped {
                 Some(idx)
             } else {
                 None

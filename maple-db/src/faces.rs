@@ -36,6 +36,11 @@ pub struct FaceDetection {
     pub embedding: Vec<f32>,
     pub person_id: Option<i64>,
     pub confidence: f32,
+    /// True when the user explicitly skipped this face during tagging.
+    /// Skipped faces are hidden from the default tagging queue and only shown
+    /// in the "Review Skipped Faces" mode.  Cleared automatically when a
+    /// person is assigned.
+    pub skipped: bool,
 }
 
 /// A named person identity.
@@ -149,14 +154,29 @@ impl Database {
     }
 
     /// Assign `face_id` to `person_id` (or unassign if `None`).
+    ///
+    /// Also clears the `skipped` flag — assigning a name to a face implicitly
+    /// un-skips it.
     pub fn assign_face_to_person(
         &self,
         face_id: i64,
         person_id: Option<i64>,
     ) -> anyhow::Result<()> {
         self.conn.execute(
-            "UPDATE face_detections SET person_id = ?1 WHERE id = ?2",
+            "UPDATE face_detections SET person_id = ?1, skipped = 0 WHERE id = ?2",
             params![person_id, face_id],
+        )?;
+        Ok(())
+    }
+
+    /// Mark a face as skipped (or un-skip it).
+    ///
+    /// Skipped faces are excluded from the default tagging queue and only
+    /// shown when the user explicitly opens "Review Skipped Faces".
+    pub fn mark_face_skipped(&self, face_id: i64, skipped: bool) -> anyhow::Result<()> {
+        self.conn.execute(
+            "UPDATE face_detections SET skipped = ?1 WHERE id = ?2",
+            params![skipped as i32, face_id],
         )?;
         Ok(())
     }
@@ -186,7 +206,7 @@ impl Database {
     pub fn faces_for_image(&self, image_id: i64) -> anyhow::Result<Vec<FaceDetection>> {
         let mut stmt = self.conn.prepare(
             "SELECT id, image_id, bbox_x1, bbox_y1, bbox_x2, bbox_y2,
-                    embedding, person_id, confidence
+                    embedding, person_id, confidence, skipped
              FROM face_detections
              WHERE image_id = ?1",
         )?;
@@ -203,10 +223,11 @@ impl Database {
                     blob,
                     row.get::<_, Option<i64>>(7)?,
                     row.get::<_, f32>(8)?,
+                    row.get::<_, bool>(9)?,
                 ))
             })?
             .filter_map(|r| r.ok())
-            .map(|(id, image_id, x1, y1, x2, y2, blob, person_id, confidence)| {
+            .map(|(id, image_id, x1, y1, x2, y2, blob, person_id, confidence, skipped)| {
                 FaceDetection {
                     id,
                     image_id,
@@ -214,6 +235,7 @@ impl Database {
                     embedding: blob_to_embedding(&blob),
                     person_id,
                     confidence,
+                    skipped,
                 }
             })
             .collect();
@@ -287,13 +309,14 @@ impl Database {
         Ok(rows)
     }
 
-    /// Return IDs of present images that have at least one real untagged face.
+    /// Return IDs of present images that have at least one real untagged, non-skipped face.
     pub fn images_with_untagged_faces(&self) -> anyhow::Result<Vec<i64>> {
         let mut stmt = self.conn.prepare(
             "SELECT DISTINCT fd.image_id
              FROM face_detections fd
              JOIN images i ON i.id = fd.image_id
              WHERE fd.person_id IS NULL
+               AND fd.skipped = 0
                AND fd.confidence >= 0.0
                AND NOT (fd.bbox_x1 = 0.0 AND fd.bbox_y1 = 0.0
                         AND fd.bbox_x2 = 0.0 AND fd.bbox_y2 = 0.0)
@@ -305,6 +328,47 @@ impl Database {
             .filter_map(|r| r.ok())
             .collect();
         Ok(rows)
+    }
+
+    /// Return IDs of present images that have at least one real skipped face.
+    ///
+    /// Used by the "Review Skipped Faces" tagging mode.
+    pub fn images_with_skipped_faces(&self) -> anyhow::Result<Vec<i64>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT DISTINCT fd.image_id
+             FROM face_detections fd
+             JOIN images i ON i.id = fd.image_id
+             WHERE fd.person_id IS NULL
+               AND fd.skipped = 1
+               AND fd.confidence >= 0.0
+               AND NOT (fd.bbox_x1 = 0.0 AND fd.bbox_y1 = 0.0
+                        AND fd.bbox_x2 = 0.0 AND fd.bbox_y2 = 0.0)
+               AND i.status = 'present'
+             ORDER BY fd.image_id",
+        )?;
+        let rows = stmt
+            .query_map([], |row| row.get::<_, i64>(0))?
+            .filter_map(|r| r.ok())
+            .collect();
+        Ok(rows)
+    }
+
+    /// Count real skipped faces across all present images.
+    pub fn count_skipped_faces(&self) -> anyhow::Result<usize> {
+        let count: i64 = self.conn.query_row(
+            "SELECT COUNT(*)
+             FROM face_detections fd
+             JOIN images i ON i.id = fd.image_id
+             WHERE fd.person_id IS NULL
+               AND fd.skipped = 1
+               AND fd.confidence >= 0.0
+               AND NOT (fd.bbox_x1 = 0.0 AND fd.bbox_y1 = 0.0
+                        AND fd.bbox_x2 = 0.0 AND fd.bbox_y2 = 0.0)
+               AND i.status = 'present'",
+            [],
+            |r| r.get(0),
+        )?;
+        Ok(count as usize)
     }
 
     /// Return image ids that contain a face assigned to any of `person_ids`.

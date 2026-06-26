@@ -149,14 +149,17 @@ impl Database {
 
     /// K-nearest-neighbour search over sentence vectors.
     ///
-    /// Returns `(image_id, distance)` for present images, one row per image
-    /// (best/lowest distance across its sentences), ordered nearest-first.
+    /// Returns `(image_id, distance, sentence)` for present images, one row per
+    /// image (best/lowest distance across its sentences), ordered nearest-first.
+    /// `sentence` is the embedded text from the winning row.  SQLite's min/max
+    /// bare-column extension guarantees that the bare columns (`se.text`) come
+    /// from the same row as `MIN(knn.distance)`.
     /// `query_embedding` must have the active encoder's dimension.
     pub fn semantic_search(
         &self,
         query_embedding: &[f32],
         k: usize,
-    ) -> anyhow::Result<Vec<(i64, f32)>> {
+    ) -> anyhow::Result<Vec<(i64, f32, String)>> {
         let blob = embedding_to_blob(query_embedding);
         // `k` is a trusted internal value (no injection risk) and sqlite-vec
         // wants it as a literal constraint.
@@ -166,7 +169,7 @@ impl Database {
                  FROM vec_sentences
                  WHERE embedding MATCH ?1 AND k = {k}
              )
-             SELECT se.image_id, MIN(knn.distance) AS dist
+             SELECT se.image_id, MIN(knn.distance) AS dist, se.text
              FROM knn
              JOIN sentence_embeddings se ON se.id = knn.rowid
              JOIN images i ON i.id = se.image_id AND i.status = 'present'
@@ -176,7 +179,11 @@ impl Database {
         let mut stmt = self.conn.prepare(&sql)?;
         let rows = stmt
             .query_map(params![blob], |row| {
-                Ok((row.get::<_, i64>(0)?, row.get::<_, f64>(1)? as f32))
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, f64>(1)? as f32,
+                    row.get::<_, String>(2)?,
+                ))
             })?
             .filter_map(|r| r.ok())
             .collect();
@@ -227,12 +234,16 @@ impl Database {
         Ok(ids.iter().filter_map(|id| by_id.remove(id)).collect())
     }
 
-    /// Hybrid search ordered by semantic similarity.
+    /// Hybrid search: direct keyword hits first, then semantic-only hits.
     ///
-    /// Images are ranked by their best (smallest) sentence-vector distance to
-    /// the query — nearest first.  Keyword matches that did not surface in the
-    /// vector KNN are appended afterwards, in keyword order, so exact-text hits
-    /// are never dropped.
+    /// Images matched by keywords are ranked ahead of images found only via
+    /// vector similarity.  Within each group the keyword group keeps its
+    /// recency order; the semantic group keeps its similarity order.
+    /// Images that appear in both groups are treated as direct hits and are
+    /// not repeated in the semantic group.
+    ///
+    /// Keyword images are reused directly from `search_images_text` so their
+    /// pre-computed `search_hit` (including description snippet) is preserved.
     pub(crate) fn search_images_hybrid(
         &self,
         text: &str,
@@ -244,42 +255,70 @@ impl Database {
     ) -> anyhow::Result<Vec<LibraryImage>> {
         let limit = limit.unwrap_or(500);
         let offset = offset.unwrap_or(0);
-        // Pull a keyword candidate pool large enough to page through.
         let pool = (limit + offset).max(200);
 
-        // Semantic hits, already sorted nearest-first by distance.
-        let semantic = self.semantic_search(query_embedding, k)?;
-        // Keyword hits (any token match), unioned in so exact matches appear.
+        // Keyword hits already carry SearchHit::Direct (with snippet) from
+        // search_images_text.
         let keyword = self.search_images_text(text, Some(pool), Some(0), collection_id)?;
+        // Semantic hits: (image_id, cosine_distance, best_sentence).
+        let semantic = self.semantic_search(query_embedding, k)?;
 
-        // Cosine similarity per image (vec0 cosine distance = 1 − similarity).
-        let similarity: std::collections::HashMap<i64, f32> = semantic
-            .iter()
-            .map(|(id, dist)| (*id, 1.0 - dist))
-            .collect();
-
-        // Similarity order first, then keyword-only matches.
-        let mut ordered: Vec<i64> = Vec::with_capacity(semantic.len() + keyword.len());
+        // Build ordered ID list: keyword first, then semantic-only.
+        let mut ordered: Vec<i64> = Vec::with_capacity(keyword.len() + semantic.len());
         let mut seen: std::collections::HashSet<i64> = std::collections::HashSet::new();
-        for (id, _dist) in &semantic {
-            if seen.insert(*id) {
-                ordered.push(*id);
-            }
-        }
         for img in &keyword {
             if seen.insert(img.id) {
                 ordered.push(img.id);
             }
         }
+        for (id, _dist, _sent) in &semantic {
+            if seen.insert(*id) {
+                ordered.push(*id);
+            }
+        }
 
         let page: Vec<i64> = ordered.into_iter().skip(offset).take(limit).collect();
-        // Materialise in similarity order (also applies present-status and the
-        // optional collection filter), then attach each image's score.
-        let mut images = self.images_by_ids_ordered(&page, collection_id)?;
-        for img in &mut images {
-            img.similarity = similarity.get(&img.id).copied();
+
+        // Keep keyword images as-is (their search_hit is already set).
+        let keyword_map: std::collections::HashMap<i64, LibraryImage> =
+            keyword.into_iter().map(|img| (img.id, img)).collect();
+
+        // For semantic-only images on the page, fetch and tag them separately.
+        let semantic_only_page: Vec<i64> = page
+            .iter()
+            .filter(|id| !keyword_map.contains_key(*id))
+            .copied()
+            .collect();
+
+        let semantic_info: std::collections::HashMap<i64, (f32, String)> = semantic
+            .into_iter()
+            .map(|(id, dist, sent)| (id, (1.0 - dist, sent)))
+            .collect();
+
+        let mut semantic_only_images =
+            self.images_by_ids_ordered(&semantic_only_page, collection_id)?;
+        for img in &mut semantic_only_images {
+            if let Some((sim, sent)) = semantic_info.get(&img.id) {
+                img.search_hit = Some(crate::SearchHit::Semantic {
+                    similarity: *sim,
+                    sentence: sent.clone(),
+                });
+            }
         }
-        Ok(images)
+        let semantic_only_map: std::collections::HashMap<i64, LibraryImage> =
+            semantic_only_images.into_iter().map(|img| (img.id, img)).collect();
+
+        // Assemble the final page in order.
+        let result = page
+            .iter()
+            .filter_map(|id| {
+                keyword_map
+                    .get(id)
+                    .or_else(|| semantic_only_map.get(id))
+                    .cloned()
+            })
+            .collect();
+        Ok(result)
     }
 }
 
@@ -333,7 +372,7 @@ mod tests {
 
         // A query aligned with image A's vector ranks A first.
         let hits = db.semantic_search(&[1.0, 0.0, 0.0, 0.0], 10).unwrap();
-        assert_eq!(hits.first().map(|(id, _)| *id), Some(img_a));
+        assert_eq!(hits.first().map(|(id, _, _)| *id), Some(img_a));
 
         // Both descriptions are now processed → none pending.
         assert!(db.descriptions_needing_embedding(model).unwrap().is_empty());
@@ -393,7 +432,7 @@ mod tests {
     }
 
     #[test]
-    fn hybrid_orders_by_similarity() {
+    fn hybrid_direct_hits_before_semantic() {
         let model = "test-model";
         let (db, _dir, pairs) = db_with_descriptions(model);
         db.ensure_vec_table(model, 4).unwrap();
@@ -404,12 +443,18 @@ mod tests {
         db.insert_sentence_embeddings(img_b, desc_b, model, &[("s".into(), vec![0.0, 1.0, 0.0, 0.0])])
             .unwrap();
 
-        // Both descriptions contain "apple", so both are keyword matches; the
-        // query vector is nearer image A, so A must rank first.
+        // Both descriptions contain "apple" so both are keyword (direct) hits.
+        // Direct hits appear before semantic-only hits; both images surface here.
         let results = db
             .search_images_hybrid("apple", &[0.9, 0.1, 0.0, 0.0], 10, None, None, None)
             .unwrap();
-        let ids: Vec<i64> = results.iter().map(|i| i.id).collect();
+        let mut ids: Vec<i64> = results.iter().map(|i| i.id).collect();
+        ids.sort();
         assert_eq!(ids, vec![img_a, img_b]);
+
+        // Verify all results are tagged as Direct hits (not Semantic).
+        for r in &results {
+            assert!(matches!(r.search_hit, Some(crate::SearchHit::Direct { .. })));
+        }
     }
 }

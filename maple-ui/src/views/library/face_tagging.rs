@@ -38,7 +38,7 @@ use maple_db::FaceDetection;
 
 use super::face_shared::{
     assign_face_to_name, assign_face_to_person, face_screen_rect, is_real_detection,
-    next_untagged_index, unassign_face, EmbeddingMatrix,
+    next_skipped_index, next_untagged_index, unassign_face, EmbeddingMatrix,
 };
 use tracing::{debug, info};
 use super::image_loader::load_image_async;
@@ -52,7 +52,11 @@ enum TagAction {
     /// Created a new person and assigned.
     NewPerson { person_id: i64, name: String },
     /// Skipped without assigning.
-    Skipped,
+    ///
+    /// `was_already_skipped` is `true` when the face was already marked skipped
+    /// in the DB before this session (i.e. in "Review Skipped" mode).  Back
+    /// should not un-skip it in that case.
+    Skipped { was_already_skipped: bool },
 }
 
 #[derive(Clone)]
@@ -71,8 +75,12 @@ struct HistoryEntry {
 struct TaggingState {
     db: Arc<Mutex<maple_db::Database>>,
     tagging_top_k: usize,
+    /// When true, iterate over skipped faces instead of normal untagged ones.
+    review_skipped: bool,
+    /// Navigation view — needed so the done screen can push a Review Skipped page.
+    nav_view: adw::NavigationView,
 
-    /// IDs of all images that had at least one untagged face when the view opened.
+    /// IDs of all images that had at least one qualifying face when the view opened.
     image_ids: Rc<RefCell<Vec<i64>>>,
     /// Current position within `image_ids`.
     image_idx: Rc<Cell<usize>>,
@@ -98,6 +106,8 @@ struct TaggingState {
     skip_btn: gtk4::Button,
     back_btn: gtk4::Button,
     done_box: gtk4::Box,
+    done_skipped_lbl: gtk4::Label,
+    done_review_btn: gtk4::Button,
     panel: gtk4::Box,
 }
 
@@ -105,10 +115,14 @@ struct TaggingState {
 
 /// Build and return the face-tagging navigation page.
 ///
-/// Push this onto the `adw::NavigationView` when the user clicks "Tag Faces".
+/// Push this onto the `adw::NavigationView` when the user clicks "Tag Faces"
+/// or "Review Skipped Faces".  When `review_skipped` is `true`, the wizard
+/// iterates only over faces that were previously skipped.
 pub fn build_face_tagging_page(
     db: Arc<Mutex<maple_db::Database>>,
     tagging_top_k: usize,
+    nav_view: adw::NavigationView,
+    review_skipped: bool,
 ) -> adw::NavigationPage {
     // ── Image display ─────────────────────────────────────────────
     let picture = gtk4::Picture::builder()
@@ -159,8 +173,12 @@ pub fn build_face_tagging_page(
     let assign_btn = gtk4::Button::with_label("Assign New");
     assign_btn.add_css_class("suggested-action");
 
-    let skip_btn = gtk4::Button::with_label("Skip");
-    skip_btn.set_tooltip_text(Some("Skip this face — it won't be tagged"));
+    let skip_btn = gtk4::Button::with_label(if review_skipped { "Keep Skipped" } else { "Skip" });
+    skip_btn.set_tooltip_text(Some(if review_skipped {
+        "Leave this face skipped and move on"
+    } else {
+        "Skip this face — it will be remembered and hidden from the default queue"
+    }));
 
     let back_btn = gtk4::Button::with_label("← Back");
     back_btn.add_css_class("flat");
@@ -199,13 +217,32 @@ pub fn build_face_tagging_page(
         .build();
     let done_icon = gtk4::Image::from_icon_name("emblem-ok-symbolic");
     done_icon.set_pixel_size(48);
-    let done_lbl = gtk4::Label::new(Some("All faces tagged!"));
+    let done_lbl = gtk4::Label::new(Some(if review_skipped {
+        "All skipped faces reviewed!"
+    } else {
+        "All faces tagged!"
+    }));
     done_lbl.add_css_class("title-2");
-    let done_sub = gtk4::Label::new(Some("No untagged faces remain in the library."));
+    let done_sub = gtk4::Label::new(Some(if review_skipped {
+        "No skipped faces remain."
+    } else {
+        "No untagged faces remain in the library."
+    }));
     done_sub.add_css_class("dim-label");
+
+    // Shown only in normal mode when there are skipped faces.
+    let done_skipped_lbl = gtk4::Label::new(None);
+    done_skipped_lbl.add_css_class("dim-label");
+    done_skipped_lbl.set_visible(false);
+
+    let done_review_btn = gtk4::Button::with_label("Review Skipped Faces");
+    done_review_btn.set_visible(false);
+
     done_box.append(&done_icon);
     done_box.append(&done_lbl);
     done_box.append(&done_sub);
+    done_box.append(&done_skipped_lbl);
+    done_box.append(&done_review_btn);
     done_box.set_visible(false);
 
     // ── Main body ─────────────────────────────────────────────────
@@ -228,7 +265,7 @@ pub fn build_face_tagging_page(
     toolbar.set_content(Some(&body));
 
     let page = adw::NavigationPage::builder()
-        .title("Tag Faces")
+        .title(if review_skipped { "Review Skipped Faces" } else { "Tag Faces" })
         .child(&toolbar)
         .build();
 
@@ -236,6 +273,8 @@ pub fn build_face_tagging_page(
     let state = TaggingState {
         db,
         tagging_top_k,
+        review_skipped,
+        nav_view,
         image_ids: Rc::new(RefCell::new(vec![])),
         image_idx: Rc::new(Cell::new(0)),
         current_faces: Rc::new(RefCell::new(vec![])),
@@ -252,6 +291,8 @@ pub fn build_face_tagging_page(
         skip_btn,
         back_btn,
         done_box,
+        done_skipped_lbl,
+        done_review_btn,
         panel,
     };
 
@@ -278,15 +319,25 @@ pub fn build_face_tagging_page(
 
 // ── Data loading ─────────────────────────────────────────────────
 
-/// Query all images with untagged faces and navigate to the first one.
+/// Query all images with qualifying faces and navigate to the first one.
 fn load_queue(state: &TaggingState) {
     let ids = state
         .db
         .lock()
-        .map(|g| g.images_with_untagged_faces().unwrap_or_default())
+        .map(|g| {
+            if state.review_skipped {
+                g.images_with_skipped_faces().unwrap_or_default()
+            } else {
+                g.images_with_untagged_faces().unwrap_or_default()
+            }
+        })
         .unwrap_or_default();
 
-    info!("face tagging: loaded {} images with untagged faces", ids.len());
+    info!(
+        "face tagging: loaded {} images with {} faces",
+        ids.len(),
+        if state.review_skipped { "skipped" } else { "untagged" },
+    );
 
     *state.image_ids.borrow_mut() = ids;
     state.image_idx.set(0);
@@ -319,7 +370,12 @@ fn navigate_to_image(state: &TaggingState, img_idx: usize, start_face_idx: usize
             .unwrap_or_default();
 
         let face_start = if idx == img_idx { start_face_idx } else { 0 };
-        if let Some(face_idx) = next_untagged_index(&faces, face_start) {
+        let next_fn: fn(&[FaceDetection], usize) -> Option<usize> = if state.review_skipped {
+            next_skipped_index
+        } else {
+            next_untagged_index
+        };
+        if let Some(face_idx) = next_fn(&faces, face_start) {
             let real_count = faces.iter().filter(|f| is_real_detection(f)).count();
             info!(
                 "face tagging: navigating to image {} (id={}), face {}/{} ({}  total faces)",
@@ -361,10 +417,38 @@ fn load_image_for_idx(state: &TaggingState, image_id: i64) {
 }
 
 fn show_done(state: &TaggingState) {
-    info!("face tagging: all faces tagged — showing done screen");
+    info!("face tagging: all qualifying faces processed — showing done screen");
     state.panel.set_visible(false);
     state.done_box.set_visible(true);
     state.drawing_area.queue_draw();
+
+    // In normal mode, check whether there are skipped faces the user might want to review.
+    if !state.review_skipped {
+        let skipped_count = state
+            .db
+            .lock()
+            .map(|g| g.count_skipped_faces().unwrap_or(0))
+            .unwrap_or(0);
+
+        if skipped_count > 0 {
+            state.done_skipped_lbl.set_label(&format!(
+                "{skipped_count} face{} previously skipped.",
+                if skipped_count == 1 { " was" } else { "s were" },
+            ));
+            state.done_skipped_lbl.set_visible(true);
+            state.done_review_btn.set_visible(true);
+
+            // Wire the review button (once — guard against re-entry).
+            let db = state.db.clone();
+            let top_k = state.tagging_top_k;
+            let nav_view = state.nav_view.clone();
+            let btn = state.done_review_btn.clone();
+            btn.connect_clicked(move |_| {
+                let page = build_face_tagging_page(db.clone(), top_k, nav_view.clone(), true);
+                nav_view.push(&page);
+            });
+        }
+    }
 }
 
 // ── Panel rebuild ─────────────────────────────────────────────────
@@ -417,7 +501,7 @@ fn rebuild_panel(state: &TaggingState, previous_action: Option<&TagAction>) {
         TagAction::Person { person_id } | TagAction::NewPerson { person_id, .. } => {
             Some(*person_id)
         }
-        TagAction::Skipped => None,
+        TagAction::Skipped { .. } => None,
     });
     let prev_new_name = previous_action.and_then(|a| match a {
         TagAction::NewPerson { name, .. } => Some(name.as_str()),
@@ -594,36 +678,58 @@ fn on_assign_new(state: &TaggingState) {
     advance(state);
 }
 
-/// User clicked "Skip".
+/// User clicked "Skip" (normal mode) or "Keep Skipped" (review mode).
 fn on_skip(state: &TaggingState) {
     let face_idx = state.face_idx.get();
-    let face_id = {
+    let (face_id, already_skipped) = {
         let faces = state.current_faces.borrow();
-        faces.get(face_idx).map(|f| f.id)
+        let f = faces.get(face_idx);
+        (f.map(|f| f.id), f.map(|f| f.skipped).unwrap_or(false))
     };
     let Some(face_id) = face_id else { return };
 
-    info!("face tagging: skipping face_id={} (idx={})", face_id, face_idx);
+    info!(
+        "face tagging: {} face_id={} (idx={})",
+        if state.review_skipped { "keeping skipped" } else { "skipping" },
+        face_id,
+        face_idx,
+    );
+
+    // In normal mode, mark the face as skipped in the DB and update memory.
+    if !state.review_skipped {
+        if let Ok(g) = state.db.lock() {
+            let _ = g.mark_face_skipped(face_id, true);
+        }
+        if let Some(face) = state.current_faces.borrow_mut().get_mut(face_idx) {
+            face.skipped = true;
+        }
+    }
 
     state.history.borrow_mut().push(HistoryEntry {
         image_idx: state.image_idx.get(),
         face_id,
         face_idx,
-        action: TagAction::Skipped,
+        action: TagAction::Skipped { was_already_skipped: already_skipped },
     });
 
     advance(state);
 }
 
-/// Move to the next untagged face.
+/// Move to the next qualifying face (untagged in normal mode, skipped in review mode).
 fn advance(state: &TaggingState) {
     let current_face_idx = state.face_idx.get();
     let current_img_idx = state.image_idx.get();
 
-    // Look for the next untagged face within the current image (after current).
+    let next_fn: fn(&[FaceDetection], usize) -> Option<usize> = if state.review_skipped {
+        next_skipped_index
+    } else {
+        next_untagged_index
+    };
+
+    // Look for the next qualifying face within the current image (after current).
     let next_in_image = {
         let faces = state.current_faces.borrow();
-        next_untagged_index(&faces, current_face_idx + 1)
+        next_fn(&faces, current_face_idx + 1)
     };
 
     if let Some(next_fi) = next_in_image {
@@ -674,11 +780,25 @@ fn on_back(state: &TaggingState) {
                 }
             }
         }
-        TagAction::Skipped => {
-            // Nothing to undo in DB; but if it's a different image, reload.
+        TagAction::Skipped { was_already_skipped } => {
             let image_id = state.image_ids.borrow().get(image_idx).copied();
             if let Some(image_id) = image_id {
-                if state.image_idx.get() != image_idx {
+                let same_image = state.image_idx.get() == image_idx;
+
+                if !was_already_skipped {
+                    // The skip was applied this session — un-skip in the DB.
+                    if let Ok(g) = state.db.lock() {
+                        let _ = g.mark_face_skipped(face_id, false);
+                    }
+                }
+
+                if same_image {
+                    // Same image: update the in-memory face's skipped flag.
+                    if let Some(face) = state.current_faces.borrow_mut().get_mut(face_idx) {
+                        face.skipped = *was_already_skipped;
+                    }
+                } else {
+                    // Different image: reload faces from DB (reflects the un-skip).
                     let faces = state
                         .db
                         .lock()

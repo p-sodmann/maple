@@ -29,7 +29,7 @@ use gtk4::gdk_pixbuf;
 use gtk4::glib;
 use gtk4::prelude::*;
 
-use maple_db::{LibraryImage, SearchQuery, ThumbnailCache};
+use maple_db::{LibraryImage, SearchHit, SearchQuery, ThumbnailCache};
 
 use crate::thumbnail;
 
@@ -214,7 +214,7 @@ impl LibraryGrid {
                         for rec in &records {
                             let child = gtk4::FlowBoxChild::new();
                             let name = rec.meta.filename.as_deref().unwrap_or("…");
-                            child.set_child(Some(&build_placeholder(name, rec.similarity, px)));
+                            child.set_child(Some(&build_placeholder(name, rec.search_hit.as_ref(), px)));
                             flow_box.append(&child);
                         }
                     }
@@ -238,7 +238,7 @@ impl LibraryGrid {
                                 child.set_child(Some(&build_cell(
                                     &texture,
                                     name,
-                                    rec.similarity,
+                                    rec.search_hit.as_ref(),
                                     px,
                                 )));
                             }
@@ -290,7 +290,7 @@ fn load_thumbnail(
 
 // ── Cell widgets ─────────────────────────────────────────────────
 
-fn build_placeholder(name: &str, similarity: Option<f32>, px: u32) -> gtk4::Box {
+fn build_placeholder(name: &str, search_hit: Option<&SearchHit>, px: u32) -> gtk4::Box {
     let spinner = gtk4::Spinner::builder()
         .spinning(true)
         .width_request(32)
@@ -311,23 +311,23 @@ fn build_placeholder(name: &str, similarity: Option<f32>, px: u32) -> gtk4::Box 
         .build();
     frame.append(&spinner);
 
-    labeled_cell(&frame, name, similarity)
+    labeled_cell(&frame, name, search_hit)
 }
 
-fn build_cell(texture: &gdk::Texture, name: &str, similarity: Option<f32>, px: u32) -> gtk4::Box {
+fn build_cell(texture: &gdk::Texture, name: &str, search_hit: Option<&SearchHit>, px: u32) -> gtk4::Box {
     let picture = gtk4::Picture::for_paintable(texture);
     picture.set_size_request(px as i32, px as i32);
     picture.set_content_fit(gtk4::ContentFit::Cover);
     picture.set_overflow(gtk4::Overflow::Hidden);
     picture.add_css_class("maple-thumb");
 
-    labeled_cell(&picture, name, similarity)
+    labeled_cell(&picture, name, search_hit)
 }
 
 fn labeled_cell(
     content: &impl IsA<gtk4::Widget>,
     name: &str,
-    similarity: Option<f32>,
+    search_hit: Option<&SearchHit>,
 ) -> gtk4::Box {
     let label = gtk4::Label::new(Some(name));
     label.set_ellipsize(gtk4::pango::EllipsizeMode::Middle);
@@ -343,12 +343,27 @@ fn labeled_cell(
     cell.append(content);
     cell.append(&label);
 
-    if let Some(sim) = similarity {
-        let pct = (sim * 100.0).clamp(0.0, 100.0);
-        let score = gtk4::Label::new(Some(&format!("{pct:.0}% match")));
-        score.add_css_class("caption");
-        score.add_css_class("maple-score");
-        cell.append(&score);
+    match search_hit {
+        Some(SearchHit::Direct { field, snippet }) => {
+            let score = gtk4::Label::new(Some("direct"));
+            let tooltip = match snippet {
+                Some(s) => format!("Matched {field}: {s}"),
+                None => format!("Matched: {field}"),
+            };
+            score.set_tooltip_text(Some(&tooltip));
+            score.add_css_class("caption");
+            score.add_css_class("maple-score");
+            cell.append(&score);
+        }
+        Some(SearchHit::Semantic { similarity, sentence }) => {
+            let pct = (similarity * 100.0).clamp(0.0, 100.0);
+            let score = gtk4::Label::new(Some(&format!("{pct:.0}% match")));
+            score.set_tooltip_text(Some(sentence.as_str()));
+            score.add_css_class("caption");
+            score.add_css_class("maple-score");
+            cell.append(&score);
+        }
+        None => {}
     }
 
     cell

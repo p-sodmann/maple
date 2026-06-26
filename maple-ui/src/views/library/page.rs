@@ -198,10 +198,13 @@ pub fn build_library_page(
             let page = build_face_tagging_page(
                 db.clone(),
                 settings.face.tagging_top_k,
+                nav_view.clone(),
+                false,
             );
             nav_view.push(&page);
         }
     });
+
 
     // ── Settings button ───────────────────────────────────────────
     let settings_btn = gtk4::Button::builder()
