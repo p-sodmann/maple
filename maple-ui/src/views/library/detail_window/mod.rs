@@ -177,7 +177,6 @@ fn build_window(
         zoom.clone(),
         img_dims.clone(),
         db.clone(),
-        settings.face.tagging_top_k,
     );
 
     // Load detections for the first image immediately.
@@ -219,6 +218,13 @@ fn build_window(
         .icon_name("system-users-symbolic")
         .tooltip_text("Show detected faces / assign persons")
         .css_classes(["flat"])
+        .build();
+
+    let add_face_btn = gtk4::ToggleButton::builder()
+        .icon_name("list-add-symbolic")
+        .tooltip_text("Draw a bounding box to tag a new face")
+        .css_classes(["flat"])
+        .sensitive(false)
         .build();
 
     let collections_btn = gtk4::Button::builder()
@@ -269,8 +275,22 @@ fn build_window(
 
     persons_btn.connect_toggled({
         let face_overlay = face_overlay.clone();
+        let add_face_btn = add_face_btn.clone();
         move |btn| {
-            face_overlay.set_visible(btn.is_active());
+            let active = btn.is_active();
+            face_overlay.set_visible(active);
+            add_face_btn.set_sensitive(active);
+            if !active {
+                add_face_btn.set_active(false);
+                face_overlay.set_draw_mode(false);
+            }
+        }
+    });
+
+    add_face_btn.connect_toggled({
+        let face_overlay = face_overlay.clone();
+        move |btn| {
+            face_overlay.set_draw_mode(btn.is_active());
         }
     });
 
@@ -294,6 +314,7 @@ fn build_window(
     header.pack_end(&info_btn);
     header.pack_end(&fullscreen_btn);
     header.pack_start(&persons_btn);
+    header.pack_start(&add_face_btn);
     header.pack_start(&collections_btn);
     header.pack_start(&rotate_ccw_btn);
     header.pack_start(&rotate_cw_btn);

@@ -181,6 +181,24 @@ impl Database {
         Ok(())
     }
 
+    /// Update the bounding box of an existing face detection.
+    pub fn update_face_bbox(&self, face_id: i64, bbox: [f32; 4]) -> anyhow::Result<()> {
+        self.conn.execute(
+            "UPDATE face_detections
+             SET bbox_x1 = ?1, bbox_y1 = ?2, bbox_x2 = ?3, bbox_y2 = ?4
+             WHERE id = ?5",
+            params![bbox[0], bbox[1], bbox[2], bbox[3], face_id],
+        )?;
+        Ok(())
+    }
+
+    /// Delete a face detection and its person assignment.
+    pub fn delete_face_detection(&self, face_id: i64) -> anyhow::Result<()> {
+        self.conn
+            .execute("DELETE FROM face_detections WHERE id = ?1", params![face_id])?;
+        Ok(())
+    }
+
     /// Insert or retrieve a person by name.  Returns the person's `id`.
     pub fn upsert_person(&self, name: &str) -> anyhow::Result<i64> {
         let now = SystemTime::now()
