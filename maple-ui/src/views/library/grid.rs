@@ -214,7 +214,12 @@ impl LibraryGrid {
                         for rec in &records {
                             let child = gtk4::FlowBoxChild::new();
                             let name = rec.meta.filename.as_deref().unwrap_or("…");
-                            child.set_child(Some(&build_placeholder(name, rec.search_hit.as_ref(), px)));
+                            child.set_child(Some(&build_placeholder(
+                                name,
+                                rec.search_hit.as_ref(),
+                                rec.stack_size,
+                                px,
+                            )));
                             flow_box.append(&child);
                         }
                     }
@@ -239,6 +244,7 @@ impl LibraryGrid {
                                     &texture,
                                     name,
                                     rec.search_hit.as_ref(),
+                                    rec.stack_size,
                                     px,
                                 )));
                             }
@@ -290,7 +296,12 @@ fn load_thumbnail(
 
 // ── Cell widgets ─────────────────────────────────────────────────
 
-fn build_placeholder(name: &str, search_hit: Option<&SearchHit>, px: u32) -> gtk4::Box {
+fn build_placeholder(
+    name: &str,
+    search_hit: Option<&SearchHit>,
+    stack_size: Option<usize>,
+    px: u32,
+) -> gtk4::Box {
     let spinner = gtk4::Spinner::builder()
         .spinning(true)
         .width_request(32)
@@ -311,24 +322,49 @@ fn build_placeholder(name: &str, search_hit: Option<&SearchHit>, px: u32) -> gtk
         .build();
     frame.append(&spinner);
 
-    labeled_cell(&frame, name, search_hit)
+    labeled_cell(&frame, name, search_hit, stack_size)
 }
 
-fn build_cell(texture: &gdk::Texture, name: &str, search_hit: Option<&SearchHit>, px: u32) -> gtk4::Box {
+fn build_cell(
+    texture: &gdk::Texture,
+    name: &str,
+    search_hit: Option<&SearchHit>,
+    stack_size: Option<usize>,
+    px: u32,
+) -> gtk4::Box {
     let picture = gtk4::Picture::for_paintable(texture);
     picture.set_size_request(px as i32, px as i32);
     picture.set_content_fit(gtk4::ContentFit::Cover);
     picture.set_overflow(gtk4::Overflow::Hidden);
     picture.add_css_class("maple-thumb");
 
-    labeled_cell(&picture, name, search_hit)
+    labeled_cell(&picture, name, search_hit, stack_size)
 }
 
 fn labeled_cell(
     content: &impl IsA<gtk4::Widget>,
     name: &str,
     search_hit: Option<&SearchHit>,
+    stack_size: Option<usize>,
 ) -> gtk4::Box {
+    // Wrap the thumbnail in an Overlay so the stack badge can sit on top.
+    let overlay = gtk4::Overlay::new();
+    overlay.set_child(Some(content));
+
+    if let Some(size) = stack_size.filter(|&n| n >= 2) {
+        let badge_label = gtk4::Label::new(Some(&format!("⊞  {size}")));
+        badge_label.add_css_class("maple-stack-count");
+
+        let badge = gtk4::Box::builder()
+            .orientation(gtk4::Orientation::Horizontal)
+            .halign(gtk4::Align::Start)
+            .valign(gtk4::Align::End)
+            .css_classes(["maple-stack-badge"])
+            .build();
+        badge.append(&badge_label);
+        overlay.add_overlay(&badge);
+    }
+
     let label = gtk4::Label::new(Some(name));
     label.set_ellipsize(gtk4::pango::EllipsizeMode::Middle);
     label.set_max_width_chars(20);
@@ -340,7 +376,7 @@ fn labeled_cell(
         .spacing(4)
         .css_classes(["maple-card"])
         .build();
-    cell.append(content);
+    cell.append(&overlay);
     cell.append(&label);
 
     match search_hit {

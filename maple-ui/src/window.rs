@@ -45,7 +45,7 @@ pub fn build_window(app: &adw::Application) -> adw::ApplicationWindow {
 
     // Start the background hasher if stack detection is enabled.
     if settings.stacks.enabled {
-        maple_db::spawn_hasher(db.clone(), settings.stacks.clone());
+        maple_db::spawn_hasher(db.clone(), settings.stacks.clone(), Some(cache.clone()));
     }
 
     let toast_overlay = adw::ToastOverlay::new();

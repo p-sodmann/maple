@@ -289,6 +289,15 @@ const V10: &str = "
         ON image_hashes(algorithm);
 ";
 
+// ── V11: stack cover ─────────────────────────────────────────────
+//
+// Adds a `cover_image_id` column to `stacks` so the user can pick which
+// image in a stack is displayed as the grid thumbnail.  NULL means "use the
+// image with the lowest id" (the default first-imported shot).
+
+const V11: &str =
+    "ALTER TABLE stacks ADD COLUMN cover_image_id INTEGER REFERENCES images(id) ON DELETE SET NULL";
+
 // ── Migration runner ─────────────────────────────────────────────
 
 /// Apply all pending schema migrations to `conn`.
@@ -377,6 +386,15 @@ pub fn ensure_schema(conn: &Connection) -> anyhow::Result<()> {
     if version < 10 {
         conn.execute_batch(V10)?;
         conn.execute_batch("PRAGMA user_version = 10")?;
+    }
+
+    if version < 11 {
+        if let Err(e) = conn.execute_batch(V11) {
+            if !e.to_string().to_lowercase().contains("duplicate column") {
+                return Err(e.into());
+            }
+        }
+        conn.execute_batch("PRAGMA user_version = 11")?;
     }
 
     Ok(())

@@ -7,20 +7,27 @@
 //! main thread over an `mpsc` channel so no GObject types cross thread
 //! boundaries.
 //!
-//! Callers supply an `on_loaded` closure that receives `(img_w, img_h)` —
-//! the *post-rotation* pixel dimensions of the decoded image — giving each
-//! caller a chance to resize windows, reset zoom, queue redraws, etc.
+//! Callers supply:
+//!   • `on_loaded` — called with `(img_w, img_h)` on success.
+//!   • `on_error`  — called when decoding fails *or* the 30-second timeout
+//!                   fires (hung thread / unavailable mount).
+//!
+//! The channel always receives exactly one message (or Disconnected if the
+//! thread panics), so the glib poller always terminates.
 
 use std::cell::Cell;
 use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::mpsc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use gtk4::gdk;
 use gtk4::gdk_pixbuf;
 use gtk4::glib;
 use maple_import::{is_raw_format, loadable_image_bytes};
+
+/// How long to wait for the decode thread before giving up.
+const LOAD_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Raw pixel data that can safely be moved across threads.
 struct PixelBuffer {
@@ -34,50 +41,50 @@ struct PixelBuffer {
 /// Load `path` asynchronously, apply EXIF orientation, display the result in
 /// `picture`, and set `img_dims` to the post-rotation pixel size.
 ///
-/// `on_loaded` is called on the main thread once the texture is displayed.
-/// It receives the decoded `(width, height)` in pixels.
+/// `on_loaded` is called on the main thread on success with `(width, height)`.
+/// `on_error` is called when decoding fails or the 30-second timeout fires.
 pub fn load_image_async(
     path: PathBuf,
     picture: &gtk4::Picture,
     img_dims: &Rc<Cell<(i32, i32)>>,
     on_loaded: impl Fn(i32, i32) + 'static,
+    on_error: impl Fn() + 'static,
 ) {
-    let (tx, rx) = mpsc::channel::<PixelBuffer>();
+    let (tx, rx) = mpsc::channel::<Option<PixelBuffer>>();
 
     std::thread::spawn(move || {
-        let pixbuf = if is_raw_format(&path) {
-            let Ok(bytes) = loadable_image_bytes(&path) else { return };
-            let stream = gtk4::gio::MemoryInputStream::from_bytes(&glib::Bytes::from(&bytes));
-            let Ok(pb) = gdk_pixbuf::Pixbuf::from_stream(&stream, gtk4::gio::Cancellable::NONE)
-            else {
-                return;
+        let result = (|| {
+            let pixbuf = if is_raw_format(&path) {
+                let bytes = loadable_image_bytes(&path).ok()?;
+                let stream =
+                    gtk4::gio::MemoryInputStream::from_bytes(&glib::Bytes::from(&bytes));
+                gdk_pixbuf::Pixbuf::from_stream(&stream, gtk4::gio::Cancellable::NONE).ok()?
+            } else {
+                gdk_pixbuf::Pixbuf::from_file(&path).ok()?
             };
-            pb
-        } else {
-            let Ok(pb) = gdk_pixbuf::Pixbuf::from_file(&path) else { return };
-            pb
-        };
-        // apply_embedded_orientation() rotates/flips according to the EXIF tag.
-        // It returns None when orientation is already 1 (top-left), so fall
-        // back to the original in that case.
-        let pixbuf = pixbuf.apply_embedded_orientation().unwrap_or(pixbuf);
-
-        let width = pixbuf.width();
-        let height = pixbuf.height();
-        let rowstride = pixbuf.rowstride();
-        let has_alpha = pixbuf.has_alpha();
-        let Some(bytes) = pixbuf.pixel_bytes() else { return };
-        let data = bytes.as_ref().to_vec();
-
-        let _ = tx.send(PixelBuffer { width, height, rowstride, has_alpha, data });
+            let pixbuf = pixbuf.apply_embedded_orientation().unwrap_or(pixbuf);
+            let width = pixbuf.width();
+            let height = pixbuf.height();
+            let rowstride = pixbuf.rowstride();
+            let has_alpha = pixbuf.has_alpha();
+            let bytes = pixbuf.pixel_bytes()?;
+            let data = bytes.as_ref().to_vec();
+            Some(PixelBuffer { width, height, rowstride, has_alpha, data })
+        })();
+        let _ = tx.send(result);
     });
 
     let picture = picture.clone();
     let img_dims = img_dims.clone();
+    let deadline = Instant::now() + LOAD_TIMEOUT;
 
     glib::timeout_add_local(Duration::from_millis(32), move || {
+        if Instant::now() > deadline {
+            on_error();
+            return glib::ControlFlow::Break;
+        }
         match rx.try_recv() {
-            Ok(buf) => {
+            Ok(Some(buf)) => {
                 let gb = glib::Bytes::from(&buf.data);
                 let pixbuf = gdk_pixbuf::Pixbuf::from_bytes(
                     &gb,
@@ -94,11 +101,11 @@ pub fn load_image_async(
                 on_loaded(buf.width, buf.height);
                 glib::ControlFlow::Break
             }
-            Err(mpsc::TryRecvError::Empty) => glib::ControlFlow::Continue,
-            Err(mpsc::TryRecvError::Disconnected) => {
-                on_loaded(0, 0);
+            Ok(None) | Err(mpsc::TryRecvError::Disconnected) => {
+                on_error();
                 glib::ControlFlow::Break
             }
+            Err(mpsc::TryRecvError::Empty) => glib::ControlFlow::Continue,
         }
     });
 }

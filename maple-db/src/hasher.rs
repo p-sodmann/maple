@@ -19,12 +19,12 @@
 use std::sync::{mpsc, Arc, Mutex};
 use std::time::Duration;
 
-use maple_import::{compute_phash, loadable_image_bytes};
+use maple_import::loadable_image_bytes;
 use maple_state::{StackMode, StackSettings};
 use tracing::{info, warn};
 
 use crate::worker::WorkerHandle;
-use crate::{lock_db, Database};
+use crate::{lock_db, Database, ThumbnailCache};
 
 /// How many images to hash per poll cycle before re-running the stacker.
 const BATCH_SIZE: usize = 20;
@@ -39,7 +39,11 @@ const WORK_SLEEP: Duration = Duration::from_millis(100);
 ///
 /// Returns a [`WorkerHandle`] whose [`stop`](WorkerHandle::stop) method
 /// requests a graceful shutdown.
-pub fn spawn_hasher(db: Arc<Mutex<Database>>, settings: StackSettings) -> WorkerHandle {
+pub fn spawn_hasher(
+    db: Arc<Mutex<Database>>,
+    settings: StackSettings,
+    cache: Option<Arc<ThumbnailCache>>,
+) -> WorkerHandle {
     let (stop_tx, stop_rx) = mpsc::sync_channel::<()>(1);
 
     std::thread::Builder::new()
@@ -73,6 +77,12 @@ pub fn spawn_hasher(db: Arc<Mutex<Database>>, settings: StackSettings) -> Worker
                 StackMode::Onnx => format!("onnx:{}", settings.model_repo),
             };
 
+            // `done` tracks images hashed in the current "run" (resets when
+            // we go idle and come back).  `total` is sampled once per run so
+            // the fraction is stable across batches.
+            let mut done: usize = 0;
+            let mut total: usize = 0;
+
             loop {
                 if stop_rx.try_recv().is_ok() {
                     info!("Background hasher stopped");
@@ -83,34 +93,66 @@ pub fn spawn_hasher(db: Arc<Mutex<Database>>, settings: StackSettings) -> Worker
                     let guard = lock_db(&db);
                     guard.images_without_hash(&algorithm, BATCH_SIZE).unwrap_or_default()
                 };
+                // `pending` is now Vec<(i64, PathBuf, Option<[u8;32]>)>
 
                 if pending.is_empty() {
+                    if done > 0 {
+                        info!("Hasher: finished — hashed {done} image(s)");
+                        done = 0;
+                        total = 0;
+                    }
                     std::thread::sleep(IDLE_SLEEP);
                     continue;
                 }
 
-                info!("Hasher: processing {} image(s)", pending.len());
+                // Sample the total once when we first detect work in this run.
+                if total == 0 {
+                    total = lock_db(&db)
+                        .count_images_without_hash(&algorithm)
+                        .unwrap_or(pending.len());
+                    info!(
+                        "Hasher: starting — {} image(s) to hash (algorithm: {algorithm})",
+                        total
+                    );
+                }
 
                 let mut newly_hashed: Vec<i64> = Vec::new();
 
-                for (image_id, path) in &pending {
+                for (image_id, path, content_hash) in &pending {
                     if stop_rx.try_recv().is_ok() {
                         break;
                     }
 
                     let result = match effective_mode {
-                        StackMode::PHash => hash_phash(*image_id, path, &settings, &db, &algorithm),
+                        StackMode::PHash => hash_phash(
+                            *image_id,
+                            path,
+                            content_hash.as_ref(),
+                            cache.as_deref(),
+                            &settings,
+                            &db,
+                            &algorithm,
+                        ),
                         StackMode::Onnx => {
                             if let Some(ref mut embedder) = onnx_embedder {
-                                hash_onnx(*image_id, path, embedder, &db, &algorithm)
+                                hash_onnx(*image_id, path, content_hash.as_ref(), cache.as_deref(), embedder, &db, &algorithm)
                             } else {
-                                hash_phash(*image_id, path, &settings, &db, &algorithm)
+                                hash_phash(*image_id, path, content_hash.as_ref(), cache.as_deref(), &settings, &db, &algorithm)
                             }
                         }
                     };
 
                     match result {
-                        Ok(()) => newly_hashed.push(*image_id),
+                        Ok(()) => {
+                            done += 1;
+                            newly_hashed.push(*image_id);
+                            info!(
+                                "Hasher: {done}/{total} — {}",
+                                path.file_name()
+                                    .and_then(|n| n.to_str())
+                                    .unwrap_or("?")
+                            );
+                        }
                         Err(e) => warn!("Hasher: failed to hash {}: {e}", path.display()),
                     }
                 }
@@ -133,14 +175,43 @@ pub fn spawn_hasher(db: Arc<Mutex<Database>>, settings: StackSettings) -> Worker
 
 // ── Per-algorithm hashing ─────────────────────────────────────────────────────
 
+/// Load an image for hashing.  Uses the thumbnail cache when available
+/// (already a small WebP — fast to decode), falls back to the full image.
+fn load_image_for_hash(
+    path: &std::path::Path,
+    content_hash: Option<&[u8; 32]>,
+    cache: Option<&ThumbnailCache>,
+) -> anyhow::Result<image::DynamicImage> {
+    if let (Some(hash), Some(cache)) = (content_hash, cache) {
+        if let Some(webp_bytes) = cache.get(hash) {
+            if let Ok(img) = image::load_from_memory(&webp_bytes) {
+                return Ok(img);
+            }
+        }
+    }
+    // Cache miss or no cache — decode full image.
+    let bytes = loadable_image_bytes(path)?;
+    Ok(image::load_from_memory(&bytes)?)
+}
+
 fn hash_phash(
     image_id: i64,
     path: &std::path::Path,
+    content_hash: Option<&[u8; 32]>,
+    cache: Option<&ThumbnailCache>,
     settings: &StackSettings,
     db: &Arc<Mutex<Database>>,
     algorithm: &str,
 ) -> anyhow::Result<()> {
-    let hash = compute_phash(path, settings.hash_size)?;
+    use image_hasher::{HashAlg, HasherConfig};
+
+    let img = load_image_for_hash(path, content_hash, cache)?;
+    let hasher = HasherConfig::new()
+        .hash_alg(HashAlg::Median)
+        .preproc_dct()
+        .hash_size(settings.hash_size, settings.hash_size)
+        .to_hasher();
+    let hash = hasher.hash_image(&img);
     let blob = hash.as_bytes().to_vec();
     lock_db(db).insert_image_hash(image_id, algorithm, &blob)?;
     Ok(())
@@ -149,18 +220,15 @@ fn hash_phash(
 fn hash_onnx(
     image_id: i64,
     path: &std::path::Path,
+    content_hash: Option<&[u8; 32]>,
+    cache: Option<&ThumbnailCache>,
     embedder: &mut crate::models::OnnxImageEmbedder,
     db: &Arc<Mutex<Database>>,
     algorithm: &str,
 ) -> anyhow::Result<()> {
-    let bytes = loadable_image_bytes(path)?;
-    let img = image::load_from_memory(&bytes)?;
+    let img = load_image_for_hash(path, content_hash, cache)?;
     let embedding = embedder.embed(&img)?;
-    // Serialise Vec<f32> as little-endian bytes (same layout as face embeddings).
-    let blob: Vec<u8> = embedding
-        .iter()
-        .flat_map(|f| f.to_le_bytes())
-        .collect();
+    let blob: Vec<u8> = embedding.iter().flat_map(|f| f.to_le_bytes()).collect();
     lock_db(db).insert_image_hash(image_id, algorithm, &blob)?;
     Ok(())
 }

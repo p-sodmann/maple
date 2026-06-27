@@ -413,7 +413,7 @@ fn load_image_for_idx(state: &TaggingState, image_id: i64) {
     let drawing_area = state.drawing_area.clone();
     load_image_async(path, &state.picture, &state.img_dims, move |_, _| {
         drawing_area.queue_draw();
-    });
+    }, || {});
 }
 
 fn show_done(state: &TaggingState) {

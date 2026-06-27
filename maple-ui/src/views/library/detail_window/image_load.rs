@@ -22,8 +22,9 @@ const CHROME_H: i32 = 82;
 /// Load `path` asynchronously, apply EXIF orientation, display it in
 /// `picture`, resize the window to fit, and reset zoom/pan.
 ///
-/// `on_done` is called on the main thread once loading finishes (whether
-/// successful or not), so callers can clear a loading guard.
+/// `on_done` is called on the main thread on success.
+/// `on_error` is called when decoding fails or the timeout fires — callers
+/// should clear any loading guard and surface a notification.
 pub(super) fn load_image(
     path: PathBuf,
     picture: &gtk4::Picture,
@@ -32,18 +33,25 @@ pub(super) fn load_image(
     img_dims: &Rc<Cell<(i32, i32)>>,
     window: &adw::Window,
     on_done: impl Fn() + 'static,
+    on_error: impl Fn() + 'static,
 ) {
     let scrolled = scrolled.clone();
     let zoom = zoom.clone();
     let picture_ref = picture.clone();
     let window = window.clone();
 
-    load_image_async(path, picture, img_dims, move |img_w, img_h| {
-        let (dw, dh) = display_size(img_w, img_h);
-        window.set_default_size(dw, dh);
-        reset_zoom(&picture_ref, &scrolled, &zoom);
-        on_done();
-    });
+    load_image_async(
+        path,
+        picture,
+        img_dims,
+        move |img_w, img_h| {
+            let (dw, dh) = display_size(img_w, img_h);
+            window.set_default_size(dw, dh);
+            reset_zoom(&picture_ref, &scrolled, &zoom);
+            on_done();
+        },
+        on_error,
+    );
 }
 
 /// Compute a window size that fits `img_w × img_h` within the screen budget.

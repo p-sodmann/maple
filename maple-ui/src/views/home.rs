@@ -11,7 +11,7 @@ use maple_db::ThumbnailCache;
 use gtk4::prelude::*;
 use libadwaita as adw;
 
-use super::{library, settings_window, source_picker};
+use super::{debug_window, library, settings_window, source_picker};
 use crate::widgets;
 
 /// Build the home page and wire navigation into `nav_view`.
@@ -70,8 +70,15 @@ pub fn build_home_page(
         .css_classes(["flat"])
         .build();
 
+    let debug_btn = gtk4::Button::builder()
+        .icon_name("bug-symbolic")
+        .tooltip_text("Debug Tools")
+        .css_classes(["flat"])
+        .build();
+
     let header = adw::HeaderBar::new();
     header.pack_end(&settings_btn);
+    header.pack_end(&debug_btn);
 
     let toolbar_view = adw::ToolbarView::new();
     toolbar_view.add_top_bar(&header);
@@ -82,6 +89,16 @@ pub fn build_home_page(
         .title("Maple")
         .child(&toolbar_view)
         .build();
+
+    // ── Debug button ─────────────────────────────────────────────
+    debug_btn.connect_clicked({
+        let db = db.clone();
+        move |btn| {
+            if let Some(win) = btn.root().and_downcast::<gtk4::Window>() {
+                debug_window::open_debug(&win, &db);
+            }
+        }
+    });
 
     // ── Settings button ──────────────────────────────────────────
     settings_btn.connect_clicked({

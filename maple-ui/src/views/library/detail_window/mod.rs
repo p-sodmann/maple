@@ -58,7 +58,6 @@ struct DetailContext {
     /// Face overlay — loads detections for each image and draws boxes.
     face_overlay: FaceOverlay,
     /// Toast overlay for showing notifications inside the detail window.
-    #[allow(dead_code)]
     toast_overlay: adw::ToastOverlay,
     /// Collection bar — chips + add-to-collection logic.
     collection_bar: CollectionBar,
@@ -78,6 +77,16 @@ struct DetailContext {
     current_index: Rc<Cell<usize>>,
     /// True while an image load is in flight; navigation is blocked until cleared.
     is_loading: Rc<Cell<bool>>,
+    /// Spinner shown over the photo while a decode is in progress.
+    spinner: gtk4::Spinner,
+    /// All images in the current stack (empty when image is not stacked).
+    stack_images: Rc<RefCell<Vec<LibraryImage>>>,
+    /// Position within `stack_images`.
+    stack_index: Rc<Cell<usize>>,
+    /// "N/M" label shown in the bottom bar when viewing a stacked image.
+    stack_indicator: gtk4::Label,
+    /// Button to remove the current image from its stack.
+    unstack_btn: gtk4::Button,
 }
 
 thread_local! {
@@ -181,6 +190,19 @@ fn build_window(
 
     // Load detections for the first image immediately.
     face_overlay.load_for_image(image.id, db);
+
+    // ── Loading spinner overlay ───────────────────────────────────
+    // Sits on top of the photo surface; hidden once the first decode finishes.
+    let spinner = gtk4::Spinner::builder()
+        .spinning(true)
+        .width_request(48)
+        .height_request(48)
+        .halign(gtk4::Align::Center)
+        .valign(gtk4::Align::Center)
+        .build();
+    let photo_overlay = gtk4::Overlay::new();
+    photo_overlay.set_child(Some(&face_overlay.container));
+    photo_overlay.add_overlay(&spinner);
 
     // ── Toast overlay ─────────────────────────────────────────────
     let toast_overlay = adw::ToastOverlay::new();
@@ -308,6 +330,13 @@ fn build_window(
         }
     });
 
+    let unstack_btn = gtk4::Button::builder()
+        .icon_name("list-remove-symbolic")
+        .tooltip_text("Remove from stack (unstack)")
+        .css_classes(["flat"])
+        .visible(false)
+        .build();
+
     let header = adw::HeaderBar::new();
     header.pack_end(&open_btn);
     header.pack_end(&copy_btn);
@@ -318,6 +347,7 @@ fn build_window(
     header.pack_start(&collections_btn);
     header.pack_start(&rotate_ccw_btn);
     header.pack_start(&rotate_cw_btn);
+    header.pack_start(&unstack_btn);
 
     // ── Metadata info strip ───────────────────────────────────────
     let info_bar = info_bar::build_empty_info_bar();
@@ -332,6 +362,13 @@ fn build_window(
         .css_classes(["dim-label", "caption"])
         .build();
 
+    // Stack position indicator — "⊞ 2/5" — hidden when not stacked.
+    let stack_indicator = gtk4::Label::builder()
+        .halign(gtk4::Align::Center)
+        .css_classes(["caption", "dim-label"])
+        .visible(false)
+        .build();
+
     let bottom_bar = gtk4::Box::builder()
         .orientation(gtk4::Orientation::Horizontal)
         .margin_top(4)
@@ -340,6 +377,7 @@ fn build_window(
         .margin_end(4)
         .build();
     bottom_bar.append(&collection_bar.chips);
+    bottom_bar.append(&stack_indicator);
     bottom_bar.append(&filename_label);
 
     // ── Layout ────────────────────────────────────────────────────
@@ -349,7 +387,7 @@ fn build_window(
     toolbar_view.add_top_bar(&header);
     toolbar_view.add_top_bar(&info_bar);
     toolbar_view.add_bottom_bar(&bottom_bar);
-    toolbar_view.set_content(Some(&face_overlay.container));
+    toolbar_view.set_content(Some(&photo_overlay));
 
     toast_overlay.set_child(Some(&toolbar_view));
 
@@ -406,9 +444,51 @@ fn build_window(
         &window,
         {
             let is_loading = is_loading.clone();
-            move || is_loading.set(false)
+            let spinner = spinner.clone();
+            move || {
+                is_loading.set(false);
+                spinner.set_spinning(false);
+                spinner.set_visible(false);
+            }
+        },
+        {
+            let is_loading = is_loading.clone();
+            let spinner = spinner.clone();
+            let toast_overlay = toast_overlay.clone();
+            move || {
+                is_loading.set(false);
+                spinner.set_spinning(false);
+                spinner.set_visible(false);
+                toast_overlay.add_toast(adw::Toast::new("Failed to load image"));
+            }
         },
     );
+
+    // Initialise stack state for the first image.
+    let (initial_stack_images, initial_stack_index) =
+        if let Some(stack_id) = image.stack_id {
+            let imgs = maple_db::lock_db(db)
+                .images_in_stack(stack_id)
+                .unwrap_or_default();
+            let idx = imgs.iter().position(|img| img.id == image.id).unwrap_or(0);
+            (imgs, idx)
+        } else {
+            (Vec::new(), 0)
+        };
+
+    let stack_images: Rc<RefCell<Vec<LibraryImage>>> =
+        Rc::new(RefCell::new(initial_stack_images));
+    let stack_index: Rc<Cell<usize>> = Rc::new(Cell::new(initial_stack_index));
+
+    // Set initial stack indicator visibility.
+    {
+        let count = stack_images.borrow().len();
+        if count >= 2 {
+            stack_indicator.set_visible(true);
+            stack_indicator.set_label(&format!("⊞ {}/{}", initial_stack_index + 1, count));
+            unstack_btn.set_visible(true);
+        }
+    }
 
     let ctx = DetailContext {
         window,
@@ -429,6 +509,11 @@ fn build_window(
         images,
         current_index,
         is_loading,
+        spinner,
+        stack_images,
+        stack_index,
+        stack_indicator,
+        unstack_btn,
     };
 
     // Load initial collection chips.
@@ -461,6 +546,8 @@ fn update_context(
     *ctx.current_image.borrow_mut() = image.clone();
     zoom_pan::reset_zoom(&ctx.picture, &ctx.scrolled, &ctx.zoom);
     ctx.is_loading.set(true);
+    ctx.spinner.set_spinning(true);
+    ctx.spinner.set_visible(true);
     image_load::load_image(
         image.path.clone(),
         &ctx.picture,
@@ -470,13 +557,52 @@ fn update_context(
         &ctx.window,
         {
             let is_loading = ctx.is_loading.clone();
-            move || is_loading.set(false)
+            let spinner = ctx.spinner.clone();
+            move || {
+                is_loading.set(false);
+                spinner.set_spinning(false);
+                spinner.set_visible(false);
+            }
+        },
+        {
+            let is_loading = ctx.is_loading.clone();
+            let spinner = ctx.spinner.clone();
+            let toast_overlay = ctx.toast_overlay.clone();
+            move || {
+                is_loading.set(false);
+                spinner.set_spinning(false);
+                spinner.set_visible(false);
+                toast_overlay.add_toast(adw::Toast::new("Failed to load image"));
+            }
         },
     );
     // Reload face detections for the new image.
     ctx.face_overlay.load_for_image(image.id, db);
     // Reload collection chips.
     ctx.collection_bar.reload();
+
+    // Update stack siblings and indicator.
+    let (stack_imgs, stack_idx) = if let Some(stack_id) = image.stack_id {
+        let imgs = maple_db::lock_db(db)
+            .images_in_stack(stack_id)
+            .unwrap_or_default();
+        let idx = imgs.iter().position(|img| img.id == image.id).unwrap_or(0);
+        (imgs, idx)
+    } else {
+        (Vec::new(), 0)
+    };
+    let stack_count = stack_imgs.len();
+    *ctx.stack_images.borrow_mut() = stack_imgs;
+    ctx.stack_index.set(stack_idx);
+    if stack_count >= 2 {
+        ctx.stack_indicator.set_visible(true);
+        ctx.stack_indicator
+            .set_label(&format!("⊞ {}/{}", stack_idx + 1, stack_count));
+        ctx.unstack_btn.set_visible(true);
+    } else {
+        ctx.stack_indicator.set_visible(false);
+        ctx.unstack_btn.set_visible(false);
+    }
 }
 
 // ── Navigation ───────────────────────────────────────────────────
@@ -559,7 +685,8 @@ fn rotate_image(ctx: &DetailContext, clockwise: bool, cw_btn: &gtk4::Button, ccw
                     }
                 }
                 ctx.is_loading.set(true);
-                let is_loading = ctx.is_loading.clone();
+                ctx.spinner.set_spinning(true);
+                ctx.spinner.set_visible(true);
                 image_load::load_image(
                     ctx.current_path.borrow().clone(),
                     &ctx.picture,
@@ -567,7 +694,27 @@ fn rotate_image(ctx: &DetailContext, clockwise: bool, cw_btn: &gtk4::Button, ccw
                     &ctx.zoom,
                     &ctx.img_dims,
                     &ctx.window,
-                    move || is_loading.set(false),
+                    {
+                        let is_loading = ctx.is_loading.clone();
+                        let spinner = ctx.spinner.clone();
+                        move || {
+                            is_loading.set(false);
+                            spinner.set_spinning(false);
+                            spinner.set_visible(false);
+                        }
+                    },
+                    {
+                        let is_loading = ctx.is_loading.clone();
+                        let spinner = ctx.spinner.clone();
+                        let toast_overlay = ctx.toast_overlay.clone();
+                        move || {
+                            is_loading.set(false);
+                            spinner.set_spinning(false);
+                            spinner.set_visible(false);
+                            toast_overlay
+                                .add_toast(adw::Toast::new("Failed to reload after rotation"));
+                        }
+                    },
                 );
                 cw_btn.set_sensitive(true);
                 ccw_btn.set_sensitive(true);
@@ -590,7 +737,57 @@ fn rotate_image(ctx: &DetailContext, clockwise: bool, cw_btn: &gtk4::Button, ccw
     });
 }
 
+/// Move `delta` steps within the current stack (+1 = next, -1 = prev).
+/// Wraps around — + from last goes to first.
+fn navigate_in_stack(ctx: &DetailContext, delta: i32) {
+    if ctx.is_loading.get() {
+        return;
+    }
+    let new_image = {
+        let images = ctx.stack_images.borrow();
+        let len = images.len();
+        if len < 2 {
+            return;
+        }
+        let cur = ctx.stack_index.get();
+        let new_idx = ((cur as i64 + delta as i64).rem_euclid(len as i64)) as usize;
+        images[new_idx].clone()
+    };
+    update_context(ctx, &new_image, &ctx.db.clone());
+}
+
+/// Mark the current image as the cover (favourite) of its stack.
+fn set_stack_cover_for_current(ctx: &DetailContext) {
+    let image = ctx.current_image.borrow().clone();
+    if let Some(stack_id) = image.stack_id {
+        match maple_db::lock_db(&ctx.db).set_stack_cover(stack_id, image.id) {
+            Ok(()) => ctx.toast_overlay.add_toast(adw::Toast::new("★ Set as stack cover")),
+            Err(e) => tracing::warn!("Failed to set stack cover: {e}"),
+        }
+    }
+}
+
 fn wire_navigation(ctx: &DetailContext) {
+    // Wire unstack button.
+    ctx.unstack_btn.connect_clicked({
+        let ctx = ctx.clone();
+        move |btn| {
+            let image_id = ctx.current_image.borrow().id;
+            match maple_db::lock_db(&ctx.db).remove_from_stack(image_id) {
+                Ok(()) => {
+                    ctx.toast_overlay.add_toast(adw::Toast::new("Removed from stack"));
+                    // Clear the in-memory stack state immediately.
+                    ctx.stack_images.borrow_mut().clear();
+                    ctx.stack_indicator.set_visible(false);
+                    btn.set_visible(false);
+                    ctx.current_image.borrow_mut().stack_id = None;
+                    ctx.current_image.borrow_mut().stack_size = None;
+                }
+                Err(e) => tracing::warn!("Failed to unstack image {image_id}: {e}"),
+            }
+        }
+    });
+
     let key_ctrl = gtk4::EventControllerKey::new();
     key_ctrl.connect_key_pressed({
         let ctx = ctx.clone();
@@ -601,6 +798,20 @@ fn wire_navigation(ctx: &DetailContext) {
             }
             gdk::Key::Right | gdk::Key::Down => {
                 navigate_relative(&ctx, 1);
+                glib::Propagation::Stop
+            }
+            // +/- navigate within a stack (wrap around).
+            gdk::Key::plus | gdk::Key::KP_Add | gdk::Key::equal => {
+                navigate_in_stack(&ctx, 1);
+                glib::Propagation::Stop
+            }
+            gdk::Key::minus | gdk::Key::KP_Subtract => {
+                navigate_in_stack(&ctx, -1);
+                glib::Propagation::Stop
+            }
+            // Space marks the current image as the stack cover.
+            gdk::Key::space => {
+                set_stack_cover_for_current(&ctx);
                 glib::Propagation::Stop
             }
             _ => glib::Propagation::Proceed,

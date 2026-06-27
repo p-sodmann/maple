@@ -1,3 +1,4 @@
+pub mod debug_window;
 pub mod drop_import;
 pub mod home;
 pub mod image_browser;

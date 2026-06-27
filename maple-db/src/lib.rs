@@ -145,6 +145,11 @@ pub struct LibraryImage {
     /// BLAKE3 content hash — used as the thumbnail cache key.
     /// `None` only if the DB row has a corrupt/missing hash (should not happen).
     pub hash: Option<[u8; 32]>,
+    /// Stack this image belongs to, if any.
+    pub stack_id: Option<i64>,
+    /// Number of images in the same stack (including this one).
+    /// `None` for non-stacked images.
+    pub stack_size: Option<usize>,
     /// How this image matched the active search query.  `None` for plain
     /// (unfiltered) listings and keyword-only results without semantic search.
     pub search_hit: Option<SearchHit>,
@@ -252,15 +257,29 @@ impl Database {
         Ok(())
     }
 
+    /// Count images that have no hash for `algorithm`.
+    pub fn count_images_without_hash(&self, algorithm: &str) -> anyhow::Result<usize> {
+        let n: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM images
+             WHERE status = 'present'
+               AND id NOT IN (
+                   SELECT image_id FROM image_hashes WHERE algorithm = ?1
+               )",
+            params![algorithm],
+            |r| r.get(0),
+        )?;
+        Ok(n as usize)
+    }
+
     /// Return up to `limit` images that have no hash for `algorithm`.
     /// Used by the background hasher to find pending work.
     pub fn images_without_hash(
         &self,
         algorithm: &str,
         limit: usize,
-    ) -> anyhow::Result<Vec<(i64, PathBuf)>> {
+    ) -> anyhow::Result<Vec<(i64, PathBuf, Option<[u8; 32]>)>> {
         let mut stmt = self.conn.prepare_cached(
-            "SELECT id, path FROM images
+            "SELECT id, path, hash FROM images
              WHERE status = 'present'
                AND id NOT IN (
                    SELECT image_id FROM image_hashes WHERE algorithm = ?1
@@ -269,10 +288,18 @@ impl Database {
         )?;
         let rows = stmt
             .query_map(params![algorithm, limit as i64], |r| {
-                Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?))
+                let id: i64 = r.get(0)?;
+                let path: String = r.get(1)?;
+                let hash_bytes: Option<Vec<u8>> = r.get(2)?;
+                Ok((id, path, hash_bytes))
             })?
             .filter_map(|r| {
-                r.ok().map(|(id, path)| (id, PathBuf::from(path)))
+                r.ok().map(|(id, path, hash_bytes)| {
+                    let hash: Option<[u8; 32]> = hash_bytes.and_then(|b| {
+                        b.try_into().ok()
+                    });
+                    (id, PathBuf::from(path), hash)
+                })
             })
             .collect();
         Ok(rows)
@@ -317,6 +344,84 @@ impl Database {
             "UPDATE images SET stack_id = ?1 WHERE id = ?2",
             params![stack_id, image_id],
         )?;
+        Ok(())
+    }
+
+    /// Return all images belonging to `stack_id`, ordered by id (oldest first).
+    pub fn images_in_stack(&self, stack_id: i64) -> anyhow::Result<Vec<LibraryImage>> {
+        let mut stmt = self.conn.prepare_cached(
+            "SELECT i.id, i.path, i.added_at, i.status,
+                    i.filename, i.taken_at, i.make, i.model, i.lens,
+                    i.focal_length, i.aperture, i.iso,
+                    i.width, i.height, i.orientation, i.raw_path, i.hash,
+                    i.stack_id,
+                    (SELECT COUNT(*) FROM images sc
+                     WHERE sc.stack_id = i.stack_id AND sc.status = 'present') AS stack_size
+             FROM images i
+             WHERE i.stack_id = ?1 AND i.status = 'present'
+             ORDER BY i.id ASC",
+        )?;
+        let rows = stmt
+            .query_map(params![stack_id], row_to_library_image)?
+            .filter_map(|r| r.ok())
+            .collect();
+        Ok(rows)
+    }
+
+    /// Set the cover (favourite) image for a stack.
+    /// The cover is used as the grid thumbnail for the stack.
+    pub fn set_stack_cover(&self, stack_id: i64, image_id: i64) -> anyhow::Result<()> {
+        self.conn.execute(
+            "UPDATE stacks SET cover_image_id = ?1 WHERE id = ?2",
+            params![image_id, stack_id],
+        )?;
+        Ok(())
+    }
+
+    /// Remove `image_id` from its stack.
+    ///
+    /// If after removal the stack has fewer than 2 images, the remaining
+    /// images are also unstacked and the stack row is deleted.
+    pub fn remove_from_stack(&self, image_id: i64) -> anyhow::Result<()> {
+        // Find the stack this image belongs to.
+        let stack_id: Option<i64> = self
+            .conn
+            .query_row(
+                "SELECT stack_id FROM images WHERE id = ?1",
+                params![image_id],
+                |r| r.get(0),
+            )
+            .optional()?
+            .flatten();
+
+        let Some(stack_id) = stack_id else {
+            return Ok(()); // not stacked
+        };
+
+        // Remove this image from the stack.
+        self.conn.execute(
+            "UPDATE images SET stack_id = NULL WHERE id = ?1",
+            params![image_id],
+        )?;
+
+        // If fewer than 2 images remain, disband the whole stack.
+        let remaining: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM images WHERE stack_id = ?1 AND status = 'present'",
+            params![stack_id],
+            |r| r.get(0),
+        )?;
+
+        if remaining < 2 {
+            self.conn.execute(
+                "UPDATE images SET stack_id = NULL WHERE stack_id = ?1",
+                params![stack_id],
+            )?;
+            self.conn.execute(
+                "DELETE FROM stacks WHERE id = ?1",
+                params![stack_id],
+            )?;
+        }
+
         Ok(())
     }
 
@@ -449,19 +554,32 @@ impl Database {
         let offset = offset.unwrap_or(0) as i64;
 
         let coll_clause = if collection_id.is_some() {
-            " AND id IN (SELECT image_id FROM collection_images WHERE collection_id = ?)"
+            " AND i.id IN (SELECT image_id FROM collection_images WHERE collection_id = ?)"
         } else {
             ""
         };
 
         let sql = format!(
-            "SELECT id, path, added_at, status,
-                    filename, taken_at, make, model, lens,
-                    focal_length, aperture, iso,
-                    width, height, orientation, raw_path, hash
-             FROM images
-             WHERE status = 'present'{coll_clause}
-             ORDER BY added_at DESC
+            "SELECT i.id, i.path, i.added_at, i.status,
+                    i.filename, i.taken_at, i.make, i.model, i.lens,
+                    i.focal_length, i.aperture, i.iso,
+                    i.width, i.height, i.orientation, i.raw_path, i.hash,
+                    i.stack_id,
+                    CASE WHEN i.stack_id IS NOT NULL THEN
+                        (SELECT COUNT(*) FROM images sc
+                         WHERE sc.stack_id = i.stack_id AND sc.status = 'present')
+                    ELSE NULL END AS stack_size
+             FROM images i
+             WHERE i.status = 'present'
+               AND (
+                 i.stack_id IS NULL
+                 OR i.id = COALESCE(
+                   (SELECT s.cover_image_id FROM stacks s WHERE s.id = i.stack_id),
+                   (SELECT MIN(si.id) FROM images si
+                    WHERE si.stack_id = i.stack_id AND si.status = 'present')
+                 )
+               ){coll_clause}
+             ORDER BY i.added_at DESC
              LIMIT ? OFFSET ?"
         );
 
@@ -535,13 +653,26 @@ impl Database {
             "SELECT DISTINCT i.id, i.path, i.added_at, i.status,
                     i.filename, i.taken_at, i.make, i.model, i.lens,
                     i.focal_length, i.aperture, i.iso,
-                    i.width, i.height, i.orientation, i.raw_path, i.hash
+                    i.width, i.height, i.orientation, i.raw_path, i.hash,
+                    i.stack_id,
+                    CASE WHEN i.stack_id IS NOT NULL THEN
+                        (SELECT COUNT(*) FROM images sc
+                         WHERE sc.stack_id = i.stack_id AND sc.status = 'present')
+                    ELSE NULL END AS stack_size
              FROM images i
              LEFT JOIN ai_descriptions ad ON ad.image_id = i.id
              LEFT JOIN face_detections fd ON fd.image_id = i.id
              LEFT JOIN persons p ON p.id = fd.person_id
              WHERE i.status = 'present'
-               AND {token_conditions}{coll_clause}
+               AND {token_conditions}
+               AND (
+                 i.stack_id IS NULL
+                 OR i.id = COALESCE(
+                   (SELECT s.cover_image_id FROM stacks s WHERE s.id = i.stack_id),
+                   (SELECT MIN(si.id) FROM images si
+                    WHERE si.stack_id = i.stack_id AND si.status = 'present')
+                 )
+               ){coll_clause}
              ORDER BY i.added_at DESC
              LIMIT ? OFFSET ?"
         );
@@ -762,6 +893,73 @@ impl Database {
             .query_row("SELECT COUNT(*) FROM images", [], |r| r.get(0))?;
         Ok(n as u64)
     }
+
+    // ── Debug / similarity query ─────────────────────────────────
+
+    /// Return the raw hash blob stored for `image_id` under `algorithm`, if any.
+    pub fn hash_blob_for_image(
+        &self,
+        image_id: i64,
+        algorithm: &str,
+    ) -> anyhow::Result<Option<Vec<u8>>> {
+        let mut stmt = self.conn.prepare_cached(
+            "SELECT hash_blob FROM image_hashes WHERE image_id = ?1 AND algorithm = ?2",
+        )?;
+        let result = stmt
+            .query_row(params![image_id, algorithm], |r| r.get(0))
+            .optional()?;
+        Ok(result)
+    }
+
+    /// Compute perceptual similarity between two images under `algorithm`.
+    ///
+    /// Returns `None` if either image has no stored hash for that algorithm.
+    /// Algorithm prefix determines comparison method:
+    ///   `"phash:N"` → normalised Hamming distance (fraction of bits that agree).
+    ///   `"onnx:…"`  → cosine similarity of the stored float embeddings.
+    pub fn similarity_for_images(
+        &self,
+        id_a: i64,
+        id_b: i64,
+        algorithm: &str,
+    ) -> anyhow::Result<Option<f32>> {
+        let blob_a = self.hash_blob_for_image(id_a, algorithm)?;
+        let blob_b = self.hash_blob_for_image(id_b, algorithm)?;
+        let (Some(a), Some(b)) = (blob_a, blob_b) else {
+            return Ok(None);
+        };
+        let sim = if let Some(size_str) = algorithm.strip_prefix("phash:") {
+            let hash_size: u32 = size_str.parse().unwrap_or(8);
+            let ha = maple_import::ImageHash::from_bytes(&a)
+                .map_err(|e| anyhow::anyhow!("invalid pHash bytes for id_a: {e:?}"))?;
+            let hb = maple_import::ImageHash::from_bytes(&b)
+                .map_err(|e| anyhow::anyhow!("invalid pHash bytes for id_b: {e:?}"))?;
+            maple_import::phash_similarity(&ha, &hb, hash_size)
+        } else {
+            let ea: Vec<f32> = a
+                .chunks_exact(4)
+                .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+                .collect();
+            let eb: Vec<f32> = b
+                .chunks_exact(4)
+                .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+                .collect();
+            crate::models::image_cosine_similarity(&ea, &eb)
+        };
+        Ok(Some(sim))
+    }
+
+    /// Return all distinct algorithm keys currently stored in `image_hashes`.
+    pub fn stored_algorithms(&self) -> anyhow::Result<Vec<String>> {
+        let mut stmt = self.conn.prepare_cached(
+            "SELECT DISTINCT algorithm FROM image_hashes ORDER BY algorithm",
+        )?;
+        let rows = stmt
+            .query_map([], |r| r.get(0))?
+            .filter_map(|r| r.ok())
+            .collect();
+        Ok(rows)
+    }
 }
 
 // ── Helpers ──────────────────────────────────────────────────────
@@ -874,6 +1072,8 @@ fn row_to_library_image(row: &rusqlite::Row<'_>) -> rusqlite::Result<LibraryImag
     let raw_path: Option<String> = row.get(15)?;
     let hash_bytes: Vec<u8> = row.get(16)?;
     let hash: Option<[u8; 32]> = hash_bytes.try_into().ok();
+    let stack_id: Option<i64> = row.get(17)?;
+    let stack_size: Option<i64> = row.get(18)?;
     Ok(LibraryImage {
         id: row.get(0)?,
         path: PathBuf::from(row.get::<_, String>(1)?),
@@ -882,6 +1082,8 @@ fn row_to_library_image(row: &rusqlite::Row<'_>) -> rusqlite::Result<LibraryImag
         status: ImageStatus::from_str(&status_str),
         meta,
         hash,
+        stack_id,
+        stack_size: stack_size.map(|n| n as usize),
         search_hit: None,
     })
 }

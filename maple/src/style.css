@@ -130,6 +130,22 @@
     min-height: 4px;
 }
 
+/* ── Stack badge (library grid) ───────────────────────────────────
+ * Pill-shaped overlay at the bottom-left of stacked thumbnails.
+ * Shows the stack count so the user knows how many shots are grouped. */
+.maple-stack-badge {
+    background-color: alpha(black, 0.55);
+    border-radius: 4px;
+    padding: 1px 5px;
+    margin: 4px;
+}
+
+.maple-stack-count {
+    color: white;
+    font-size: 0.72em;
+    font-weight: bold;
+}
+
 /* ── Misc ─────────────────────────────────────────────────────────
  * Slow down the spinner used in thumbnail placeholders.
  * GTK4 spinner animation is ~1.05s by default; we stretch it to 3s. */
