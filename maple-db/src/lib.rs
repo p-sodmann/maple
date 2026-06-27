@@ -875,12 +875,17 @@ impl Database {
     /// Fetch a single image record by id.
     pub fn image_by_id(&self, id: i64) -> anyhow::Result<Option<LibraryImage>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, path, added_at, status,
-                    filename, taken_at, make, model, lens,
-                    focal_length, aperture, iso,
-                    width, height, orientation, raw_path, hash
-             FROM images
-             WHERE id = ?1",
+            "SELECT i.id, i.path, i.added_at, i.status,
+                    i.filename, i.taken_at, i.make, i.model, i.lens,
+                    i.focal_length, i.aperture, i.iso,
+                    i.width, i.height, i.orientation, i.raw_path, i.hash,
+                    i.stack_id,
+                    CASE WHEN i.stack_id IS NOT NULL THEN
+                        (SELECT COUNT(*) FROM images sc
+                         WHERE sc.stack_id = i.stack_id AND sc.status = 'present')
+                    ELSE NULL END AS stack_size
+             FROM images i
+             WHERE i.id = ?1",
         )?;
         let mut rows = stmt.query_map(params![id], row_to_library_image)?;
         Ok(rows.next().transpose()?)

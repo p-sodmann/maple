@@ -1,14 +1,18 @@
 //! Debug tools window.
 //!
-//! Opened from the home-page header bar (bug/wrench icon).  The window uses an
-//! `adw::NavigationView` so additional debug pages can be pushed without
-//! restructuring anything here — each tool lives in its own `NavigationPage`.
+//! A single non-modal window that stays open while the rest of the app is
+//! used.  Clicking the debug button again raises the existing window instead
+//! of opening a second one.
+//!
+//! The window uses an `adw::NavigationView` so additional debug pages can be
+//! pushed without restructuring anything here.
 //!
 //! # Adding a new debug tool
 //!   1. Build an `adw::NavigationPage` for the tool (see `build_similarity_page`).
 //!   2. Push it from the root list by appending an `adw::ActionRow` with a
 //!      `go-next-symbolic` suffix that calls `nav.push(&your_page)`.
 
+use std::cell::RefCell;
 use std::sync::{Arc, Mutex};
 
 use gtk4::prelude::*;
@@ -17,13 +21,25 @@ use adw::prelude::*;
 
 use maple_db::Database;
 
-/// Open the debug tools window as a modal transient of `parent`.
+// ── Singleton ──────────────────────────────────────────────────────────────
+
+thread_local! {
+    static DEBUG_WIN: RefCell<Option<adw::Window>> = const { RefCell::new(None) };
+}
+
+/// Open the debug tools window, or raise it if it is already open.
 pub fn open_debug(parent: &impl IsA<gtk4::Window>, db: &Arc<Mutex<Database>>) {
+    // Raise an already-visible window rather than opening a second one.
+    let existing = DEBUG_WIN.with(|cell| cell.borrow().clone());
+    if let Some(win) = existing {
+        if win.is_visible() {
+            win.present();
+            return;
+        }
+    }
+
     let db = db.clone();
-
     let nav = adw::NavigationView::new();
-
-    // ── Root page — list of available tools ───────────────────────
     let root_page = build_root_page(&nav, &db);
     nav.push(&root_page);
 
@@ -32,11 +48,19 @@ pub fn open_debug(parent: &impl IsA<gtk4::Window>, db: &Arc<Mutex<Database>>) {
         .default_width(480)
         .default_height(420)
         .transient_for(parent)
-        .modal(true)
         .build();
     win.set_content(Some(&nav));
+
+    // Clear the singleton when the window is closed.
+    win.connect_destroy(|_| {
+        DEBUG_WIN.with(|cell| *cell.borrow_mut() = None);
+    });
+
+    DEBUG_WIN.with(|cell| *cell.borrow_mut() = Some(win.clone()));
     win.present();
 }
+
+// ── Pages ──────────────────────────────────────────────────────────────────
 
 fn build_root_page(nav: &adw::NavigationView, db: &Arc<Mutex<Database>>) -> adw::NavigationPage {
     let tools_group = adw::PreferencesGroup::builder()
@@ -48,21 +72,16 @@ fn build_root_page(nav: &adw::NavigationView, db: &Arc<Mutex<Database>>) -> adw:
         .subtitle("Compute perceptual similarity between two images by ID")
         .activatable(true)
         .build();
-    let next_icon = gtk4::Image::from_icon_name("go-next-symbolic");
-    sim_row.add_suffix(&next_icon);
+    sim_row.add_suffix(&gtk4::Image::from_icon_name("go-next-symbolic"));
     tools_group.add(&sim_row);
 
-    let page_box = gtk4::Box::builder()
-        .orientation(gtk4::Orientation::Vertical)
-        .build();
     let pref_page = adw::PreferencesPage::new();
     pref_page.add(&tools_group);
-    page_box.append(&pref_page);
 
     let header = adw::HeaderBar::new();
     let toolbar_view = adw::ToolbarView::new();
     toolbar_view.add_top_bar(&header);
-    toolbar_view.set_content(Some(&page_box));
+    toolbar_view.set_content(Some(&pref_page));
 
     let root = adw::NavigationPage::builder()
         .title("Debug Tools")
@@ -72,10 +91,7 @@ fn build_root_page(nav: &adw::NavigationView, db: &Arc<Mutex<Database>>) -> adw:
     sim_row.connect_activated({
         let nav = nav.clone();
         let db = db.clone();
-        move |_| {
-            let page = build_similarity_page(&db);
-            nav.push(&page);
-        }
+        move |_| nav.push(&build_similarity_page(&db))
     });
 
     root
@@ -119,13 +135,13 @@ fn build_similarity_page(db: &Arc<Mutex<Database>>) -> adw::NavigationPage {
         .model(&algo_model)
         .build();
 
-    let no_algo_row = adw::ActionRow::builder()
-        .title("No hashes stored yet")
-        .subtitle("Run the background hasher before querying similarity")
-        .build();
-
     if algorithms.is_empty() {
-        algo_group.add(&no_algo_row);
+        algo_group.add(
+            &adw::ActionRow::builder()
+                .title("No hashes stored yet")
+                .subtitle("Run the background hasher before querying similarity")
+                .build(),
+        );
     } else {
         algo_group.add(&algo_row);
     }
@@ -170,10 +186,8 @@ fn build_similarity_page(db: &Arc<Mutex<Database>>) -> adw::NavigationPage {
         let db = db.clone();
         let algorithms = algorithms.clone();
         move |_| {
-            let text_a = id_a_row.text();
-            let text_b = id_b_row.text();
-            let id_a: Option<i64> = text_a.trim().parse().ok();
-            let id_b: Option<i64> = text_b.trim().parse().ok();
+            let id_a: Option<i64> = id_a_row.text().trim().parse().ok();
+            let id_b: Option<i64> = id_b_row.text().trim().parse().ok();
 
             let algorithm = {
                 let idx = algo_row.selected() as usize;
@@ -183,13 +197,17 @@ fn build_similarity_page(db: &Arc<Mutex<Database>>) -> adw::NavigationPage {
             };
 
             let subtitle = match (id_a, id_b) {
-                (Some(a), Some(b)) => {
-                    match db.lock().ok().and_then(|g| g.similarity_for_images(a, b, &algorithm).ok()) {
-                        Some(Some(sim)) => format!("{sim:.6}   [{algorithm}]"),
-                        Some(None) => format!("No hash stored for one or both IDs under [{algorithm}]"),
-                        None => "Database error".to_owned(),
+                (Some(a), Some(b)) => match db
+                    .lock()
+                    .ok()
+                    .and_then(|g| g.similarity_for_images(a, b, &algorithm).ok())
+                {
+                    Some(Some(sim)) => format!("{sim:.6}   [{algorithm}]"),
+                    Some(None) => {
+                        format!("No hash stored for one or both IDs under [{algorithm}]")
                     }
-                }
+                    None => "Database error".to_owned(),
+                },
                 _ => "Enter valid integer IDs in both fields".to_owned(),
             };
             result_row.set_subtitle(&subtitle);
