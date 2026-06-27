@@ -64,11 +64,11 @@ impl ImageGroup {
                     .map(|c| c.path.clone())
                     .collect();
                 if raws.is_empty() {
-                    // No raw companion — check if the display itself is raw.
+                    // No raw companion — only copy display if it is itself raw.
                     if is_raw_format(&self.display.path) {
                         vec![self.display.path.clone()]
                     } else {
-                        vec![self.display.path.clone()]
+                        vec![]
                     }
                 } else {
                     raws
@@ -323,5 +323,19 @@ mod tests {
 
         let display = group.paths_for_copy(CopyMode::DisplayOnly);
         assert_eq!(display, vec![PathBuf::from("/photos/DSCF0001.JPG")]);
+    }
+
+    #[test]
+    fn paths_for_copy_raw_only_jpg_group_returns_empty() {
+        // A JPG-only group with no raw companion must return nothing for RawOnly.
+        let group = ImageGroup {
+            display: ImageFile {
+                path: PathBuf::from("/photos/DSCF0002.JPG"),
+                size: 100,
+            },
+            companions: vec![],
+        };
+        let raw = group.paths_for_copy(CopyMode::RawOnly);
+        assert!(raw.is_empty(), "RawOnly should not copy a JPG-only group");
     }
 }
