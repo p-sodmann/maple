@@ -391,6 +391,153 @@ impl Default for SemanticSettings {
     }
 }
 
+/// Which similarity algorithm to use when grouping burst/similar shots into stacks.
+///
+/// Serialises to/from the lowercase string name (`"phash"`, `"onnx"`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum StackMode {
+    /// Perceptual hash (DCT-based pHash via `image_hasher`).  Fast, zero
+    /// configuration — works offline with no models.  Best for detecting
+    /// burst duplicates and near-identical shots.
+    #[default]
+    PHash,
+    /// Dense image embedding via a HuggingFace ONNX vision model (e.g.
+    /// DINOv2).  Slower but captures semantic similarity, so it groups
+    /// shots of the same subject even when exposure or composition differs.
+    Onnx,
+}
+
+/// Stack detection settings.
+///
+/// Stored under `[stacks]` in `settings.toml`.
+///
+/// After import, newly copied images are compared pairwise and similar ones
+/// are assigned a shared `stack_id` in the DB.  The library grid shows each
+/// stack as a single tile with a count badge.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StackSettings {
+    /// Whether stack detection runs automatically after each import batch.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Similarity algorithm.  `"phash"` (default) or `"onnx"`.
+    #[serde(default)]
+    pub mode: StackMode,
+    /// Similarity threshold (0.0–1.0).  Images with similarity ≥ this value
+    /// are placed in the same stack.
+    ///
+    /// - pHash: fraction of bits that agree (1.0 = identical hashes).
+    ///   A value of 0.90 means ≤ 6 out of 64 bits may differ.
+    /// - ONNX: cosine similarity of the image embeddings.
+    #[serde(default = "StackSettings::default_threshold")]
+    pub threshold: f32,
+    /// pHash hash size (default 8 → 8×8 = 64-bit hash).
+    /// Larger values are more discriminating but slower.
+    #[serde(default = "StackSettings::default_hash_size")]
+    pub hash_size: u32,
+    /// HuggingFace repo id of the ONNX vision model (ONNX mode only).
+    /// e.g. `"facebook/dinov2-with-registers-base"`.
+    /// The repo must contain an exported ONNX file at `onnx_file`.
+    #[serde(default = "StackSettings::default_model_repo")]
+    pub model_repo: String,
+    /// Path of the ONNX model file within the repo (ONNX mode only).
+    #[serde(default = "StackSettings::default_onnx_file")]
+    pub onnx_file: String,
+    /// Resize image so its shortest edge equals this value before cropping
+    /// (ONNX mode only).  Should match the model's `size.shortest_edge`.
+    #[serde(default = "StackSettings::default_shortest_edge")]
+    pub shortest_edge: u32,
+    /// Center-crop size after resize (ONNX mode only).
+    /// Should match the model's `crop_size`.
+    #[serde(default = "StackSettings::default_image_size")]
+    pub image_size: u32,
+    /// Per-channel mean for ImageNet-style normalisation (ONNX mode only).
+    #[serde(default = "StackSettings::default_image_mean")]
+    pub image_mean: [f32; 3],
+    /// Per-channel std for ImageNet-style normalisation (ONNX mode only).
+    #[serde(default = "StackSettings::default_image_std")]
+    pub image_std: [f32; 3],
+    /// Execution device for ONNX inference (ONNX mode only).
+    /// Accepts: `"cpu"` (default), `"cuda:N"`, `"tensorrt:N"`.
+    #[serde(default = "StackSettings::default_device")]
+    pub device: String,
+}
+
+impl StackSettings {
+    fn default_threshold() -> f32 {
+        0.90
+    }
+
+    fn default_hash_size() -> u32 {
+        8
+    }
+
+    fn default_model_repo() -> String {
+        "facebook/dinov2-with-registers-base".into()
+    }
+
+    fn default_onnx_file() -> String {
+        "onnx/model.onnx".into()
+    }
+
+    fn default_shortest_edge() -> u32 {
+        256
+    }
+
+    fn default_image_size() -> u32 {
+        224
+    }
+
+    fn default_image_mean() -> [f32; 3] {
+        [0.485, 0.456, 0.406]
+    }
+
+    fn default_image_std() -> [f32; 3] {
+        [0.229, 0.224, 0.225]
+    }
+
+    fn default_device() -> String {
+        "cpu".into()
+    }
+}
+
+impl StackSettings {
+    /// A stable string key that identifies the current algorithm + parameters.
+    ///
+    /// Used as the `algorithm` column in `image_hashes`.  When the user
+    /// changes any parameter that affects hash values (e.g. `hash_size`,
+    /// `model_repo`), the key changes and the old rows are ignored — the
+    /// background hasher will recompute hashes under the new key.
+    ///
+    /// Format:
+    ///   pHash  → `"phash:8"`  (hash_size as suffix)
+    ///   ONNX   → `"onnx:facebook/dinov2-with-registers-base"`
+    pub fn algorithm_key(&self) -> String {
+        match self.mode {
+            StackMode::PHash => format!("phash:{}", self.hash_size),
+            StackMode::Onnx => format!("onnx:{}", self.model_repo),
+        }
+    }
+}
+
+impl Default for StackSettings {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            mode: StackMode::default(),
+            threshold: Self::default_threshold(),
+            hash_size: Self::default_hash_size(),
+            model_repo: Self::default_model_repo(),
+            onnx_file: Self::default_onnx_file(),
+            shortest_edge: Self::default_shortest_edge(),
+            image_size: Self::default_image_size(),
+            image_mean: Self::default_image_mean(),
+            image_std: Self::default_image_std(),
+            device: Self::default_device(),
+        }
+    }
+}
+
 /// The bundled defaults.toml — written to disk on first launch so users
 /// can discover and edit every setting.
 const DEFAULTS_TOML: &str = include_str!("../defaults.toml");
@@ -439,6 +586,9 @@ pub struct Settings {
     /// Thumbnail cache settings.
     #[serde(default)]
     pub thumbnails: ThumbnailSettings,
+    /// Stack detection settings.
+    #[serde(default)]
+    pub stacks: StackSettings,
 }
 
 impl Settings {
@@ -490,7 +640,13 @@ impl Settings {
                 DEFAULTS_TOML.to_owned()
             }
         };
-        let mut settings: Self = toml::from_str(&contents).unwrap_or_default();
+        let mut settings: Self = match toml::from_str(&contents) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("maple: failed to parse settings.toml: {e}\nFalling back to defaults.");
+                Self::default()
+            }
+        };
         settings.fill_empty_paths();
         settings
     }
@@ -524,6 +680,7 @@ impl Default for Settings {
             collections: CollectionSettings::default(),
             semantic: SemanticSettings::default(),
             thumbnails: ThumbnailSettings::default(),
+            stacks: StackSettings::default(),
         }
     }
 }

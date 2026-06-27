@@ -41,7 +41,12 @@ pub fn build_window(app: &adw::Application) -> adw::ApplicationWindow {
 
     // Start the background library scanner immediately so the DB stays
     // in sync with the library directory from the moment the app launches.
-    maple_db::LibraryScanner::new(db.clone(), settings.library_dir, Some(cache.clone())).spawn();
+    maple_db::LibraryScanner::new(db.clone(), settings.library_dir.clone(), Some(cache.clone())).spawn();
+
+    // Start the background hasher if stack detection is enabled.
+    if settings.stacks.enabled {
+        maple_db::spawn_hasher(db.clone(), settings.stacks.clone());
+    }
 
     let toast_overlay = adw::ToastOverlay::new();
     let nav_view = adw::NavigationView::new();

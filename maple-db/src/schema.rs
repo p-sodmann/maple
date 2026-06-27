@@ -9,6 +9,8 @@
 //!   5 → 6 : collections + collection_images tables
 //!   6 → 7 : sentence_embeddings + semantic_meta + vec_sentences (sqlite-vec)
 //!   7 → 8 : skipped column on face_detections (remember skipped faces)
+//!   8 → 9 : stacks table + stack_id column on images (burst/similar grouping)
+//!   9 → 10: image_hashes table (algorithm-keyed perceptual/embedding hashes)
 
 use rusqlite::Connection;
 
@@ -237,6 +239,56 @@ pub(crate) fn vec_table_ddl(dim: i64) -> String {
 const V8_COLUMN: &str =
     "ALTER TABLE face_detections ADD COLUMN skipped INTEGER NOT NULL DEFAULT 0";
 
+// ── V9: stacks ───────────────────────────────────────────────────
+//
+// A stack groups near-identical or semantically similar shots (burst, bracketed
+// exposures, etc.) so the library grid can display them as a single tile with a
+// count badge.  Each row in `stacks` is a named group; images reference it via
+// `stack_id`.  The relationship is one-to-many: an image belongs to at most one
+// stack, but a stack can contain many images.
+
+const V9: &str = "
+    CREATE TABLE IF NOT EXISTS stacks (
+        id         INTEGER PRIMARY KEY,
+        created_at INTEGER NOT NULL
+    );
+";
+
+const V9_COLUMN: &str =
+    "ALTER TABLE images ADD COLUMN stack_id INTEGER REFERENCES stacks(id) ON DELETE SET NULL";
+
+const V9_INDEX: &str =
+    "CREATE INDEX IF NOT EXISTS idx_images_stack_id ON images(stack_id)";
+
+// ── V10: image_hashes ────────────────────────────────────────────
+//
+// Stores a perceptual hash or dense embedding for each image, keyed by an
+// algorithm string that encodes both the method and its parameters (e.g.
+// "phash:8" or "onnx:facebook/dinov2-with-registers-base").
+//
+// When the active algorithm changes (settings.toml edit), the key changes and
+// old rows are ignored.  The background hasher fills in the new rows
+// automatically.  Old rows from unused algorithms are left in place (harmless)
+// and may be cleaned up by a future migration.
+//
+// `hash_blob` encoding:
+//   phash  — ImageHash bytes (image_hasher::ImageHash::as_bytes())
+//   onnx   — Vec<f32> as little-endian bytes (same layout as face embeddings)
+
+const V10: &str = "
+    CREATE TABLE IF NOT EXISTS image_hashes (
+        id          INTEGER PRIMARY KEY,
+        image_id    INTEGER NOT NULL REFERENCES images(id) ON DELETE CASCADE,
+        algorithm   TEXT    NOT NULL,
+        hash_blob   BLOB    NOT NULL,
+        created_at  INTEGER NOT NULL
+    );
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_image_hashes_image_alg
+        ON image_hashes(image_id, algorithm);
+    CREATE INDEX IF NOT EXISTS idx_image_hashes_algorithm
+        ON image_hashes(algorithm);
+";
+
 // ── Migration runner ─────────────────────────────────────────────
 
 /// Apply all pending schema migrations to `conn`.
@@ -309,6 +361,22 @@ pub fn ensure_schema(conn: &Connection) -> anyhow::Result<()> {
             }
         }
         conn.execute_batch("PRAGMA user_version = 8")?;
+    }
+
+    if version < 9 {
+        conn.execute_batch(V9)?;
+        if let Err(e) = conn.execute_batch(V9_COLUMN) {
+            if !e.to_string().to_lowercase().contains("duplicate column") {
+                return Err(e.into());
+            }
+        }
+        conn.execute_batch(V9_INDEX)?;
+        conn.execute_batch("PRAGMA user_version = 9")?;
+    }
+
+    if version < 10 {
+        conn.execute_batch(V10)?;
+        conn.execute_batch("PRAGMA user_version = 10")?;
     }
 
     Ok(())

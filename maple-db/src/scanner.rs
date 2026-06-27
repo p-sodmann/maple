@@ -1,24 +1,29 @@
 //! Background library scanner.
 //!
-//! Runs in a dedicated OS thread and wakes up every `SCAN_INTERVAL` seconds
-//! to reconcile the on-disk state of the library directory with the database:
+//! Runs in a dedicated OS thread and wakes up every [`SCAN_INTERVAL`] seconds
+//! to reconcile the library directory with the database:
 //!
 //! * Files in the DB that no longer exist on disk → marked `missing`.
-//! * Files that are `missing` in the DB but have reappeared → marked `present`.
-//! * Image groups found on disk that have no DB record → hashed and inserted
-//!   (one row per group, with `raw_path` set for any companion raw file).
+//! * Files marked `missing` that have reappeared → marked `present`.
+//! * Image groups found on disk that have no DB record → hashed and inserted.
+//!
+//! The scan uses [`scan_grouped_excluding`] so that application-internal
+//! subdirectories (`aligned_faces`, `.thumbcache`, any hidden dir) are never
+//! accidentally ingested as user photos.
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use maple_import::{content_hash, scan_grouped};
+use maple_import::{content_hash, scan_grouped_excluding};
 
 use crate::{Database, ImageStatus, ThumbnailCache};
 
-/// How long the scanner sleeps between reconciliation passes.
 const SCAN_INTERVAL: Duration = Duration::from_secs(60);
+
+/// Subdirectory names inside `library_dir` that the scanner never ingests.
+const EXCLUDED_DIRS: &[&str] = &["aligned_faces", ".thumbcache"];
 
 pub struct LibraryScanner {
     db: Arc<Mutex<Database>>,
@@ -35,10 +40,6 @@ impl LibraryScanner {
         Self { db, library_dir, cache }
     }
 
-    /// Spawn the scanner as a background thread.
-    ///
-    /// The thread sleeps for `SCAN_INTERVAL` between passes and is
-    /// automatically killed when the process exits.
     pub fn spawn(self) {
         std::thread::Builder::new()
             .name("maple-library-scanner".into())
@@ -70,18 +71,16 @@ impl LibraryScanner {
         // ── 1. Load all DB records ───────────────────────────────
         let db_records: Vec<(PathBuf, ImageStatus, Option<[u8; 32]>)> =
             crate::lock_db(&self.db).all_paths().unwrap_or_default();
-        // Build a set of all display paths known to the DB.
         let db_path_set: HashSet<&PathBuf> = db_records.iter().map(|(p, _, _)| p).collect();
 
-        // ── 2. Scan the library directory on disk (grouped) ───────
-        let groups = match scan_grouped(dir) {
+        // ── 2. Scan library directory, skipping internal subdirs ──
+        let groups = match scan_grouped_excluding(dir, EXCLUDED_DIRS) {
             Ok(g) => g,
             Err(e) => {
                 tracing::warn!("Library scan error scanning {}: {e}", dir.display());
                 return;
             }
         };
-        // Map display_path → (size, optional raw_path) for quick lookup.
         let found_map: HashMap<PathBuf, (u64, Option<PathBuf>)> = groups
             .into_iter()
             .map(|g| {
@@ -96,7 +95,6 @@ impl LibraryScanner {
             match (on_disk, status) {
                 (false, ImageStatus::Present) => {
                     tracing::info!("Library scan: marking missing {}", path.display());
-                    // Evict the thumbnail from cache before marking missing.
                     if let (Some(cache), Some(hash)) = (&self.cache, hash) {
                         if let Err(e) = cache.remove(hash) {
                             tracing::warn!(
@@ -106,20 +104,26 @@ impl LibraryScanner {
                         }
                     }
                     if let Err(e) = crate::lock_db(&self.db).mark_missing(path) {
-                        tracing::warn!("Library scan: failed to mark missing {}: {e}", path.display());
+                        tracing::warn!(
+                            "Library scan: failed to mark missing {}: {e}",
+                            path.display()
+                        );
                     }
                 }
                 (true, ImageStatus::Missing) => {
                     tracing::info!("Library scan: marking present {}", path.display());
                     if let Err(e) = crate::lock_db(&self.db).mark_present(path) {
-                        tracing::warn!("Library scan: failed to mark present {}: {e}", path.display());
+                        tracing::warn!(
+                            "Library scan: failed to mark present {}: {e}",
+                            path.display()
+                        );
                     }
                 }
-                _ => {} // already consistent
+                _ => {}
             }
         }
 
-        // ── 4. Insert newly discovered groups ────────────────────
+        // ── 4. Insert newly discovered groups ─────────────────────
         let mut inserted = 0usize;
         for (display_path, (size, raw_path)) in &found_map {
             if db_path_set.contains(display_path) {

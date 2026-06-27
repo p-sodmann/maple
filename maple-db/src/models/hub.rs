@@ -53,3 +53,31 @@ pub fn fetch_sentence_model(
     );
     Ok((onnx_path, tokenizer_path))
 }
+
+/// Download (or reuse the cached copy of) a single ONNX vision model file.
+///
+/// - `repo` — HuggingFace repo id, e.g. `"facebook/dinov2-with-registers-base"`.
+/// - `onnx_file` — model path within the repo, e.g. `"onnx/model.onnx"`.
+///
+/// Returns the local path to the cached ONNX file.  This is a blocking network
+/// call; run it on a background thread.
+pub fn fetch_image_model(repo: &str, onnx_file: &str) -> Result<PathBuf> {
+    let cache_dir = maple_state::config_dir().join("models");
+    std::fs::create_dir_all(&cache_dir).ok();
+
+    info!(repo, "fetching image embedding model from HuggingFace Hub…");
+
+    let api = ApiBuilder::new()
+        .with_cache_dir(cache_dir)
+        .build()
+        .context("building HuggingFace Hub API client")?;
+
+    let model = api.model(repo.to_string());
+
+    let onnx_path = model
+        .get(onnx_file)
+        .with_context(|| format!("downloading {repo}/{onnx_file}"))?;
+
+    info!(onnx = %onnx_path.display(), "image embedding model ready");
+    Ok(onnx_path)
+}

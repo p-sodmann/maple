@@ -753,6 +753,8 @@ fn build_browser_page_impl(
                             // Insert successfully copied files into the library DB.
                             // Only display files get a DB row; raw companions are
                             // stored as `raw_path` on the display row.
+                            // Also collect dest paths so the stacker can resolve IDs.
+                            let mut inserted_display_paths: Vec<PathBuf> = Vec::new();
                             if let Ok(db_guard) = db.lock() {
                                 // First pass: collect dest paths for raw companions
                                 // keyed by display_hash so we can attach them.
@@ -792,10 +794,16 @@ fn build_browser_page_impl(
                                                 "Failed to insert {} into library DB: {e}",
                                                 dest_path.display()
                                             );
+                                        } else {
+                                            inserted_display_paths.push(dest_path.clone());
                                         }
                                     }
                                 }
                             }
+
+                            // Stack detection is handled by the background hasher which
+                            // picks up newly inserted images automatically — no inline
+                            // spawn needed here.
 
                             // Mark copied images as imported and persist.
                             {

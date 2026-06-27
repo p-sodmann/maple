@@ -92,6 +92,54 @@ quality = 80
 # Changing this clears the thumbnail cache automatically.
 size = 200
 
+# ── Stack detection ─────────────────────────────────────────────
+# After each import batch, newly copied images are compared and similar shots
+# are grouped into stacks.  The library shows each stack as one tile with a
+# count badge so burst duplicates don't clutter the grid.
+
+[stacks]
+# Whether stack detection runs automatically after each import batch.
+enabled = false
+
+# Similarity algorithm:
+#   "phash" — perceptual hash (DCT-based, fast, no models needed).
+#             Best for detecting near-identical / burst duplicates.
+#   "onnx"  — dense vision embedding (e.g. DINOv2).  Slower but captures
+#             semantic similarity across different exposures / compositions.
+mode = "phash"
+
+# Similarity threshold (0.0–1.0).  Images ≥ this value are stacked together.
+#   pHash:  fraction of hash bits that agree (0.90 = at most 6/64 bits differ).
+#   ONNX:   cosine similarity of the image embeddings.
+threshold = 0.90
+
+# pHash hash size (only for mode = "phash").
+# 8 → 8×8 = 64-bit hash.  Larger = more discriminating, slightly slower.
+hash_size = 8
+
+# ── ONNX mode settings (ignored when mode = "phash") ────────────
+
+# HuggingFace repo id of the ONNX vision model.
+# The repo must contain an ONNX export at the path given by onnx_file.
+# e.g. "facebook/dinov2-with-registers-base" (requires ONNX export from Optimum)
+model_repo = "facebook/dinov2-with-registers-base"
+
+# Path of the ONNX file within the repo.
+onnx_file = "onnx/model.onnx"
+
+# Resize so the shortest edge equals this value, then center-crop to image_size.
+# Should match the model's preprocessing config (BitImageProcessor defaults).
+shortest_edge = 256
+image_size = 224
+
+# ImageNet normalisation parameters (match the model's preprocessor_config.json).
+image_mean = [0.485, 0.456, 0.406]
+image_std  = [0.229, 0.224, 0.225]
+
+# Execution device for ONNX inference.
+# Accepts: "cpu" (default), "cuda:N" (NVIDIA GPU), "tensorrt:N".
+device = "cpu"
+
 # ── Semantic search ─────────────────────────────────────────────
 # Encodes each sentence of every AI description into a vector with a
 # sentence-transformer and stores it in a sqlite-vec table.  Search then ranks

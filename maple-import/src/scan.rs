@@ -85,7 +85,7 @@ impl ImageGroup {
 pub fn scan_images(root: &Path) -> anyhow::Result<Vec<ImageFile>> {
     anyhow::ensure!(root.is_dir(), "{} is not a directory", root.display());
     let mut results = Vec::new();
-    scan_dir(root, &mut results)?;
+    scan_dir_excluding(root, &[], &mut results)?;
     results.sort_by(|a, b| a.path.cmp(&b.path));
     tracing::info!("Scanned {} images in {}", results.len(), root.display());
     Ok(results)
@@ -96,7 +96,23 @@ pub fn scan_images(root: &Path) -> anyhow::Result<Vec<ImageFile>> {
 /// For each group the preferred display file is a standard format (JPG/PNG);
 /// raw files become companions.  Groups are sorted by display path.
 pub fn scan_grouped(root: &Path) -> anyhow::Result<Vec<ImageGroup>> {
-    let files = scan_images(root)?;
+    scan_grouped_excluding(root, &[])
+}
+
+/// Like [`scan_grouped`] but skips any subdirectory whose name exactly matches
+/// one of `excluded_names`.
+///
+/// Use this when scanning a library directory that contains application-internal
+/// subdirectories (e.g. `aligned_faces`, `.thumbcache`) that should not be
+/// treated as user photos.
+pub fn scan_grouped_excluding(
+    root: &Path,
+    excluded_names: &[&str],
+) -> anyhow::Result<Vec<ImageGroup>> {
+    let mut files = Vec::new();
+    scan_dir_excluding(root, excluded_names, &mut files)?;
+    files.sort_by(|a, b| a.path.cmp(&b.path));
+    tracing::info!("Scanned {} images in {}", files.len(), root.display());
 
     // Key = (parent_dir, stem_lowercase).  BTreeMap keeps insertion order stable.
     let mut groups: BTreeMap<(PathBuf, String), Vec<ImageFile>> = BTreeMap::new();
@@ -137,7 +153,11 @@ pub fn scan_grouped(root: &Path) -> anyhow::Result<Vec<ImageGroup>> {
     Ok(result)
 }
 
-fn scan_dir(dir: &Path, out: &mut Vec<ImageFile>) -> anyhow::Result<()> {
+fn scan_dir_excluding(
+    dir: &Path,
+    excluded_names: &[&str],
+    out: &mut Vec<ImageFile>,
+) -> anyhow::Result<()> {
     let entries = match std::fs::read_dir(dir) {
         Ok(e) => e,
         Err(e) => {
@@ -152,7 +172,15 @@ fn scan_dir(dir: &Path, out: &mut Vec<ImageFile>) -> anyhow::Result<()> {
         let path = entry.path();
 
         if ft.is_dir() {
-            scan_dir(&path, out)?;
+            // Skip hidden directories and any explicitly excluded names.
+            let name = path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("");
+            if name.starts_with('.') || excluded_names.contains(&name) {
+                continue;
+            }
+            scan_dir_excluding(&path, excluded_names, out)?;
         } else if ft.is_file() && is_image(&path) {
             let size = entry.metadata().map(|m| m.len()).unwrap_or(0);
             out.push(ImageFile { path, size });

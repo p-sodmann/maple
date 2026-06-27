@@ -16,14 +16,18 @@ pub mod ai;
 pub mod collections;
 pub mod face_detector;
 pub mod faces;
+pub mod hasher;
 pub mod metadata;
 pub mod models;
 pub mod query;
 pub mod semantic;
+pub mod stacker;
 
 pub use ai::{spawn_ai_tagger, AiDescriber, AiTagger, LmStudioDescriber};
 pub use metadata::rotate_image_file;
 pub use collections::Collection;
+pub use hasher::spawn_hasher;
+pub use stacker::update_stacks;
 pub use face_detector::{spawn_face_tagger, DetectedFace, FaceDetector, FaceTagger};
 pub use faces::{best_person_match, best_person_matches, cosine_similarity, FaceDetection, Person};
 pub use metadata::{extract_metadata, spawn_metadata_filler, ImageMetadata};
@@ -32,7 +36,7 @@ pub use scanner::LibraryScanner;
 pub use thumb_cache::ThumbnailCache;
 pub use semantic::{spawn_sentence_embedder, split_sentences, SemanticEncoder, SentenceEmbedder};
 
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, OptionalExtension};
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -224,6 +228,107 @@ impl Database {
             ],
         )?;
         Ok(())
+    }
+
+    // ── Image hash operations ─────────────────────────────────────
+
+    /// Store a perceptual hash or embedding for `image_id` under `algorithm`.
+    /// Overwrites any existing row for the same `(image_id, algorithm)` pair.
+    pub fn insert_image_hash(
+        &self,
+        image_id: i64,
+        algorithm: &str,
+        hash_blob: &[u8],
+    ) -> anyhow::Result<()> {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as i64;
+        self.conn.execute(
+            "INSERT OR REPLACE INTO image_hashes (image_id, algorithm, hash_blob, created_at)
+             VALUES (?1, ?2, ?3, ?4)",
+            params![image_id, algorithm, hash_blob, now],
+        )?;
+        Ok(())
+    }
+
+    /// Return up to `limit` images that have no hash for `algorithm`.
+    /// Used by the background hasher to find pending work.
+    pub fn images_without_hash(
+        &self,
+        algorithm: &str,
+        limit: usize,
+    ) -> anyhow::Result<Vec<(i64, PathBuf)>> {
+        let mut stmt = self.conn.prepare_cached(
+            "SELECT id, path FROM images
+             WHERE status = 'present'
+               AND id NOT IN (
+                   SELECT image_id FROM image_hashes WHERE algorithm = ?1
+               )
+             LIMIT ?2",
+        )?;
+        let rows = stmt
+            .query_map(params![algorithm, limit as i64], |r| {
+                Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?))
+            })?
+            .filter_map(|r| {
+                r.ok().map(|(id, path)| (id, PathBuf::from(path)))
+            })
+            .collect();
+        Ok(rows)
+    }
+
+    /// Return all `(image_id, hash_blob)` rows for `algorithm`.
+    /// Used by the stacker to compare all hashed images.
+    pub fn images_with_hash(
+        &self,
+        algorithm: &str,
+    ) -> anyhow::Result<Vec<(i64, Vec<u8>)>> {
+        let mut stmt = self.conn.prepare_cached(
+            "SELECT image_id, hash_blob FROM image_hashes WHERE algorithm = ?1",
+        )?;
+        let rows = stmt
+            .query_map(params![algorithm], |r| {
+                Ok((r.get::<_, i64>(0)?, r.get::<_, Vec<u8>>(1)?))
+            })?
+            .filter_map(|r| r.ok())
+            .collect();
+        Ok(rows)
+    }
+
+    // ── Stack operations ─────────────────────────────────────────
+
+    /// Create a new stack and return its id.
+    pub fn create_stack(&self) -> anyhow::Result<i64> {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as i64;
+        self.conn.execute(
+            "INSERT INTO stacks (created_at) VALUES (?1)",
+            params![now],
+        )?;
+        Ok(self.conn.last_insert_rowid())
+    }
+
+    /// Assign `image_id` to `stack_id`.  Pass `None` to remove from any stack.
+    pub fn set_image_stack(&self, image_id: i64, stack_id: Option<i64>) -> anyhow::Result<()> {
+        self.conn.execute(
+            "UPDATE images SET stack_id = ?1 WHERE id = ?2",
+            params![stack_id, image_id],
+        )?;
+        Ok(())
+    }
+
+    /// Return the DB row id for an image by file path, or `None` if not found.
+    pub fn image_id_for_path(&self, path: &Path) -> anyhow::Result<Option<i64>> {
+        let mut stmt = self
+            .conn
+            .prepare_cached("SELECT id FROM images WHERE path = ?1")?;
+        let id = stmt
+            .query_row(params![path.to_string_lossy().as_ref()], |r| r.get(0))
+            .optional()?;
+        Ok(id)
     }
 
     /// Set the raw companion path on an existing image record.

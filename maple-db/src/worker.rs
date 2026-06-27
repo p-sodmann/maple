@@ -26,6 +26,10 @@ impl WorkerHandle {
     pub fn stop(&self) {
         let _ = self.stop_tx.send(());
     }
+
+    pub(crate) fn from_sync_sender(stop_tx: mpsc::SyncSender<()>) -> Self {
+        Self { stop_tx }
+    }
 }
 
 /// Spawn a background worker thread that polls the database for work.
