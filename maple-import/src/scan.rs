@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use crate::image_source::is_raw_format;
 
 /// Supported image file extensions.
-const IMAGE_EXTENSIONS: &[&str] = &["jpg", "jpeg", "png", "raf"];
+const IMAGE_EXTENSIONS: &[&str] = &["jpg", "jpeg", "png", "raf", "cr2", "cr3"];
 
 /// Metadata about a discovered image file.
 #[derive(Debug, Clone)]

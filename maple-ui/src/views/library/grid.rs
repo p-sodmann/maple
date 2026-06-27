@@ -30,6 +30,7 @@ use gtk4::glib;
 use gtk4::prelude::*;
 
 use maple_db::{LibraryImage, SearchHit, SearchQuery, ThumbnailCache};
+use maple_import::raw_preview_supported;
 
 use crate::thumbnail;
 
@@ -46,6 +47,10 @@ enum GridMsg {
         rgb: Vec<u8>,
         width: u32,
         height: u32,
+    },
+    /// Format recognised but preview extraction not yet implemented.
+    Unsupported {
+        index: usize,
     },
     /// All thumbnails have been generated.
     Done,
@@ -185,6 +190,9 @@ impl LibraryGrid {
                                         "Thumbnail failed for {}: {e}",
                                         rec.path.display()
                                     );
+                                    if !raw_preview_supported(&rec.path) {
+                                        let _ = tx.send(GridMsg::Unsupported { index });
+                                    }
                                 }
                             }
                         }
@@ -242,6 +250,21 @@ impl LibraryGrid {
                                 let name = rec.meta.filename.as_deref().unwrap_or("?");
                                 child.set_child(Some(&build_cell(
                                     &texture,
+                                    name,
+                                    rec.search_hit.as_ref(),
+                                    rec.stack_size,
+                                    px,
+                                )));
+                            }
+                        }
+                    }
+
+                    GridMsg::Unsupported { index } => {
+                        if let Some(child) = flow_box.child_at_index(index as i32) {
+                            let records = records_ref.borrow();
+                            if let Some(rec) = records.get(index) {
+                                let name = rec.meta.filename.as_deref().unwrap_or("?");
+                                child.set_child(Some(&build_unsupported_cell(
                                     name,
                                     rec.search_hit.as_ref(),
                                     rec.stack_size,
@@ -321,6 +344,41 @@ fn build_placeholder(
         .css_classes(["maple-placeholder"])
         .build();
     frame.append(&spinner);
+
+    labeled_cell(&frame, name, search_hit, stack_size)
+}
+
+fn build_unsupported_cell(
+    name: &str,
+    search_hit: Option<&SearchHit>,
+    stack_size: Option<usize>,
+    px: u32,
+) -> gtk4::Box {
+    let icon = gtk4::Image::from_icon_name("image-missing-symbolic");
+    icon.set_pixel_size(32);
+    icon.set_halign(gtk4::Align::Center);
+    icon.set_valign(gtk4::Align::End);
+    icon.set_hexpand(true);
+    icon.set_vexpand(true);
+
+    let label = gtk4::Label::new(Some("Format not yet supported"));
+    label.set_halign(gtk4::Align::Center);
+    label.set_valign(gtk4::Align::Start);
+    label.set_wrap(true);
+    label.set_justify(gtk4::Justification::Center);
+    label.add_css_class("maple-unsupported-label");
+
+    let frame = gtk4::Box::builder()
+        .orientation(gtk4::Orientation::Vertical)
+        .spacing(4)
+        .width_request(px as i32)
+        .height_request(px as i32)
+        .hexpand(true)
+        .vexpand(true)
+        .css_classes(["maple-placeholder"])
+        .build();
+    frame.append(&icon);
+    frame.append(&label);
 
     labeled_cell(&frame, name, search_hit, stack_size)
 }

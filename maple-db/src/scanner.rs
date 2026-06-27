@@ -18,6 +18,8 @@ use std::time::Duration;
 
 use maple_import::{content_hash, scan_grouped_excluding};
 
+use maple_import::ImageGroup;
+
 use crate::{Database, ImageStatus, ThumbnailCache};
 
 const SCAN_INTERVAL: Duration = Duration::from_secs(60);
@@ -81,13 +83,8 @@ impl LibraryScanner {
                 return;
             }
         };
-        let found_map: HashMap<PathBuf, (u64, Option<PathBuf>)> = groups
-            .into_iter()
-            .map(|g| {
-                let raw = g.companions.first().map(|c| c.path.clone());
-                (g.display.path, (g.display.size, raw))
-            })
-            .collect();
+        let found_map: HashMap<PathBuf, (u64, Option<PathBuf>)> =
+            groups.into_iter().map(group_map_entry).collect();
 
         // ── 3. Reconcile DB records against disk ─────────────────
         for (path, status, hash) in &db_records {
@@ -161,5 +158,73 @@ impl LibraryScanner {
             found_map.len(),
             inserted,
         );
+    }
+}
+
+/// Convert an [`ImageGroup`] into the `(display_path, (size, raw_path))` entry
+/// used in the scanner's `found_map`.
+///
+/// Only the first companion is stored in `raw_path` — the DB schema currently
+/// has a single `raw_path TEXT` column.  When more than one companion is present
+/// a warning is emitted so the data loss is never silent.  A schema migration
+/// (separate `companions` table) will be needed before multi-companion support
+/// (XMP sidecars, DNG+JPG) can land.
+fn group_map_entry(g: ImageGroup) -> (PathBuf, (u64, Option<PathBuf>)) {
+    if g.companions.len() > 1 {
+        tracing::warn!(
+            "{} has {} companions; only '{}' will be stored as raw_path — \
+             remaining companions are dropped (schema supports one companion per image)",
+            g.display.path.display(),
+            g.companions.len(),
+            g.companions[0].path.display(),
+        );
+    }
+    let raw = g.companions.into_iter().next().map(|c| c.path);
+    (g.display.path, (g.display.size, raw))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use maple_import::ImageFile;
+
+    fn img(path: &str) -> ImageFile {
+        ImageFile { path: PathBuf::from(path), size: 42 }
+    }
+
+    #[test]
+    fn map_entry_no_companions() {
+        let g = ImageGroup {
+            display: img("/lib/DSCF0001.JPG"),
+            companions: vec![],
+        };
+        let (path, (size, raw)) = group_map_entry(g);
+        assert_eq!(path, PathBuf::from("/lib/DSCF0001.JPG"));
+        assert_eq!(size, 42);
+        assert!(raw.is_none());
+    }
+
+    #[test]
+    fn map_entry_one_companion_stored() {
+        let g = ImageGroup {
+            display: img("/lib/DSCF0001.JPG"),
+            companions: vec![img("/lib/DSCF0001.RAF")],
+        };
+        let (_, (_, raw)) = group_map_entry(g);
+        assert_eq!(raw, Some(PathBuf::from("/lib/DSCF0001.RAF")));
+    }
+
+    #[test]
+    fn map_entry_multiple_companions_keeps_first() {
+        // Current schema supports only one companion per image.  The first
+        // companion is kept; extras are dropped with a warning.  This test
+        // pins the current behavior so any future multi-companion schema
+        // change is deliberate.
+        let g = ImageGroup {
+            display: img("/lib/DSCF0001.JPG"),
+            companions: vec![img("/lib/DSCF0001.RAF"), img("/lib/DSCF0001.XMP")],
+        };
+        let (_, (_, raw)) = group_map_entry(g);
+        assert_eq!(raw, Some(PathBuf::from("/lib/DSCF0001.RAF")));
     }
 }
