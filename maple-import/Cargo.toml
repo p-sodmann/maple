@@ -9,6 +9,7 @@ tokio = { workspace = true }
 blake3 = { workspace = true }
 image = { workspace = true }
 image_hasher = { workspace = true }
+zune-jpeg = { workspace = true }
 anyhow = { workspace = true }
 tracing = { workspace = true }
 kamadak-exif = { workspace = true }

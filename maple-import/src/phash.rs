@@ -1,7 +1,7 @@
 //! Perceptual hashing for stack / near-duplicate detection.
 //!
 //! Wraps `image_hasher` to compute a DCT-based pHash for any image that
-//! Maple can load (including raw files via `loadable_image_bytes`).
+//! Maple can load (including raw files via [`crate::decode_image`]).
 //!
 //! The returned [`ImageHash`] is opaque; use [`phash_similarity`] to convert
 //! a pairwise Hamming distance into a normalised [0, 1] similarity score.
@@ -14,19 +14,14 @@ use image_hasher::{HashAlg, HasherConfig};
 
 /// Compute a pHash for the image at `path`.
 ///
-/// Raw files (RAF, etc.) are handled transparently via
-/// [`loadable_image_bytes`](crate::loadable_image_bytes).
+/// Raw files (RAF, etc.) are handled transparently via [`crate::decode_image`].
 ///
 /// `hash_size` controls the hash grid (default 8 → 8×8 = 64-bit hash).
 /// Larger values produce finer hashes at a small speed cost.
 pub fn compute_phash(path: &Path, hash_size: u32) -> Result<ImageHash> {
-    let bytes = crate::loadable_image_bytes(path)
-        .with_context(|| format!("reading image for pHash: {}", path.display()))?;
+    let img = crate::decode_image(path)
+        .with_context(|| format!("loading image for pHash: {}", path.display()))?;
 
-    let img = image::load_from_memory(&bytes)
-        .with_context(|| format!("decoding image for pHash: {}", path.display()))?;
-
-    // pHash: Median + DCT preprocessing (classic perceptual hash).
     let hasher = HasherConfig::new()
         .hash_alg(HashAlg::Median)
         .preproc_dct()

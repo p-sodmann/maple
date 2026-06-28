@@ -19,11 +19,10 @@ use maple_db::SearchQuery;
 
 slint::include_modules!();
 
+mod detail;
 mod grid;
-// Pure-Rust decode/thumbnail pipeline (no gdk-pixbuf). Some helpers are
-// consumed by views ported in later phases.
-#[allow(dead_code)]
-mod thumbnail;
+mod image_loader;
+pub mod thumbnail;
 
 use grid::LibraryGrid;
 
@@ -116,13 +115,15 @@ pub fn run() -> anyhow::Result<()> {
         }
     });
 
-    // Cell click → open detail window (ported in Phase 4; logs for now).
+    // Cell click → open the detail/lightbox window with a snapshot of the
+    // records the grid is currently showing (for prev/next navigation).
     window.on_library_activated({
         let records = grid.records();
+        let db = db.clone();
         move |idx| {
-            let records = records.borrow();
-            if let Some(rec) = records.get(idx as usize) {
-                tracing::info!("activated {} (detail window: Phase 4)", rec.path.display());
+            let snapshot = records.borrow().clone();
+            if (idx as usize) < snapshot.len() {
+                detail::open(snapshot, idx as usize, db.clone());
             }
         }
     });

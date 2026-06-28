@@ -1,0 +1,353 @@
+// Detail / lightbox window (Slint port of views/library/detail_window/*).
+//
+// A second top-level `Window` shown from Rust via `.show()` and held as a
+// thread-local singleton (see src/detail.rs). It presents one full-resolution
+// image over a dark photo surface with pointer-anchored scroll-zoom and
+// drag-to-pan, prev/next navigation through the records the grid was showing,
+// a toggleable one-line EXIF strip, and a collection-chips bar.
+//
+// ── Zoom / pan model ──────────────────────────────────────────────
+// Pan is handled natively by the `Flickable`: the image lives inside a
+// viewport sized to the displayed image (but never smaller than the visible
+// surface, so a fit-sized image stays centred). Zoom is a `zoom` factor
+// (1.0 = fit-to-window … 20.0). On every scroll tick we recompute the
+// viewport offset so the image pixel under the cursor stays put — the
+// Slint reimplementation of the anchor math in the old `zoom_pan.rs`.
+//
+// Slint's expression language has no local variables, so the anchor math is
+// expressed through small `pure function`s parameterised by the zoom factor.
+
+import { Theme } from "theme.slint";
+import { FlatButton } from "widgets.slint";
+
+// One collection membership chip (built in Rust from maple_db::Collection).
+export struct CollectionChip {
+    id: int,
+    name: string,
+    color: color,
+}
+
+export component DetailWindow inherits Window {
+    title: "Maple — Photo";
+    preferred-width: 960px;
+    preferred-height: 720px;
+    min-width: 480px;
+    min-height: 360px;
+    background: Theme.window-bg;
+    default-font-size: 14px;
+
+    // ── Data (set from Rust) ──────────────────────────────────────
+    in-out property <image> photo;
+    in property <int> img-w;          // native pixel size (post-orientation)
+    in property <int> img-h;
+    in property <string> filename;
+    in property <string> info-text;   // one-line EXIF summary (info_bar.rs)
+    in property <bool> loading;
+    in property <string> error-text;
+    in property <bool> is-fullscreen;
+    in property <[CollectionChip]> collection-chips;
+
+    // ── View state (UI-local) ─────────────────────────────────────
+    property <float> zoom: 1.0;
+    property <bool> show-info: true;
+    // Snapshots captured at the start of a scroll-zoom (no locals in callbacks).
+    property <float> prev-zoom: 1.0;
+    property <length> prev-ox: 0;
+    property <length> prev-oy: 0;
+
+    // ── Callbacks (wired in Rust) ─────────────────────────────────
+    callback prev;
+    callback next;
+    callback close-requested;
+    callback toggle-fullscreen;
+    callback open-external;
+    callback remove-collection(int);
+
+    // ── Geometry ──────────────────────────────────────────────────
+    property <length> view-w: surface.width;
+    property <length> view-h: surface.height;
+    // Screen length per image pixel at zoom == 1.0 (the "fit" scale).
+    property <float> fit-scale: (root.img-w <= 0 || root.img-h <= 0)
+        ? 1.0
+        : min(root.view-w / (root.img-w * 1px), root.view-h / (root.img-h * 1px));
+    property <length> disp-w: root.img-w * 1px * root.fit-scale * root.zoom;
+    property <length> disp-h: root.img-h * 1px * root.fit-scale * root.zoom;
+    // Viewport never smaller than the surface, so a fit image stays centred.
+    property <length> vp-w: max(root.view-w, root.disp-w);
+    property <length> vp-h: max(root.view-h, root.disp-h);
+
+    // Screen length per image pixel at zoom factor `z`.
+    pure function ppx-for(z: float) -> float {
+        return root.fit-scale * z;
+    }
+    pure function disp-w-for(z: float) -> length {
+        return root.img-w * 1px * root.fit-scale * z;
+    }
+    pure function disp-h-for(z: float) -> length {
+        return root.img-h * 1px * root.fit-scale * z;
+    }
+    // Centring offset of the image inside the viewport at zoom `z`.
+    pure function img-left-for(z: float) -> length {
+        return (max(root.view-w, disp-w-for(z)) - disp-w-for(z)) / 2;
+    }
+    pure function img-top-for(z: float) -> length {
+        return (max(root.view-h, disp-h-for(z)) - disp-h-for(z)) / 2;
+    }
+    // New viewport-x/y that keeps the image pixel under the cursor fixed.
+    // `m` is the cursor position in viewport coords; `o0` the viewport offset
+    // before the zoom; `z0`/`z1` the old/new zoom factors.
+    pure function anchored-ox(m: length, z0: float, z1: float, o0: length) -> length {
+        return m + o0 - (img-left-for(z1)
+            + (m - img-left-for(z0)) * (ppx-for(z1) / ppx-for(z0)));
+    }
+    pure function anchored-oy(m: length, z0: float, z1: float, o0: length) -> length {
+        return m + o0 - (img-top-for(z1)
+            + (m - img-top-for(z0)) * (ppx-for(z1) / ppx-for(z0)));
+    }
+    pure function stepped-zoom(delta: length) -> float {
+        // winit reports wheel-up as a positive delta-y; wheel-up zooms in.
+        return clamp(delta > 0 ? root.zoom * 1.15 : root.zoom / 1.15, 1.0, 20.0);
+    }
+
+    // Reset to fit-to-window. Called from Rust after each image load and on
+    // double-click.
+    public function reset-view() {
+        root.zoom = 1.0;
+        flick.viewport-x = 0;
+        flick.viewport-y = 0;
+    }
+
+    init => {
+        key-scope.focus();
+    }
+
+    key-scope := FocusScope {
+        width: 100%;
+        height: 100%;
+
+        key-pressed(event) => {
+            if event.text == Key.Escape {
+                root.close-requested();
+                return accept;
+            }
+            if event.text == Key.LeftArrow || event.text == Key.UpArrow {
+                root.prev();
+                return accept;
+            }
+            if event.text == Key.RightArrow || event.text == Key.DownArrow {
+                root.next();
+                return accept;
+            }
+            return reject;
+        }
+
+        VerticalLayout {
+            width: 100%;
+            height: 100%;
+
+            // ── Header ────────────────────────────────────────────
+            Rectangle {
+                height: 46px;
+                background: Theme.sidebar-bg;
+                HorizontalLayout {
+                    padding-left: 8px;
+                    padding-right: 8px;
+                    padding-top: 6px;
+                    padding-bottom: 6px;
+                    spacing: 6px;
+
+                    FlatButton {
+                        text: "‹ Prev";
+                        clicked => { root.prev(); }
+                    }
+                    FlatButton {
+                        text: "Next ›";
+                        clicked => { root.next(); }
+                    }
+                    Rectangle {
+                        horizontal-stretch: 1;
+                        Text {
+                            text: root.filename;
+                            color: Theme.fg;
+                            font-size: 14px;
+                            font-weight: 600;
+                            overflow: elide;
+                            horizontal-alignment: center;
+                            vertical-alignment: center;
+                        }
+                    }
+                    FlatButton {
+                        text: root.show-info ? "Hide Info" : "Info";
+                        clicked => { root.show-info = !root.show-info; }
+                    }
+                    FlatButton {
+                        text: "Open";
+                        clicked => { root.open-external(); }
+                    }
+                    FlatButton {
+                        text: root.is-fullscreen ? "Windowed" : "Fullscreen";
+                        clicked => { root.toggle-fullscreen(); }
+                    }
+                    FlatButton {
+                        text: "✕ Close";
+                        clicked => { root.close-requested(); }
+                    }
+                }
+            }
+
+            // ── One-line EXIF strip (info_bar.rs) ─────────────────
+            if root.show-info && root.info-text != "": Rectangle {
+                height: 26px;
+                background: Theme.card-bg;
+                Text {
+                    text: root.info-text;
+                    color: Theme.dim-fg;
+                    font-size: 12px;
+                    overflow: elide;
+                    horizontal-alignment: center;
+                    vertical-alignment: center;
+                }
+            }
+
+            // ── Photo surface (zoom + pan) ────────────────────────
+            surface := Rectangle {
+                vertical-stretch: 1;
+                clip: true;
+                background: Theme.photo-surface;
+
+                flick := Flickable {
+                    width: 100%;
+                    height: 100%;
+                    viewport-width: root.vp-w;
+                    viewport-height: root.vp-h;
+                    // Disable native wheel-scroll; the zoom-area below owns the
+                    // wheel. Drag-to-pan stays active.
+                    interactive: root.zoom > 1.0;
+
+                    Image {
+                        x: (root.vp-w - root.disp-w) / 2;
+                        y: (root.vp-h - root.disp-h) / 2;
+                        width: root.disp-w;
+                        height: root.disp-h;
+                        source: root.photo;
+                        // Box matches the image aspect exactly, so `fill` never
+                        // distorts and guarantees the box == the drawn pixels
+                        // (the anchor math depends on that).
+                        image-fit: fill;
+                    }
+
+                    zoom-area := TouchArea {
+                        width: root.vp-w;
+                        height: root.vp-h;
+
+                        scroll-event(event) => {
+                            if root.img-w <= 0 || root.img-h <= 0 {
+                                return accept;
+                            }
+                            // Snapshot pre-zoom state (no locals in callbacks).
+                            root.prev-zoom = root.zoom;
+                            root.prev-ox = flick.viewport-x;
+                            root.prev-oy = flick.viewport-y;
+                            // Apply the new zoom first so the viewport resizes,
+                            // then re-anchor the offsets from the snapshot.
+                            root.zoom = stepped-zoom(event.delta-y);
+                            flick.viewport-x = anchored-ox(self.mouse-x, root.prev-zoom, root.zoom, root.prev-ox);
+                            flick.viewport-y = anchored-oy(self.mouse-y, root.prev-zoom, root.zoom, root.prev-oy);
+                            return accept;
+                        }
+
+                        double-clicked => {
+                            root.reset-view();
+                        }
+                    }
+                }
+
+                // Loading / error overlays over the photo.
+                if root.loading: Rectangle {
+                    Text {
+                        text: "Loading…";
+                        color: Theme.dim-fg;
+                        font-size: 16px;
+                        horizontal-alignment: center;
+                        vertical-alignment: center;
+                    }
+                }
+                if !root.loading && root.error-text != "": Rectangle {
+                    Text {
+                        text: root.error-text;
+                        color: #ff6b6b;
+                        font-size: 14px;
+                        wrap: word-wrap;
+                        horizontal-alignment: center;
+                        vertical-alignment: center;
+                    }
+                }
+            }
+
+            // ── Collection chips bar ──────────────────────────────
+            Rectangle {
+                height: 40px;
+                background: Theme.sidebar-bg;
+                HorizontalLayout {
+                    padding-left: 10px;
+                    padding-right: 10px;
+                    spacing: 8px;
+                    alignment: start;
+
+                    Text {
+                        text: "Collections";
+                        color: Theme.dim-fg;
+                        font-size: 12px;
+                        vertical-alignment: center;
+                    }
+
+                    for chip[i] in root.collection-chips: Rectangle {
+                        height: 24px;
+                        border-radius: 12px;
+                        background: Theme.card-bg;
+                        HorizontalLayout {
+                            spacing: 5px;
+                            padding-left: 8px;
+                            padding-right: 6px;
+                            VerticalLayout {
+                                alignment: center;
+                                Rectangle {
+                                    width: 10px;
+                                    height: 10px;
+                                    border-radius: 5px;
+                                    background: chip.color;
+                                }
+                            }
+                            Text {
+                                text: chip.name;
+                                color: Theme.fg;
+                                font-size: 12px;
+                                vertical-alignment: center;
+                            }
+                            rmv := TouchArea {
+                                width: 16px;
+                                Text {
+                                    text: "✕";
+                                    font-size: 11px;
+                                    color: rmv.has-hover ? #ff6b6b : Theme.dim-fg;
+                                    horizontal-alignment: center;
+                                    vertical-alignment: center;
+                                }
+                                clicked => { root.remove-collection(chip.id); }
+                            }
+                        }
+                    }
+
+                    if root.collection-chips.length == 0: Text {
+                        text: "None";
+                        color: Theme.dim-fg;
+                        font-size: 12px;
+                        vertical-alignment: center;
+                    }
+
+                    Rectangle { horizontal-stretch: 1; }
+                }
+            }
+        }
+    }
+}

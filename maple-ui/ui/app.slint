@@ -8,8 +8,11 @@ import { Theme } from "theme.slint";
 import { FlatButton } from "widgets.slint";
 import { HomePage } from "home.slint";
 import { LibraryPage, ThumbItem } from "library.slint";
+import { DetailWindow, CollectionChip } from "detail.slint";
 
-export { ThumbItem }
+// Re-export the detail window + its data structs so Rust can build & show the
+// second top-level window (see src/detail.rs).
+export { ThumbItem, DetailWindow, CollectionChip }
 
 export enum Page { home, library, import }
 

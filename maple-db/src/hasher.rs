@@ -19,7 +19,7 @@
 use std::sync::{mpsc, Arc, Mutex};
 use std::time::Duration;
 
-use maple_import::loadable_image_bytes;
+use maple_import::decode_image;
 use maple_state::{StackMode, StackSettings};
 use tracing::{info, warn};
 
@@ -189,9 +189,7 @@ fn load_image_for_hash(
             }
         }
     }
-    // Cache miss or no cache — decode full image.
-    let bytes = loadable_image_bytes(path)?;
-    Ok(image::load_from_memory(&bytes)?)
+    decode_image(path)
 }
 
 fn hash_phash(

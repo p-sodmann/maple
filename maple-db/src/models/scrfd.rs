@@ -22,12 +22,11 @@
 //!
 //! [`OnnxFaceDetector`]: super::detection::OnnxFaceDetector
 
-use std::io::Cursor;
 use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
-use image::{DynamicImage, ImageDecoder, ImageReader, RgbImage};
-use maple_import::{is_raw_format, loadable_image_bytes};
+use image::RgbImage;
+use maple_import::decode_image;
 use ndarray::{Array2, Array4, Axis};
 use tracing::{debug, info, warn};
 
@@ -269,25 +268,7 @@ unsafe impl Sync for ScrfdDetector {}
 // ── Image loading ──────────────────────────────────────────────────────────────
 
 fn load_rgb(path: &Path) -> Result<RgbImage> {
-    if is_raw_format(path) {
-        let bytes = loadable_image_bytes(path)?;
-        let reader = ImageReader::new(Cursor::new(bytes))
-            .with_guessed_format()
-            .context("guessing format for raw preview")?;
-        let mut decoder = reader.into_decoder().context("decoding image header")?;
-        let orientation = decoder.orientation().context("reading EXIF orientation")?;
-        let mut dyn_img = DynamicImage::from_decoder(decoder).context("decoding image")?;
-        dyn_img.apply_orientation(orientation);
-        Ok(dyn_img.to_rgb8())
-    } else {
-        let reader = ImageReader::open(path)
-            .with_context(|| format!("opening image: {}", path.display()))?;
-        let mut decoder = reader.into_decoder().context("decoding image header")?;
-        let orientation = decoder.orientation().context("reading EXIF orientation")?;
-        let mut dyn_img = DynamicImage::from_decoder(decoder).context("decoding image")?;
-        dyn_img.apply_orientation(orientation);
-        Ok(dyn_img.to_rgb8())
-    }
+    Ok(decode_image(path)?.into_rgb8())
 }
 
 // ── Preprocessing ──────────────────────────────────────────────────────────────
