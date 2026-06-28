@@ -2,21 +2,28 @@
 //!
 //! # Pipeline (cache miss)
 //!
-//! 1. Decode via gdk-pixbuf at 2× target size — JPEGs use DCT downscaling
-//!    inside libjpeg-turbo, keeping peak memory low for large files.
-//! 2. Apply EXIF orientation (`apply_embedded_orientation`).
-//! 3. Strip alpha and row-padding → tight RGB byte buffer.
+//! 1. Decode via the pure-Rust `image` crate (no system GTK / gdk-pixbuf).
+//! 2. Apply EXIF orientation (`apply_orientation`, driven by the file's — or, for
+//!    raw files, the embedded preview's — Orientation tag).
+//! 3. Convert to a tight RGB buffer.
 //! 4. `fast_image_resize` Lanczos3 → target dimensions.
 //! 5. Encode as lossy WebP at the configured quality.
 //!
 //! # Cache round-trip
 //!
 //! On a cache hit, `decode_webp_rgb` turns stored WebP bytes back into an RGB
-//! pixel buffer that the grid sends to GTK without going through gdk-pixbuf
-//! format loaders (no system WebP loader required).
+//! pixel buffer that the UI uploads to Slint as an `Image`.
+//!
+//! # Note on peak memory
+//!
+//! The former gdk-pixbuf path decoded JPEGs at 2× the target size using
+//! libjpeg's DCT downscaling, keeping peak memory low for very large files. The
+//! `image` crate does not expose scale-on-decode, so this path decodes at full
+//! resolution before the Lanczos3 downsample. Correct, but heavier for huge
+//! sources — a future optimisation could drop to `zune-jpeg`'s DCT scaling.
 
 use std::fs::File;
-use std::io::{BufReader, Cursor};
+use std::io::{BufRead, BufReader, Cursor, Seek};
 use std::path::Path;
 
 use fast_image_resize as fir;
@@ -30,57 +37,12 @@ use maple_import::{is_raw_format, loadable_image_bytes};
 /// EXIF orientation is applied before resizing.
 /// Lanczos3 filter is used for the final downsample step.
 pub fn render_to_rgb(path: &Path, max_size: u32) -> anyhow::Result<(Vec<u8>, u32, u32)> {
-    // Decode to 2× target so Lanczos3 has enough source detail.
-    let hint = (max_size * 2) as i32;
-
-    let pixbuf = if is_raw_format(path) {
-        let bytes = loadable_image_bytes(path)?;
-        let stream =
-            gtk4::gio::MemoryInputStream::from_bytes(&gtk4::glib::Bytes::from(&bytes));
-        gtk4::gdk_pixbuf::Pixbuf::from_stream_at_scale(
-            &stream,
-            hint,
-            hint,
-            true,
-            gtk4::gio::Cancellable::NONE,
-        )
-    } else {
-        gtk4::gdk_pixbuf::Pixbuf::from_file_at_scale(path, hint, hint, true)
-    }
-    .map_err(|e| anyhow::anyhow!("decode {}: {e}", path.display()))?;
-
-    let pixbuf = pixbuf.apply_embedded_orientation().unwrap_or(pixbuf);
-
-    let src_w = pixbuf.width() as u32;
-    let src_h = pixbuf.height() as u32;
-    let rowstride = pixbuf.rowstride() as usize;
-    let has_alpha = pixbuf.has_alpha();
-    let src_ch: usize = if has_alpha { 4 } else { 3 };
-
-    let Some(raw) = pixbuf.pixel_bytes() else {
-        anyhow::bail!("no pixel data for {}", path.display());
-    };
-
-    // Unpack rows (strip row padding) and convert to tight RGB.
-    let mut rgb = Vec::with_capacity((src_w * src_h * 3) as usize);
-    for y in 0..src_h as usize {
-        let row = &raw[y * rowstride..y * rowstride + src_w as usize * src_ch];
-        if has_alpha {
-            for px in row.chunks_exact(4) {
-                rgb.extend_from_slice(&px[..3]);
-            }
-        } else {
-            rgb.extend_from_slice(row);
-        }
-    }
-    drop(raw);
-    drop(pixbuf);
-
+    let rgb_img = decode_oriented(path)?.into_rgb8();
+    let (src_w, src_h) = rgb_img.dimensions();
     let (dst_w, dst_h) = fit_dims(src_w, src_h, max_size);
 
-    let src_img =
-        fir::images::ImageRef::new(src_w, src_h, &rgb, fir::PixelType::U8x3)
-            .map_err(|e| anyhow::anyhow!("fir src: {e}"))?;
+    let src_img = fir::images::ImageRef::new(src_w, src_h, rgb_img.as_raw(), fir::PixelType::U8x3)
+        .map_err(|e| anyhow::anyhow!("fir src: {e}"))?;
     let mut dst_img = fir::images::Image::new(dst_w, dst_h, fir::PixelType::U8x3);
     fir::Resizer::new()
         .resize(
@@ -92,6 +54,32 @@ pub fn render_to_rgb(path: &Path, max_size: u32) -> anyhow::Result<(Vec<u8>, u32
         .map_err(|e| anyhow::anyhow!("fir resize: {e}"))?;
 
     Ok((dst_img.into_vec(), dst_w, dst_h))
+}
+
+/// Decode `path` (or its raw preview) into a full-resolution image with EXIF
+/// orientation already applied.
+///
+/// Shared by the thumbnail pipeline and the full-resolution image loader.
+pub fn decode_oriented(path: &Path) -> anyhow::Result<image::DynamicImage> {
+    if is_raw_format(path) {
+        // `loadable_image_bytes` returns the embedded JPEG preview for raw files.
+        let bytes = loadable_image_bytes(path)
+            .map_err(|e| anyhow::anyhow!("read raw preview {}: {e}", path.display()))?;
+        let img = image::load_from_memory(&bytes)
+            .map_err(|e| anyhow::anyhow!("decode raw preview {}: {e}", path.display()))?;
+        // The preview JPEG carries its own EXIF orientation.
+        let orientation = read_orientation_from(&mut Cursor::new(&bytes));
+        Ok(apply_orientation(img, orientation))
+    } else {
+        let img = image::ImageReader::open(path)
+            .map_err(|e| anyhow::anyhow!("open {}: {e}", path.display()))?
+            .with_guessed_format()
+            .map_err(|e| anyhow::anyhow!("probe {}: {e}", path.display()))?
+            .decode()
+            .map_err(|e| anyhow::anyhow!("decode {}: {e}", path.display()))?;
+        let orientation = read_exif_orientation(path);
+        Ok(apply_orientation(img, orientation))
+    }
 }
 
 /// Encode `rgb` pixels as lossy WebP at the given quality (0–100).
@@ -119,6 +107,44 @@ pub fn generate_thumbnail(path: &Path, max_size: u32, quality: u8) -> anyhow::Re
     Ok(encode_webp_rgb(&rgb, w, h, quality))
 }
 
+// ── EXIF orientation ──────────────────────────────────────────────
+
+/// Read the EXIF orientation tag (1–8) from `path`. Returns 1 (normal) on any
+/// failure (missing tag, unreadable file, no EXIF).
+pub fn read_exif_orientation(path: &Path) -> u32 {
+    let Ok(file) = File::open(path) else {
+        return 1;
+    };
+    read_orientation_from(&mut BufReader::new(file))
+}
+
+/// Read the EXIF orientation tag from any seekable reader (file or in-memory
+/// preview bytes). Returns 1 on any failure.
+fn read_orientation_from<R: BufRead + Seek>(reader: &mut R) -> u32 {
+    match exif::Reader::new().read_from_container(reader) {
+        Ok(e) => e
+            .get_field(exif::Tag::Orientation, exif::In::PRIMARY)
+            .and_then(|f| f.value.get_uint(0))
+            .unwrap_or(1),
+        Err(_) => 1,
+    }
+}
+
+/// Apply an EXIF orientation transform (1–8) to a `DynamicImage`.
+pub fn apply_orientation(img: image::DynamicImage, orientation: u32) -> image::DynamicImage {
+    match orientation {
+        1 => img,
+        2 => img.fliph(),
+        3 => img.rotate180(),
+        4 => img.flipv(),
+        5 => img.fliph().rotate270(),
+        6 => img.rotate90(),
+        7 => img.fliph().rotate90(),
+        8 => img.rotate270(),
+        _ => img,
+    }
+}
+
 // ── Internals ─────────────────────────────────────────────────────
 
 /// Compute output dimensions preserving aspect ratio.
@@ -136,62 +162,10 @@ fn fit_dims(w: u32, h: u32, max: u32) -> (u32, u32) {
     }
 }
 
-// ── Legacy fallback (pure-Rust, used in tests) ────────────────────
-
-/// Generate a thumbnail using the `image` crate (pure Rust, no GTK).
-///
-/// Slower than the gdk-pixbuf path but usable in test contexts without a
-/// GTK main loop.  Returns PNG-encoded bytes.
-#[allow(dead_code)]
-pub fn generate_thumbnail_image_crate(path: &Path, max_size: u32) -> anyhow::Result<Vec<u8>> {
-    let img = image::open(path)
-        .map_err(|e| anyhow::anyhow!("Failed to decode {}: {}", path.display(), e))?;
-
-    let orientation = read_exif_orientation(path);
-    let img = apply_orientation(img, orientation);
-
-    let thumb = img.thumbnail(max_size, max_size);
-
-    let mut cursor = Cursor::new(Vec::new());
-    thumb.write_to(&mut cursor, image::ImageFormat::Png)?;
-
-    Ok(cursor.into_inner())
-}
-
-/// Read the EXIF orientation tag (1–8). Returns 1 (normal) on any failure.
-pub fn read_exif_orientation(path: &Path) -> u32 {
-    let file = match File::open(path) {
-        Ok(f) => f,
-        Err(_) => return 1,
-    };
-    let mut reader = BufReader::new(file);
-    let exif = match exif::Reader::new().read_from_container(&mut reader) {
-        Ok(e) => e,
-        Err(_) => return 1,
-    };
-    exif.get_field(exif::Tag::Orientation, exif::In::PRIMARY)
-        .and_then(|f| f.value.get_uint(0))
-        .unwrap_or(1)
-}
-
-/// Apply EXIF orientation transform to a `DynamicImage`.
-pub fn apply_orientation(img: image::DynamicImage, orientation: u32) -> image::DynamicImage {
-    match orientation {
-        1 => img,
-        2 => img.fliph(),
-        3 => img.rotate180(),
-        4 => img.flipv(),
-        5 => img.fliph().rotate270(),
-        6 => img.rotate90(),
-        7 => img.fliph().rotate90(),
-        8 => img.rotate270(),
-        _ => img,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use image::GenericImageView;
     use std::io::Cursor;
 
     fn create_test_png(w: u32, h: u32) -> tempfile::TempDir {
@@ -202,9 +176,7 @@ mod tests {
         });
         let dyn_img = image::DynamicImage::ImageRgb8(img);
         let mut buf = Cursor::new(Vec::new());
-        dyn_img
-            .write_to(&mut buf, image::ImageFormat::Png)
-            .unwrap();
+        dyn_img.write_to(&mut buf, image::ImageFormat::Png).unwrap();
         std::fs::write(&path, buf.get_ref()).unwrap();
         dir
     }
@@ -214,28 +186,59 @@ mod tests {
     }
 
     #[test]
-    fn thumbnail_produces_valid_png() {
+    fn render_to_rgb_packs_tight_rgb() {
         let dir = create_test_png(640, 480);
-        let bytes = generate_thumbnail_image_crate(&test_png_path(&dir), 128).unwrap();
-        assert!(bytes.starts_with(&[0x89, b'P', b'N', b'G']));
+        let (rgb, w, h) = render_to_rgb(&test_png_path(&dir), 128).unwrap();
+        assert_eq!(w, 128);
+        assert_eq!(h, 96);
+        assert_eq!(rgb.len(), (w * h * 3) as usize);
     }
 
     #[test]
-    fn thumbnail_respects_max_size() {
+    fn generate_thumbnail_produces_webp() {
+        let dir = create_test_png(640, 480);
+        let bytes = generate_thumbnail(&test_png_path(&dir), 128, 80).unwrap();
+        // WebP container: "RIFF" .... "WEBP".
+        assert_eq!(&bytes[0..4], b"RIFF");
+        assert_eq!(&bytes[8..12], b"WEBP");
+    }
+
+    #[test]
+    fn render_to_rgb_respects_max_size() {
         let dir = create_test_png(800, 400);
-        let bytes = generate_thumbnail_image_crate(&test_png_path(&dir), 100).unwrap();
-
-        let img = image::load_from_memory(&bytes).unwrap();
-        assert!(img.width() <= 100);
-        assert!(img.height() <= 100);
-        assert_eq!(img.width(), 100);
-        assert_eq!(img.height(), 50);
+        let (_rgb, w, h) = render_to_rgb(&test_png_path(&dir), 100).unwrap();
+        assert_eq!(w, 100);
+        assert_eq!(h, 50);
     }
 
     #[test]
-    fn thumbnail_bad_path_errors() {
-        let result = generate_thumbnail_image_crate(Path::new("/nonexistent/photo.jpg"), 128);
+    fn render_to_rgb_bad_path_errors() {
+        let result = render_to_rgb(Path::new("/nonexistent/photo.jpg"), 128);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn webp_round_trips_to_rgb() {
+        let dir = create_test_png(64, 48);
+        let webp = generate_thumbnail(&test_png_path(&dir), 64, 90).unwrap();
+        let (rgb, w, h) = decode_webp_rgb(&webp).unwrap();
+        assert_eq!((w, h), (64, 48));
+        assert_eq!(rgb.len(), (w * h * 3) as usize);
+    }
+
+    #[test]
+    fn apply_orientation_rotate90_swaps_dims() {
+        // Orientation 6 = rotate 90° CW: a 4×2 image becomes 2×4.
+        let img = image::DynamicImage::ImageRgb8(image::RgbImage::new(4, 2));
+        let rotated = apply_orientation(img, 6);
+        assert_eq!((rotated.width(), rotated.height()), (2, 4));
+    }
+
+    #[test]
+    fn apply_orientation_identity_and_flip_preserve_dims() {
+        let img = image::DynamicImage::ImageRgb8(image::RgbImage::new(4, 2));
+        assert_eq!(apply_orientation(img.clone(), 1).dimensions(), (4, 2));
+        assert_eq!(apply_orientation(img, 2).dimensions(), (4, 2)); // horizontal flip
     }
 
     #[test]

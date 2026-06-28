@@ -1,0 +1,174 @@
+// Library browser page (Slint port of views/library/page.rs + grid.rs).
+//
+// The grid reproduces the former GTK `FlowBox`: a responsive wrap of fixed-size
+// thumbnail tiles whose column count is derived from the available width. Tiles
+// start as placeholders and are filled in-place as the Rust side decodes
+// thumbnails on background threads (see src/grid.rs). Like the old FlowBox this
+// instantiates every tile; true virtualization is a later optimisation.
+import { Theme } from "theme.slint";
+import { FlatButton } from "widgets.slint";
+import { LineEdit, ScrollView } from "std-widgets.slint";
+
+// One grid cell. `image` is empty until `loaded` flips true.
+export struct ThumbItem {
+    image: image,
+    name: string,
+    loaded: bool,
+    unsupported: bool,
+    stack-size: int,
+    score: string,
+}
+
+export component LibraryGridView {
+    in property <[ThumbItem]> items;
+    in property <length> cell-size: 160px;
+    callback activated(int);
+
+    property <length> gap: Theme.gap;
+    property <length> pad: Theme.pad;
+    property <length> label-h: 28px;
+    property <length> tile-h: root.cell-size + root.label-h;
+    property <length> pitch-x: root.cell-size + root.gap;
+    property <length> pitch-y: root.tile-h + root.gap;
+    // Columns that fit the viewport (mirrors FlowBox's wrap behaviour).
+    property <float> columns: Math.max(1, Math.floor((sv.visible-width - 2 * root.pad + root.gap) / (root.cell-size + root.gap)));
+    property <float> row-count: Math.ceil(root.items.length / root.columns);
+
+    sv := ScrollView {
+        viewport-width: sv.visible-width;
+        viewport-height: root.row-count * root.pitch-y + root.pad;
+
+        for item[idx] in root.items: tile := Rectangle {
+            property <float> grid-col: Math.mod(idx, root.columns);
+            property <float> grid-row: Math.floor(idx / root.columns);
+            x: root.pad + grid-col * root.pitch-x;
+            y: root.pad + grid-row * root.pitch-y;
+            width: root.cell-size;
+            height: root.tile-h;
+
+            VerticalLayout {
+                spacing: 4px;
+
+                frame := Rectangle {
+                    height: root.cell-size;
+                    border-radius: Theme.thumb-radius;
+                    clip: true;
+                    background: Theme.placeholder-bg;
+
+                    if item.loaded: Image {
+                        source: item.image;
+                        width: 100%;
+                        height: 100%;
+                        image-fit: cover;
+                    }
+
+                    if !item.loaded && !item.unsupported: Text {
+                        text: "…";
+                        color: Theme.dim-fg;
+                        font-size: 22px;
+                        horizontal-alignment: center;
+                        vertical-alignment: center;
+                    }
+
+                    if item.unsupported: Text {
+                        text: "Format not\nyet supported";
+                        color: Theme.dim-fg;
+                        font-size: 12px;
+                        horizontal-alignment: center;
+                        vertical-alignment: center;
+                    }
+
+                    // Stack-count badge (bottom-left), shown for stacks of ≥2.
+                    if item.stack-size >= 2: Rectangle {
+                        x: 4px;
+                        y: parent.height - self.height - 4px;
+                        border-radius: 4px;
+                        background: #000000.with-alpha(0.55);
+                        HorizontalLayout {
+                            padding-left: 5px;
+                            padding-right: 5px;
+                            padding-top: 1px;
+                            padding-bottom: 1px;
+                            Text {
+                                text: "⊞ \{item.stack-size}";
+                                color: white;
+                                font-size: 11px;
+                                font-weight: 700;
+                            }
+                        }
+                    }
+
+                    // Hover ring.
+                    if ta.has-hover: Rectangle {
+                        border-radius: Theme.thumb-radius;
+                        border-width: 2px;
+                        border-color: Theme.accent;
+                    }
+                }
+
+                Text {
+                    text: item.score == "" ? item.name : item.name + "  ·  " + item.score;
+                    color: item.score == "" ? Theme.dim-fg : Theme.accent;
+                    font-size: 12px;
+                    overflow: elide;
+                    horizontal-alignment: center;
+                }
+            }
+
+            ta := TouchArea {
+                clicked => {
+                    root.activated(idx);
+                }
+            }
+        }
+    }
+}
+
+export component LibraryPage inherits Rectangle {
+    in property <[ThumbItem]> items;
+    in property <length> cell-size: 160px;
+    callback back;
+    callback search-changed(string);
+    callback activated(int);
+    callback settings-clicked;
+
+    background: Theme.window-bg;
+
+    VerticalLayout {
+        // ── Header (back + title + search + settings) ────────────
+        HorizontalLayout {
+            padding: 8px;
+            spacing: 8px;
+
+            FlatButton {
+                text: "← Back";
+                clicked => { root.back(); }
+            }
+            Text {
+                text: "Library";
+                color: Theme.fg;
+                font-size: 18px;
+                font-weight: 600;
+                vertical-alignment: center;
+            }
+            Rectangle { horizontal-stretch: 1; }
+            LineEdit {
+                width: 320px;
+                placeholder-text: "Search filename, camera, lens…";
+                edited(text) => { root.search-changed(text); }
+            }
+            FlatButton {
+                text: "Settings";
+                clicked => { root.settings-clicked(); }
+            }
+        }
+
+        // ── Grid ─────────────────────────────────────────────────
+        LibraryGridView {
+            vertical-stretch: 1;
+            items: root.items;
+            cell-size: root.cell-size;
+            activated(i) => { root.activated(i); }
+        }
+    }
+}

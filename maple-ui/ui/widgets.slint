@@ -1,0 +1,60 @@
+// Small shared, custom-themed UI building blocks (Slint port of widgets.rs).
+// Custom components keep the maple look without pulling a std-widgets style.
+import { Theme } from "theme.slint";
+
+// Full-width rounded "pill" action button.
+export component PillButton inherits Rectangle {
+    in property <string> text;
+    in property <bool> primary;          // accent fill vs neutral card fill
+    callback clicked;
+
+    height: 48px;
+    border-radius: self.height / 2;
+    background: root.primary
+        ? (touch.has-hover ? Theme.accent.darker(0.12) : Theme.accent)
+        : (touch.has-hover ? Theme.card-bg-hover : Theme.card-bg);
+    animate background { duration: 120ms; }
+
+    Text {
+        text: root.text;
+        color: root.primary ? Theme.accent-fg : Theme.fg;
+        font-size: 15px;
+        font-weight: 600;
+        horizontal-alignment: center;
+        vertical-alignment: center;
+    }
+
+    touch := TouchArea {
+        clicked => {
+            root.clicked();
+        }
+    }
+}
+
+// Flat header button (text label for now; SVG icons land in a later phase).
+export component FlatButton inherits Rectangle {
+    in property <string> text;
+    callback clicked;
+
+    border-radius: 6px;
+    background: touch.has-hover ? Theme.card-bg : transparent;
+    animate background { duration: 120ms; }
+
+    HorizontalLayout {
+        padding-left: 12px;
+        padding-right: 12px;
+        padding-top: 6px;
+        padding-bottom: 6px;
+        Text {
+            text: root.text;
+            color: Theme.fg;
+            vertical-alignment: center;
+        }
+    }
+
+    touch := TouchArea {
+        clicked => {
+            root.clicked();
+        }
+    }
+}

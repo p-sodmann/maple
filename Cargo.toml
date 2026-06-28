@@ -16,9 +16,17 @@ version = "0.1.0"
 edition = "2021"
 
 [workspace.dependencies]
-# UI
-gtk4 = { version = "0.9", features = ["v4_14"] }
-libadwaita = { version = "0.7", features = ["v1_6"] }
+# UI — Slint (Rust-native, ships its own GPU renderer; no system GTK runtime).
+# backend-winit + renderer-femtovg keeps the build free of system Skia/GTK deps.
+slint = { version = "1.17", default-features = false, features = ["std", "compat-1-2", "backend-winit", "renderer-femtovg"] }
+slint-build = "1.17"
+
+# Native file dialogs — xdg-portal backend (NOT the default GTK3 backend) keeps
+# the Linux build GTK-free; async-std drives the portal calls off the main loop.
+rfd = { version = "0.15", default-features = false, features = ["xdg-portal", "async-std"] }
+
+# Open files/URLs in the platform's default application (external-app launch).
+open = "5"
 
 # Async
 tokio = { version = "1", features = ["rt-multi-thread", "fs", "sync", "macros"] }

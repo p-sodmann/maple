@@ -1,0 +1,93 @@
+// Home page (Slint port of views/home.rs).
+//
+// Two entry points (Import / Browse Library) beneath the logo, plus a header
+// bar with Settings and Debug buttons. The warm top gradient reproduces the
+// former `.maple-hero` wash.
+import { Theme } from "theme.slint";
+import { PillButton, FlatButton } from "widgets.slint";
+
+export component HomePage inherits Rectangle {
+    callback import-clicked;
+    callback library-clicked;
+    callback settings-clicked;
+    callback debug-clicked;
+
+    background: Theme.window-bg;
+
+    // Soft warm wash from the brand accent over the top half of the page.
+    Rectangle {
+        x: 0;
+        y: 0;
+        width: 100%;
+        height: parent.height / 2;
+        background: @linear-gradient(180deg,
+            Theme.accent.with-alpha(0.14) 0%,
+            Theme.accent.with-alpha(0.0) 100%);
+    }
+
+    VerticalLayout {
+        // ── Header bar ───────────────────────────────────────────
+        HorizontalLayout {
+            padding: 8px;
+            spacing: 6px;
+            Rectangle { horizontal-stretch: 1; }
+            FlatButton {
+                text: "Settings";
+                clicked => { root.settings-clicked(); }
+            }
+            FlatButton {
+                text: "Debug";
+                clicked => { root.debug-clicked(); }
+            }
+        }
+
+        // ── Centred hero content ─────────────────────────────────
+        VerticalLayout {
+            alignment: center;
+            spacing: 24px;
+            padding-bottom: 48px;
+
+            HorizontalLayout {
+                alignment: center;
+                Rectangle {
+                    width: 200px;
+                    height: 200px;
+                    border-radius: 18px;
+                    clip: true;
+                    Image {
+                        source: @image-url("../../assets/logo.png");
+                        width: 100%;
+                        height: 100%;
+                        image-fit: cover;
+                    }
+                }
+            }
+
+            HorizontalLayout {
+                alignment: center;
+                Text {
+                    text: "Import and browse your photo library.";
+                    color: Theme.dim-fg;
+                    font-size: 15px;
+                }
+            }
+
+            HorizontalLayout {
+                alignment: center;
+                VerticalLayout {
+                    width: 280px;
+                    spacing: 12px;
+                    PillButton {
+                        text: "Import Photos";
+                        primary: true;
+                        clicked => { root.import-clicked(); }
+                    }
+                    PillButton {
+                        text: "Browse Library";
+                        clicked => { root.library-clicked(); }
+                    }
+                }
+            }
+        }
+    }
+}

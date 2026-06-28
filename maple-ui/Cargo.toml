@@ -7,14 +7,18 @@ edition.workspace = true
 maple-state = { path = "../maple-state" }
 maple-import = { path = "../maple-import" }
 maple-db = { path = "../maple-db" }
-gtk4 = { workspace = true }
-libadwaita = { workspace = true }
+slint = { workspace = true }
+rfd = { workspace = true }
+open = { workspace = true }
 image = { workspace = true }
 fast_image_resize = { workspace = true }
 webp = { workspace = true }
 kamadak-exif = { workspace = true }
 tracing = { workspace = true }
 anyhow = { workspace = true }
+
+[build-dependencies]
+slint-build = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

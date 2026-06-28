@@ -1,0 +1,108 @@
+// Maple — main application window (Slint).
+//
+// Replaces the GTK `adw::NavigationView` with a property-driven page switcher:
+// `page` selects which view is instantiated (Slint `if` only builds the active
+// one). Separate OS windows (settings, debug, detail) are opened from Rust via
+// the callbacks below.
+import { Theme } from "theme.slint";
+import { FlatButton } from "widgets.slint";
+import { HomePage } from "home.slint";
+import { LibraryPage, ThumbItem } from "library.slint";
+
+export { ThumbItem }
+
+export enum Page { home, library, import }
+
+// Temporary stand-in for views not yet ported (Library → Phase 3, Import →
+// Phase 6). Provides a titled header with a Back button.
+component PlaceholderPage inherits Rectangle {
+    in property <string> title;
+    callback back;
+    background: Theme.window-bg;
+
+    VerticalLayout {
+        HorizontalLayout {
+            padding: 8px;
+            spacing: 8px;
+            FlatButton {
+                text: "← Back";
+                clicked => { root.back(); }
+            }
+            Text {
+                text: root.title;
+                color: Theme.fg;
+                font-size: 18px;
+                font-weight: 600;
+                vertical-alignment: center;
+            }
+            Rectangle { horizontal-stretch: 1; }
+        }
+        Rectangle {
+            vertical-stretch: 1;
+            Text {
+                text: root.title + " — not yet ported";
+                color: Theme.dim-fg;
+                horizontal-alignment: center;
+                vertical-alignment: center;
+            }
+        }
+    }
+}
+
+export component AppWindow inherits Window {
+    title: "Maple";
+    preferred-width: 900px;
+    preferred-height: 600px;
+    min-width: 640px;
+    min-height: 420px;
+    background: Theme.window-bg;
+    default-font-size: 14px;
+
+    // Current page (navigation state lives entirely in the UI).
+    in-out property <Page> page: Page.home;
+
+    // Library grid data (owned by the Rust `LibraryGrid` controller).
+    in property <[ThumbItem]> library-items;
+    in property <length> library-cell-size: 160px;
+
+    // Wired from Rust:
+    callback settings-clicked;          // open the settings window
+    callback debug-clicked;             // open the debug window
+    callback import-requested;          // begin the import flow
+    callback library-shown;             // library page became visible → load grid
+    callback library-search-changed(string);
+    callback library-activated(int);    // grid cell clicked (index)
+
+    if root.page == Page.home: HomePage {
+        width: 100%;
+        height: 100%;
+        import-clicked => {
+            root.import-requested();
+            root.page = Page.import;
+        }
+        library-clicked => {
+            root.page = Page.library;
+            root.library-shown();
+        }
+        settings-clicked => { root.settings-clicked(); }
+        debug-clicked => { root.debug-clicked(); }
+    }
+
+    if root.page == Page.library: LibraryPage {
+        width: 100%;
+        height: 100%;
+        items: root.library-items;
+        cell-size: root.library-cell-size;
+        back => { root.page = Page.home; }
+        search-changed(text) => { root.library-search-changed(text); }
+        activated(i) => { root.library-activated(i); }
+        settings-clicked => { root.settings-clicked(); }
+    }
+
+    if root.page == Page.import: PlaceholderPage {
+        width: 100%;
+        height: 100%;
+        title: "Import";
+        back => { root.page = Page.home; }
+    }
+}

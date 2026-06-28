@@ -1,0 +1,30 @@
+// Maple design tokens — Slint port of the former GTK `style.css` palette.
+//
+// The old stylesheet used libadwaita named colours that adapted to light/dark.
+// Slint needs concrete values; a photo manager reads best on a dark neutral, so
+// the port ships a dark theme by default. Light-mode support can come later by
+// switching these to a `Palette`-driven scheme.
+export global Theme {
+    // ── Brand ──────────────────────────────────────────────────────
+    // Warm maple-orange accent (was @accent_bg_color).
+    out property <color> accent: #e8590c;
+    out property <color> accent-fg: #ffffff;
+
+    // ── Surfaces ───────────────────────────────────────────────────
+    out property <color> window-bg: #1c1c1f;
+    out property <color> card-bg: #2a2a2e;
+    out property <color> card-bg-hover: #34343a;
+    out property <color> sidebar-bg: #232327;
+    out property <color> photo-surface: #16161a; // backdrop behind full images
+    out property <color> placeholder-bg: #26262a;
+
+    // ── Text ───────────────────────────────────────────────────────
+    out property <color> fg: #f2f2f2;
+    out property <color> dim-fg: #9a9a9a;
+
+    // ── Radii / spacing ────────────────────────────────────────────
+    out property <length> card-radius: 12px;
+    out property <length> thumb-radius: 8px;
+    out property <length> gap: 8px;
+    out property <length> pad: 12px;
+}
