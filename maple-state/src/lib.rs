@@ -10,15 +10,20 @@ pub use seen::SeenSet;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
-/// Return the default config directory: `~/.config/maple`.
+/// Return the default config directory for the current platform.
+///
+/// | Platform | Path |
+/// |---|---|
+/// | Linux   | `$XDG_CONFIG_HOME/maple` or `~/.config/maple` |
+/// | macOS   | `~/Library/Application Support/maple` |
+/// | Windows | `%APPDATA%\maple` |
 pub fn config_dir() -> PathBuf {
-    let base = std::env::var("XDG_CONFIG_HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| {
-            let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
-            PathBuf::from(home).join(".config")
-        });
-    base.join("maple")
+    directories::ProjectDirs::from("", "", "maple")
+        .map(|dirs| dirs.config_dir().to_path_buf())
+        .unwrap_or_else(|| {
+            // Absolute last resort — no home dir at all (headless container).
+            PathBuf::from(".maple")
+        })
 }
 
 /// Default session file path.
@@ -825,6 +830,45 @@ mod tests {
         let loaded = Settings::load_from(Path::new("/nonexistent/settings.toml"));
         assert_eq!(loaded.preview_buffer_size, 21);
         assert_eq!(loaded.library_dir, config_dir());
+    }
+
+    #[test]
+    fn config_dir_is_absolute_even_without_home() {
+        // P1: on Windows, $HOME is not set and $XDG_CONFIG_HOME doesn't exist.
+        // The old fallback `PathBuf::from(".")` yields a *relative* path,
+        // which breaks every derived path (DB, settings, thumb cache).
+        // After the fix, `directories::ProjectDirs` returns a correct absolute
+        // platform path on all OSes.
+        //
+        // NOTE: mutates env vars — run with --test-threads=1 if this races.
+        let old_home = std::env::var("HOME").ok();
+        let old_xdg = std::env::var("XDG_CONFIG_HOME").ok();
+        // SAFETY: single-threaded test context; vars restored before return.
+        unsafe {
+            std::env::remove_var("HOME");
+            std::env::remove_var("XDG_CONFIG_HOME");
+        }
+        let dir = config_dir();
+        unsafe {
+            match old_home {
+                Some(v) => std::env::set_var("HOME", v),
+                None => std::env::remove_var("HOME"),
+            }
+            match old_xdg {
+                Some(v) => std::env::set_var("XDG_CONFIG_HOME", v),
+                None => std::env::remove_var("XDG_CONFIG_HOME"),
+            }
+        }
+        assert!(
+            dir.is_absolute(),
+            "config_dir() returned a relative path when HOME is unset: {}",
+            dir.display()
+        );
+        assert_eq!(
+            dir.file_name().and_then(|n| n.to_str()),
+            Some("maple"),
+            "config_dir() must end with 'maple'"
+        );
     }
 
     #[test]

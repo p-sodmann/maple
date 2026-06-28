@@ -276,7 +276,7 @@ impl Database {
             .query_map([], |row| {
                 Ok((
                     row.get::<_, i64>(0)?,
-                    PathBuf::from(row.get::<_, String>(1)?),
+                    crate::path_from_db(row.get::<_, String>(1)?),
                 ))
             })?
             .filter_map(|r| r.ok())

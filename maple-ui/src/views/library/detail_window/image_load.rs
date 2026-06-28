@@ -33,7 +33,7 @@ pub(super) fn load_image(
     img_dims: &Rc<Cell<(i32, i32)>>,
     window: &adw::Window,
     on_done: impl Fn() + 'static,
-    on_error: impl Fn() + 'static,
+    on_error: impl Fn(&str) + 'static,
 ) {
     let scrolled = scrolled.clone();
     let zoom = zoom.clone();

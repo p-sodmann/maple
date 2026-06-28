@@ -65,7 +65,7 @@ anyhow = "1"
 ureq = { version = "2", features = ["json"] }
 
 # Thumbnail cache
-heed = "0.20"
+redb = "2"
 webp = "0.3"
 
 # Encoding
@@ -73,6 +73,12 @@ base64 = "0.22"
 
 # Image hashing (perceptual hash for stack detection)
 image_hasher = "3"
+
+# Platform directories
+directories = "5"
+
+# Cross-platform path normalisation (forward-slash UTF-8 for SQLite storage)
+path-slash = "0.2"
 
 # Testing
 tempfile = "3"

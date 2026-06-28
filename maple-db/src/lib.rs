@@ -36,10 +36,26 @@ pub use scanner::LibraryScanner;
 pub use thumb_cache::ThumbnailCache;
 pub use semantic::{spawn_sentence_embedder, split_sentences, SemanticEncoder, SentenceEmbedder};
 
+use path_slash::{PathBufExt as _, PathExt as _};
 use rusqlite::{params, Connection, OptionalExtension};
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard};
 use std::time::{SystemTime, UNIX_EPOCH};
+
+// Normalise a path to forward-slash UTF-8 for SQLite storage.
+// On Windows this converts the backslash separator to '/'; on Linux/macOS
+// it is a no-op. Using a consistent separator makes databases portable
+// across platforms.
+pub(crate) fn path_to_db(p: &Path) -> String {
+    p.to_slash_lossy().into_owned()
+}
+
+// Reconstruct a PathBuf from a forward-slash string read out of SQLite.
+// On Windows, PathBuf::from_slash converts '/' back to '\' so the returned
+// path works with the OS APIs. On Linux/macOS this is a no-op.
+pub(crate) fn path_from_db(s: String) -> PathBuf {
+    PathBuf::from_slash(s)
+}
 
 /// Lock the database mutex, recovering from poison.
 ///
@@ -217,14 +233,14 @@ impl Database {
             .unwrap_or("")
             .to_owned();
 
-        let raw_str = raw_path.map(|p| p.to_string_lossy().to_string());
+        let raw_str = raw_path.map(path_to_db);
 
         self.conn.execute(
             "INSERT OR IGNORE INTO images
                  (path, hash, file_size, added_at, status, filename, raw_path)
              VALUES (?1, ?2, ?3, ?4, 'present', ?5, ?6)",
             params![
-                path.to_string_lossy().as_ref(),
+                path_to_db(path),
                 hash.as_slice(),
                 file_size as i64,
                 added_at,
@@ -298,7 +314,7 @@ impl Database {
                     let hash: Option<[u8; 32]> = hash_bytes.and_then(|b| {
                         b.try_into().ok()
                     });
-                    (id, PathBuf::from(path), hash)
+                    (id, path_from_db(path), hash)
                 })
             })
             .collect();
@@ -317,6 +333,31 @@ impl Database {
         let rows = stmt
             .query_map(params![algorithm], |r| {
                 Ok((r.get::<_, i64>(0)?, r.get::<_, Vec<u8>>(1)?))
+            })?
+            .filter_map(|r| r.ok())
+            .collect();
+        Ok(rows)
+    }
+
+    /// Return all `(image_id, hash_blob, stack_id)` rows for `algorithm`.
+    /// Used by the stacker to seed existing cluster state.
+    pub fn images_with_hash_and_stack(
+        &self,
+        algorithm: &str,
+    ) -> anyhow::Result<Vec<(i64, Vec<u8>, Option<i64>)>> {
+        let mut stmt = self.conn.prepare_cached(
+            "SELECT ih.image_id, ih.hash_blob, i.stack_id
+             FROM image_hashes ih
+             JOIN images i ON i.id = ih.image_id
+             WHERE ih.algorithm = ?1",
+        )?;
+        let rows = stmt
+            .query_map(params![algorithm], |r| {
+                Ok((
+                    r.get::<_, i64>(0)?,
+                    r.get::<_, Vec<u8>>(1)?,
+                    r.get::<_, Option<i64>>(2)?,
+                ))
             })?
             .filter_map(|r| r.ok())
             .collect();
@@ -431,7 +472,7 @@ impl Database {
             .conn
             .prepare_cached("SELECT id FROM images WHERE path = ?1")?;
         let id = stmt
-            .query_row(params![path.to_string_lossy().as_ref()], |r| r.get(0))
+            .query_row(params![path_to_db(path)], |r| r.get(0))
             .optional()?;
         Ok(id)
     }
@@ -440,7 +481,7 @@ impl Database {
     pub fn set_raw_path(&self, id: i64, raw_path: &Path) -> anyhow::Result<()> {
         self.conn.execute(
             "UPDATE images SET raw_path = ?1 WHERE id = ?2",
-            params![raw_path.to_string_lossy().as_ref(), id],
+            params![path_to_db(raw_path), id],
         )?;
         Ok(())
     }
@@ -498,7 +539,7 @@ impl Database {
     pub fn mark_missing(&self, path: &Path) -> anyhow::Result<()> {
         self.conn.execute(
             "UPDATE images SET status = 'missing' WHERE path = ?1",
-            params![path.to_string_lossy().as_ref()],
+            params![path_to_db(path)],
         )?;
         Ok(())
     }
@@ -507,7 +548,7 @@ impl Database {
     pub fn mark_present(&self, path: &Path) -> anyhow::Result<()> {
         self.conn.execute(
             "UPDATE images SET status = 'present' WHERE path = ?1",
-            params![path.to_string_lossy().as_ref()],
+            params![path_to_db(path)],
         )?;
         Ok(())
     }
@@ -560,24 +601,26 @@ impl Database {
         };
 
         let sql = format!(
-            "SELECT i.id, i.path, i.added_at, i.status,
+            "WITH stack_covers AS (
+                 SELECT s.id                                    AS stack_id,
+                        COALESCE(s.cover_image_id, MIN(si.id)) AS cover_id,
+                        COUNT(*)                                AS stack_size
+                 FROM stacks s
+                 JOIN images si ON si.stack_id = s.id AND si.status = 'present'
+                 GROUP BY s.id
+             )
+             SELECT i.id, i.path, i.added_at, i.status,
                     i.filename, i.taken_at, i.make, i.model, i.lens,
                     i.focal_length, i.aperture, i.iso,
                     i.width, i.height, i.orientation, i.raw_path, i.hash,
                     i.stack_id,
-                    CASE WHEN i.stack_id IS NOT NULL THEN
-                        (SELECT COUNT(*) FROM images sc
-                         WHERE sc.stack_id = i.stack_id AND sc.status = 'present')
-                    ELSE NULL END AS stack_size
+                    sc.stack_size
              FROM images i
+             LEFT JOIN stack_covers sc ON sc.stack_id = i.stack_id
              WHERE i.status = 'present'
                AND (
                  i.stack_id IS NULL
-                 OR i.id = COALESCE(
-                   (SELECT s.cover_image_id FROM stacks s WHERE s.id = i.stack_id),
-                   (SELECT MIN(si.id) FROM images si
-                    WHERE si.stack_id = i.stack_id AND si.status = 'present')
-                 )
+                 OR i.id = sc.cover_id
                ){coll_clause}
              ORDER BY i.added_at DESC
              LIMIT ? OFFSET ?"
@@ -650,16 +693,22 @@ impl Database {
         };
 
         let sql = format!(
-            "SELECT DISTINCT i.id, i.path, i.added_at, i.status,
+            "WITH stack_covers AS (
+                 SELECT s.id                                    AS stack_id,
+                        COALESCE(s.cover_image_id, MIN(si.id)) AS cover_id,
+                        COUNT(*)                                AS stack_size
+                 FROM stacks s
+                 JOIN images si ON si.stack_id = s.id AND si.status = 'present'
+                 GROUP BY s.id
+             )
+             SELECT DISTINCT i.id, i.path, i.added_at, i.status,
                     i.filename, i.taken_at, i.make, i.model, i.lens,
                     i.focal_length, i.aperture, i.iso,
                     i.width, i.height, i.orientation, i.raw_path, i.hash,
                     i.stack_id,
-                    CASE WHEN i.stack_id IS NOT NULL THEN
-                        (SELECT COUNT(*) FROM images sc
-                         WHERE sc.stack_id = i.stack_id AND sc.status = 'present')
-                    ELSE NULL END AS stack_size
+                    sc.stack_size
              FROM images i
+             LEFT JOIN stack_covers sc ON sc.stack_id = i.stack_id
              LEFT JOIN ai_descriptions ad ON ad.image_id = i.id
              LEFT JOIN face_detections fd ON fd.image_id = i.id
              LEFT JOIN persons p ON p.id = fd.person_id
@@ -667,11 +716,7 @@ impl Database {
                AND {token_conditions}
                AND (
                  i.stack_id IS NULL
-                 OR i.id = COALESCE(
-                   (SELECT s.cover_image_id FROM stacks s WHERE s.id = i.stack_id),
-                   (SELECT MIN(si.id) FROM images si
-                    WHERE si.stack_id = i.stack_id AND si.status = 'present')
-                 )
+                 OR i.id = sc.cover_id
                ){coll_clause}
              ORDER BY i.added_at DESC
              LIMIT ? OFFSET ?"
@@ -733,7 +778,7 @@ impl Database {
             .query_map(params![model_id], |row| {
                 Ok((
                     row.get::<_, i64>(0)?,
-                    PathBuf::from(row.get::<_, String>(1)?),
+                    path_from_db(row.get::<_, String>(1)?),
                 ))
             })?
             .filter_map(|r| r.ok())
@@ -810,12 +855,12 @@ impl Database {
     pub fn records_needing_metadata(&self) -> anyhow::Result<Vec<(i64, PathBuf)>> {
         let mut stmt = self
             .conn
-            .prepare("SELECT id, path FROM images WHERE filename IS NULL")?;
+            .prepare("SELECT id, path FROM images WHERE filename IS NULL AND status = 'present'")?;
         let rows = stmt
             .query_map([], |row| {
                 Ok((
                     row.get::<_, i64>(0)?,
-                    PathBuf::from(row.get::<_, String>(1)?),
+                    path_from_db(row.get::<_, String>(1)?),
                 ))
             })?
             .filter_map(|r| r.ok())
@@ -844,7 +889,7 @@ impl Database {
                 let hash: [u8; 32] = hash_bytes.try_into().ok()?;
                 Some(ImageRecord {
                     id,
-                    path: PathBuf::from(path),
+                    path: path_from_db(path),
                     hash,
                     file_size: file_size as u64,
                     added_at,
@@ -864,7 +909,7 @@ impl Database {
                 let path: String = row.get(0)?;
                 let status: String = row.get(1)?;
                 let hash_bytes: Vec<u8> = row.get(2)?;
-                Ok((PathBuf::from(path), ImageStatus::from_str(&status), hash_bytes))
+                Ok((path_from_db(path), ImageStatus::from_str(&status), hash_bytes))
             })?
             .filter_map(|r| r.ok())
             .map(|(p, s, h)| (p, s, h.try_into().ok()))
@@ -1081,8 +1126,8 @@ fn row_to_library_image(row: &rusqlite::Row<'_>) -> rusqlite::Result<LibraryImag
     let stack_size: Option<i64> = row.get(18)?;
     Ok(LibraryImage {
         id: row.get(0)?,
-        path: PathBuf::from(row.get::<_, String>(1)?),
-        raw_path: raw_path.map(PathBuf::from),
+        path: path_from_db(row.get::<_, String>(1)?),
+        raw_path: raw_path.map(path_from_db),
         added_at: row.get(2)?,
         status: ImageStatus::from_str(&status_str),
         meta,
@@ -1183,5 +1228,152 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let nested = dir.path().join("a/b/c/library.db");
         assert!(Database::open(&nested).is_ok());
+    }
+
+    #[test]
+    fn records_needing_metadata_excludes_missing() {
+        let (_dir, db) = tmp_db();
+        let present = PathBuf::from("/photos/present.jpg");
+        let missing = PathBuf::from("/photos/missing.jpg");
+
+        db.insert_image(&present, &fake_hash(10), 1024).unwrap();
+        db.insert_image(&missing, &fake_hash(11), 1024).unwrap();
+        db.mark_missing(&missing).unwrap();
+
+        // Grab IDs before clearing filenames.
+        let all = db.all_images().unwrap();
+        let present_id = all.iter().find(|r| r.path == present).unwrap().id;
+        let missing_id = all.iter().find(|r| r.path == missing).unwrap().id;
+
+        // Simulate pre-EXIF state: both records have filename IS NULL.
+        db.update_metadata(present_id, &ImageMetadata::default()).unwrap();
+        db.update_metadata(missing_id, &ImageMetadata::default()).unwrap();
+
+        let needing = db.records_needing_metadata().unwrap();
+        assert_eq!(needing.len(), 1, "missing records should not be returned");
+        assert_eq!(needing[0].1, present);
+    }
+
+    // ── Stack cover / stack_size tests (exercises B5 fix) ─────────
+
+    fn insert_and_get_id(db: &Database, path: &str, seed: u8) -> i64 {
+        let p = PathBuf::from(path);
+        db.insert_image(&p, &fake_hash(seed), 1024).unwrap();
+        db.all_images()
+            .unwrap()
+            .into_iter()
+            .find(|r| r.path == p)
+            .unwrap()
+            .id
+    }
+
+    #[test]
+    fn search_all_shows_only_stack_cover() {
+        let (_dir, db) = tmp_db();
+        let id_a = insert_and_get_id(&db, "/photos/a.jpg", 1);
+        let id_b = insert_and_get_id(&db, "/photos/b.jpg", 2);
+        insert_and_get_id(&db, "/photos/c.jpg", 3); // unstacked
+
+        let stack_id = db.create_stack().unwrap();
+        db.set_image_stack(id_a, Some(stack_id)).unwrap();
+        db.set_image_stack(id_b, Some(stack_id)).unwrap();
+
+        let results = db.search_images(&SearchQuery::default()).unwrap();
+
+        // Only 2 results: the stack cover (min id) + the unstacked image.
+        assert_eq!(results.len(), 2);
+        let cover = results.iter().find(|r| r.stack_id.is_some()).unwrap();
+        assert_eq!(cover.id, id_a.min(id_b), "min-id image is the default cover");
+        assert_eq!(cover.stack_size, Some(2));
+    }
+
+    #[test]
+    fn search_all_respects_explicit_stack_cover() {
+        let (_dir, db) = tmp_db();
+        let id_a = insert_and_get_id(&db, "/photos/a.jpg", 1);
+        let id_b = insert_and_get_id(&db, "/photos/b.jpg", 2);
+        let id_c = insert_and_get_id(&db, "/photos/c.jpg", 3);
+
+        let stack_id = db.create_stack().unwrap();
+        db.set_image_stack(id_a, Some(stack_id)).unwrap();
+        db.set_image_stack(id_b, Some(stack_id)).unwrap();
+        db.set_image_stack(id_c, Some(stack_id)).unwrap();
+        // Explicitly promote the last-inserted image as cover.
+        db.set_stack_cover(stack_id, id_c).unwrap();
+
+        let results = db.search_images(&SearchQuery::default()).unwrap();
+
+        assert_eq!(results.len(), 1);
+        let cover = results.first().unwrap();
+        assert_eq!(cover.id, id_c, "explicit cover should be returned");
+        assert_eq!(cover.stack_size, Some(3));
+    }
+
+    #[test]
+    fn search_text_shows_only_stack_cover() {
+        let (_dir, db) = tmp_db();
+        let id_a = insert_and_get_id(&db, "/photos/alpha.jpg", 1);
+        let id_b = insert_and_get_id(&db, "/photos/alpha2.jpg", 2);
+
+        let stack_id = db.create_stack().unwrap();
+        db.set_image_stack(id_a, Some(stack_id)).unwrap();
+        db.set_image_stack(id_b, Some(stack_id)).unwrap();
+
+        let q = SearchQuery::default().with_text("alpha");
+        let results = db.search_images(&q).unwrap();
+
+        // Both images match the query but only the cover should be returned.
+        assert_eq!(results.len(), 1);
+        let cover = results.first().unwrap();
+        assert_eq!(cover.id, id_a.min(id_b));
+        assert_eq!(cover.stack_size, Some(2));
+    }
+
+    // ── P3 path-normalisation tests ───────────────────────────────
+
+    #[test]
+    fn path_to_db_never_contains_backslashes() {
+        // On every platform, forward-slash paths must survive unchanged.
+        for s in &["/photos/vacation/img.jpg", "photos/img.jpg", "img.jpg"] {
+            let p = PathBuf::from(s);
+            let stored = path_to_db(&p);
+            assert!(
+                !stored.contains('\\'),
+                "path_to_db produced a backslash for {:?}: {:?}",
+                p,
+                stored,
+            );
+        }
+    }
+
+    #[test]
+    fn path_round_trip_through_db() {
+        // Insert a path, read it back via image_id_for_path (which also
+        // normalises before the lookup) and via all_images.
+        let (_dir, db) = tmp_db();
+        let path = PathBuf::from("/library/2024/vacation/DSC_0001.jpg");
+        db.insert_image(&path, &fake_hash(50), 4096).unwrap();
+
+        // Lookup by path must succeed.
+        let id = db.image_id_for_path(&path).unwrap();
+        assert!(id.is_some(), "path lookup failed after insert");
+
+        // Path retrieved via all_images must equal the original.
+        let records = db.all_images().unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].path, path);
+    }
+
+    #[test]
+    fn raw_path_round_trips_through_db() {
+        let (_dir, db) = tmp_db();
+        let jpg = PathBuf::from("/library/2024/DSC_0001.jpg");
+        let raf = PathBuf::from("/library/2024/DSC_0001.RAF");
+        db.insert_image_with_raw(&jpg, &fake_hash(60), 2048, Some(&raf))
+            .unwrap();
+
+        let results = db.search_images(&SearchQuery::default()).unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].raw_path.as_deref(), Some(raf.as_path()));
     }
 }

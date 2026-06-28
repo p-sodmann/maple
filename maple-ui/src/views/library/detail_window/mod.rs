@@ -455,11 +455,11 @@ fn build_window(
             let is_loading = is_loading.clone();
             let spinner = spinner.clone();
             let toast_overlay = toast_overlay.clone();
-            move || {
+            move |msg: &str| {
                 is_loading.set(false);
                 spinner.set_spinning(false);
                 spinner.set_visible(false);
-                toast_overlay.add_toast(adw::Toast::new("Failed to load image"));
+                toast_overlay.add_toast(adw::Toast::new(msg));
             }
         },
     );
@@ -568,11 +568,11 @@ fn update_context(
             let is_loading = ctx.is_loading.clone();
             let spinner = ctx.spinner.clone();
             let toast_overlay = ctx.toast_overlay.clone();
-            move || {
+            move |msg: &str| {
                 is_loading.set(false);
                 spinner.set_spinning(false);
                 spinner.set_visible(false);
-                toast_overlay.add_toast(adw::Toast::new("Failed to load image"));
+                toast_overlay.add_toast(adw::Toast::new(msg));
             }
         },
     );
@@ -707,7 +707,7 @@ fn rotate_image(ctx: &DetailContext, clockwise: bool, cw_btn: &gtk4::Button, ccw
                         let is_loading = ctx.is_loading.clone();
                         let spinner = ctx.spinner.clone();
                         let toast_overlay = ctx.toast_overlay.clone();
-                        move || {
+                        move |_: &str| {
                             is_loading.set(false);
                             spinner.set_spinning(false);
                             spinner.set_visible(false);

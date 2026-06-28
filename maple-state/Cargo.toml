@@ -10,6 +10,7 @@ toml = { workspace = true }
 anyhow = { workspace = true }
 tracing = { workspace = true }
 blake3 = { workspace = true }
+directories = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

@@ -24,7 +24,7 @@ use std::time::{Duration, Instant};
 use gtk4::gdk;
 use gtk4::gdk_pixbuf;
 use gtk4::glib;
-use maple_import::{is_raw_format, loadable_image_bytes};
+use maple_import::{is_raw_format, loadable_image_bytes, raw_preview_supported};
 
 /// How long to wait for the decode thread before giving up.
 const LOAD_TIMEOUT: Duration = Duration::from_secs(30);
@@ -42,34 +42,67 @@ struct PixelBuffer {
 /// `picture`, and set `img_dims` to the post-rotation pixel size.
 ///
 /// `on_loaded` is called on the main thread on success with `(width, height)`.
-/// `on_error` is called when decoding fails or the 30-second timeout fires.
+/// `on_error` is called with a user-facing message when decoding fails or
+/// the 30-second timeout fires.
 pub fn load_image_async(
     path: PathBuf,
     picture: &gtk4::Picture,
     img_dims: &Rc<Cell<(i32, i32)>>,
     on_loaded: impl Fn(i32, i32) + 'static,
-    on_error: impl Fn() + 'static,
+    on_error: impl Fn(&str) + 'static,
 ) {
-    let (tx, rx) = mpsc::channel::<Option<PixelBuffer>>();
+    let (tx, rx) = mpsc::channel::<Result<PixelBuffer, String>>();
 
     std::thread::spawn(move || {
-        let result = (|| {
+        let result: Result<PixelBuffer, String> = (|| {
+            // Check before attempting extraction — gives a clearer error than
+            // the generic bail! inside the handler.
+            if is_raw_format(&path) && !raw_preview_supported(&path) {
+                let msg = format!(
+                    "Preview not available for {} — raw format not yet supported",
+                    path.extension()
+                        .and_then(|e| e.to_str())
+                        .unwrap_or("unknown")
+                        .to_uppercase()
+                );
+                tracing::warn!("image_loader: {msg} ({})", path.display());
+                return Err(msg);
+            }
+
             let pixbuf = if is_raw_format(&path) {
-                let bytes = loadable_image_bytes(&path).ok()?;
+                let bytes = loadable_image_bytes(&path).map_err(|e| {
+                    let msg = format!("Failed to read raw preview: {e}");
+                    tracing::warn!("image_loader: {msg} ({})", path.display());
+                    msg
+                })?;
                 let stream =
                     gtk4::gio::MemoryInputStream::from_bytes(&glib::Bytes::from(&bytes));
-                gdk_pixbuf::Pixbuf::from_stream(&stream, gtk4::gio::Cancellable::NONE).ok()?
+                gdk_pixbuf::Pixbuf::from_stream(&stream, gtk4::gio::Cancellable::NONE)
+                    .map_err(|e| {
+                        let msg = format!("Failed to decode raw preview: {e}");
+                        tracing::warn!("image_loader: {msg} ({})", path.display());
+                        msg
+                    })?
             } else {
-                gdk_pixbuf::Pixbuf::from_file(&path).ok()?
+                gdk_pixbuf::Pixbuf::from_file(&path).map_err(|e| {
+                    let msg = format!("Failed to decode image: {e}");
+                    tracing::warn!("image_loader: {msg} ({})", path.display());
+                    msg
+                })?
             };
+
             let pixbuf = pixbuf.apply_embedded_orientation().unwrap_or(pixbuf);
             let width = pixbuf.width();
             let height = pixbuf.height();
             let rowstride = pixbuf.rowstride();
             let has_alpha = pixbuf.has_alpha();
-            let bytes = pixbuf.pixel_bytes()?;
+            let bytes = pixbuf.pixel_bytes().ok_or_else(|| {
+                let msg = "Failed to access pixel data".to_owned();
+                tracing::warn!("image_loader: {msg} ({})", path.display());
+                msg
+            })?;
             let data = bytes.as_ref().to_vec();
-            Some(PixelBuffer { width, height, rowstride, has_alpha, data })
+            Ok(PixelBuffer { width, height, rowstride, has_alpha, data })
         })();
         let _ = tx.send(result);
     });
@@ -80,11 +113,12 @@ pub fn load_image_async(
 
     glib::timeout_add_local(Duration::from_millis(32), move || {
         if Instant::now() > deadline {
-            on_error();
+            tracing::warn!("image_loader: 30-second decode timeout");
+            on_error("Image took too long to load");
             return glib::ControlFlow::Break;
         }
         match rx.try_recv() {
-            Ok(Some(buf)) => {
+            Ok(Ok(buf)) => {
                 let gb = glib::Bytes::from(&buf.data);
                 let pixbuf = gdk_pixbuf::Pixbuf::from_bytes(
                     &gb,
@@ -101,8 +135,13 @@ pub fn load_image_async(
                 on_loaded(buf.width, buf.height);
                 glib::ControlFlow::Break
             }
-            Ok(None) | Err(mpsc::TryRecvError::Disconnected) => {
-                on_error();
+            Ok(Err(msg)) => {
+                on_error(&msg);
+                glib::ControlFlow::Break
+            }
+            Err(mpsc::TryRecvError::Disconnected) => {
+                tracing::warn!("image_loader: decode thread panicked");
+                on_error("Failed to load image");
                 glib::ControlFlow::Break
             }
             Err(mpsc::TryRecvError::Empty) => glib::ControlFlow::Continue,

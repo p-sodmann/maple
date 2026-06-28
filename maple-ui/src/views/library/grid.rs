@@ -12,7 +12,7 @@
 //!
 //! # Thumbnail cache
 //!
-//! Workers check the `ThumbnailCache` (LMDB) before decoding.  On a cache
+//! Workers check the `ThumbnailCache` before decoding.  On a cache
 //! hit the WebP bytes are decoded in the worker thread to packed RGB.  On a
 //! miss the image is decoded, Lanczos3-resized, and encoded as WebP before
 //! being written to the cache.  The UI thread always receives plain RGB pixels
@@ -285,7 +285,7 @@ impl LibraryGrid {
 
 // ── Thumbnail loading with cache ─────────────────────────────────
 
-/// Load a thumbnail for `rec`, using the LMDB cache when possible.
+/// Load a thumbnail for `rec`, using the thumbnail cache when possible.
 ///
 /// Cache hit: decode stored WebP to RGB.
 /// Cache miss: render from disk, encode WebP, store in cache, return RGB.

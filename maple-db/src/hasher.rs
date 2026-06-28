@@ -157,10 +157,10 @@ pub fn spawn_hasher(
                     }
                 }
 
-                // Re-run the stacker over all currently hashed images so that
-                // newly hashed images are merged into existing stacks.
+                // Compare the newly hashed images against all existing ones
+                // and merge them into stacks where similarity is detected.
                 if !newly_hashed.is_empty() {
-                    if let Err(e) = crate::stacker::update_stacks(&db, &algorithm, &settings) {
+                    if let Err(e) = crate::stacker::update_stacks(&db, &algorithm, &newly_hashed, &settings) {
                         warn!("Hasher: stacker update failed: {e}");
                     }
                 }

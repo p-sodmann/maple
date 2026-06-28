@@ -8,6 +8,45 @@ use crate::image_source::is_raw_format;
 /// Supported image file extensions.
 const IMAGE_EXTENSIONS: &[&str] = &["jpg", "jpeg", "png", "raf", "cr2", "cr3"];
 
+/// Directory names that are always skipped on every platform, regardless of
+/// the dotfile convention. Covers macOS zip artifacts and Windows system dirs.
+const ALWAYS_EXCLUDED_DIRS: &[&str] = &[
+    "__MACOSX",                 // macOS zip-tool metadata directory
+    "System Volume Information", // Windows system, requires elevation
+    "$Recycle.Bin",             // Windows recycle bin
+    "RECYCLER",                 // Windows XP recycle bin
+];
+
+/// Returns true if the directory entry should be treated as hidden.
+///
+/// On all platforms: names starting with `.` are hidden (Unix convention,
+/// also covers macOS `._` resource forks at the dir level).
+/// On Windows additionally: the `FILE_ATTRIBUTE_HIDDEN` bit (0x2) is checked
+/// via `std::os::windows::fs::MetadataExt`.
+fn is_hidden_entry(entry: &std::fs::DirEntry) -> bool {
+    let name_hidden = entry
+        .path()
+        .file_name()
+        .and_then(|n| n.to_str())
+        .is_some_and(|n| n.starts_with('.'));
+    if name_hidden {
+        return true;
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        const FILE_ATTRIBUTE_HIDDEN: u32 = 0x2;
+        if entry
+            .metadata()
+            .map(|m| m.file_attributes() & FILE_ATTRIBUTE_HIDDEN != 0)
+            .unwrap_or(false)
+        {
+            return true;
+        }
+    }
+    false
+}
+
 /// Metadata about a discovered image file.
 #[derive(Debug, Clone)]
 pub struct ImageFile {
@@ -31,20 +70,15 @@ pub struct ImageGroup {
 }
 
 /// What to include when copying a selected image group.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum CopyMode {
     /// Copy all files in the group (display + companions).  Default.
+    #[default]
     All,
     /// Copy only the raw file(s).  Falls back to display if no raw companion.
     RawOnly,
     /// Copy only the display file (JPG/PNG).
     DisplayOnly,
-}
-
-impl Default for CopyMode {
-    fn default() -> Self {
-        Self::All
-    }
 }
 
 impl ImageGroup {
@@ -172,16 +206,15 @@ fn scan_dir_excluding(
         let path = entry.path();
 
         if ft.is_dir() {
-            // Skip hidden directories and any explicitly excluded names.
-            let name = path
-                .file_name()
-                .and_then(|n| n.to_str())
-                .unwrap_or("");
-            if name.starts_with('.') || excluded_names.contains(&name) {
+            let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+            if ALWAYS_EXCLUDED_DIRS.contains(&name)
+                || excluded_names.contains(&name)
+                || is_hidden_entry(&entry)
+            {
                 continue;
             }
             scan_dir_excluding(&path, excluded_names, out)?;
-        } else if ft.is_file() && is_image(&path) {
+        } else if ft.is_file() && is_image(&path) && !is_hidden_entry(&entry) {
             let size = entry.metadata().map(|m| m.len()).unwrap_or(0);
             out.push(ImageFile { path, size });
         }
@@ -323,6 +356,57 @@ mod tests {
 
         let display = group.paths_for_copy(CopyMode::DisplayOnly);
         assert_eq!(display, vec![PathBuf::from("/photos/DSCF0001.JPG")]);
+    }
+
+    #[test]
+    fn scan_skips_macosx_dir() {
+        // __MACOSX is produced by macOS zip tools and must always be ignored.
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("real.jpg"), b"real").unwrap();
+        let mac = dir.path().join("__MACOSX");
+        fs::create_dir(&mac).unwrap();
+        // Even a normal-looking JPG inside __MACOSX must be excluded.
+        fs::write(mac.join("DSCF0001.jpg"), b"artifact").unwrap();
+
+        let images = scan_images(dir.path()).unwrap();
+        assert_eq!(images.len(), 1, "__MACOSX should be excluded");
+        assert_eq!(
+            images[0].path.file_name().unwrap().to_str().unwrap(),
+            "real.jpg"
+        );
+    }
+
+    #[test]
+    fn scan_skips_always_excluded_dirs() {
+        // Every name in ALWAYS_EXCLUDED_DIRS must be skipped unconditionally.
+        for &excluded in ALWAYS_EXCLUDED_DIRS {
+            let dir = tempfile::tempdir().unwrap();
+            fs::write(dir.path().join("keep.jpg"), b"real").unwrap();
+            let ex = dir.path().join(excluded);
+            fs::create_dir(&ex).unwrap();
+            fs::write(ex.join("drop.jpg"), b"skip").unwrap();
+
+            let images = scan_images(dir.path()).unwrap();
+            assert_eq!(
+                images.len(),
+                1,
+                "dir {:?} should be excluded; got {:?}",
+                excluded,
+                images.iter().map(|i| &i.path).collect::<Vec<_>>()
+            );
+        }
+    }
+
+    #[test]
+    fn scan_skips_dotfile_dirs() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("visible.jpg"), b"real").unwrap();
+        let hidden = dir.path().join(".hidden_dir");
+        fs::create_dir(&hidden).unwrap();
+        fs::write(hidden.join("sneaky.jpg"), b"skip").unwrap();
+
+        let images = scan_images(dir.path()).unwrap();
+        assert_eq!(images.len(), 1, "dotfile dirs should be skipped");
     }
 
     #[test]
