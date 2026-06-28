@@ -8,11 +8,16 @@ import { Theme } from "theme.slint";
 import { FlatButton } from "widgets.slint";
 import { HomePage } from "home.slint";
 import { LibraryPage, ThumbItem } from "library.slint";
-import { DetailWindow, CollectionChip } from "detail.slint";
+import { DetailWindow, CollectionChip, FaceBox, FacePersonSuggestion } from "detail.slint";
+import { ImportWindow, ImportItem } from "import.slint";
+import { SettingsWindow } from "settings.slint";
+import { CollectionsWindow, CollectionEntry } from "collections.slint";
+import { FaceTagWindow } from "face_tag.slint";
 
-// Re-export the detail window + its data structs so Rust can build & show the
-// second top-level window (see src/detail.rs).
-export { ThumbItem, DetailWindow, CollectionChip }
+// Re-export all second-window types so Rust can build & show them.
+export { ThumbItem, DetailWindow, CollectionChip, FaceBox, FacePersonSuggestion,
+         ImportWindow, ImportItem, SettingsWindow, CollectionsWindow, CollectionEntry,
+         FaceTagWindow }
 
 export enum Page { home, library, import }
 
@@ -71,17 +76,19 @@ export component AppWindow inherits Window {
     // Wired from Rust:
     callback settings-clicked;          // open the settings window
     callback debug-clicked;             // open the debug window
+    callback collections-clicked;       // open the collections manager
     callback import-requested;          // begin the import flow
     callback library-shown;             // library page became visible → load grid
     callback library-search-changed(string);
     callback library-activated(int);    // grid cell clicked (index)
+    callback detect-faces-clicked;      // start background face detection
+    callback tag-faces-clicked;         // open detail on images with untagged faces
 
     if root.page == Page.home: HomePage {
         width: 100%;
         height: 100%;
         import-clicked => {
             root.import-requested();
-            root.page = Page.import;
         }
         library-clicked => {
             root.page = Page.library;
@@ -100,6 +107,9 @@ export component AppWindow inherits Window {
         search-changed(text) => { root.library-search-changed(text); }
         activated(i) => { root.library-activated(i); }
         settings-clicked => { root.settings-clicked(); }
+        collections-clicked => { root.collections-clicked(); }
+        detect-faces-clicked => { root.detect-faces-clicked(); }
+        tag-faces-clicked => { root.tag-faces-clicked(); }
     }
 
     if root.page == Page.import: PlaceholderPage {

@@ -1,0 +1,407 @@
+// Import browser window (Slint port of views/source_picker.rs + image_browser/).
+//
+// A separate top-level Window opened from the home page (not a page within
+// AppWindow). Held as a thread_local singleton in src/import.rs.
+//
+// Two internal phases driven by `root.in-browser`:
+//   false → picker:  choose source + destination folders, then "Start Scan"
+//   true  → browser: scan-results grid + large preview + filmstrip + copy
+//
+// The grid follows the same LibraryGridView pattern: absolute-positioned
+// tiles inside a ScrollView viewport, column count derived from width.
+
+import { Theme } from "theme.slint";
+import { FlatButton, PillButton } from "widgets.slint";
+import { ScrollView } from "std-widgets.slint";
+
+// ── Exported structs ──────────────────────────────────────────────
+
+export struct ImportItem {
+    index: int,
+    filename: string,
+    thumb: image,
+    loaded: bool,
+    is-selected: bool,
+    is-imported: bool,   // already present in the library
+}
+
+// ── Thumbnail grid (mirrors LibraryGridView) ──────────────────────
+
+component ImportGridView {
+    in property <[ImportItem]> items;
+    in property <int> current-index: -1;    // highlighted (preview target)
+    in property <length> cell-size: 120px;
+    callback clicked(int);
+
+    property <length> gap: Theme.gap;
+    property <length> pad: Theme.pad;
+    property <length> label-h: 22px;
+    property <length> tile-h: root.cell-size + root.label-h;
+    property <length> pitch-x: root.cell-size + root.gap;
+    property <length> pitch-y: root.tile-h + root.gap;
+    property <float> columns: Math.max(1, Math.floor(
+        (sv.visible-width - 2 * root.pad + root.gap) / (root.cell-size + root.gap)
+    ));
+    property <float> row-count: Math.ceil(root.items.length / root.columns);
+
+    sv := ScrollView {
+        viewport-width: sv.visible-width;
+        viewport-height: root.row-count * root.pitch-y + root.pad;
+
+        for item[idx] in root.items: Rectangle {
+            property <float> grid-col: Math.mod(idx, root.columns);
+            property <float> grid-row: Math.floor(idx / root.columns);
+            x: root.pad + grid-col * root.pitch-x;
+            y: root.pad + grid-row * root.pitch-y;
+            width: root.cell-size;
+            height: root.tile-h;
+
+            VerticalLayout {
+                spacing: 2px;
+
+                frame := Rectangle {
+                    height: root.cell-size;
+                    border-radius: Theme.thumb-radius;
+                    clip: true;
+                    background: Theme.placeholder-bg;
+                    border-width: idx == root.current-index ? 2px : 0;
+                    border-color: Theme.accent;
+
+                    if item.loaded: Image {
+                        source: item.thumb;
+                        width: 100%;
+                        height: 100%;
+                        image-fit: cover;
+                    }
+
+                    if !item.loaded: Text {
+                        text: "…";
+                        color: Theme.dim-fg;
+                        font-size: 18px;
+                        horizontal-alignment: center;
+                        vertical-alignment: center;
+                    }
+
+                    // Selected overlay (accent tint).
+                    if item.is-selected: Rectangle {
+                        border-radius: Theme.thumb-radius;
+                        background: Theme.accent.with-alpha(0.35);
+                    }
+
+                    // Imported badge (dimming + tick).
+                    if item.is-imported: Rectangle {
+                        border-radius: Theme.thumb-radius;
+                        background: #000000.with-alpha(0.45);
+                        Text {
+                            text: "✓";
+                            color: white;
+                            font-size: 22px;
+                            horizontal-alignment: center;
+                            vertical-alignment: center;
+                        }
+                    }
+
+                    // Selected checkmark (over the imported overlay if both).
+                    if item.is-selected: Rectangle {
+                        x: parent.width - 22px;
+                        y: 4px;
+                        width: 18px;
+                        height: 18px;
+                        border-radius: 9px;
+                        background: Theme.accent;
+                        Text {
+                            text: "✓";
+                            color: white;
+                            font-size: 11px;
+                            font-weight: 700;
+                            horizontal-alignment: center;
+                            vertical-alignment: center;
+                        }
+                    }
+
+                    // Hover ring.
+                    if ta.has-hover: Rectangle {
+                        border-radius: Theme.thumb-radius;
+                        border-width: 2px;
+                        border-color: Theme.accent.with-alpha(0.7);
+                    }
+                }
+
+                Text {
+                    text: item.filename;
+                    color: Theme.dim-fg;
+                    font-size: 11px;
+                    overflow: elide;
+                    horizontal-alignment: center;
+                }
+            }
+
+            ta := TouchArea {
+                clicked => { root.clicked(idx); }
+            }
+        }
+    }
+}
+
+// ── Main import window ────────────────────────────────────────────
+
+export component ImportWindow inherits Window {
+    title: "Maple — Import";
+    preferred-width: 960px;
+    preferred-height: 680px;
+    min-width: 600px;
+    min-height: 400px;
+    background: Theme.window-bg;
+    default-font-size: 14px;
+
+    // State (set from Rust)
+    in-out property <bool> in-browser: false;
+
+    // Picker state
+    in property <string> source-path: "";
+    in property <string> dest-path: "";
+
+    // Browser state
+    in property <[ImportItem]> items;
+    in-out property <int> current-index: 0;
+    in property <image> preview-photo;
+    in property <bool> preview-loading: false;
+    in property <string> preview-filename: "";
+    in property <int> selected-count: 0;
+    in property <int> total-count: 0;
+    in property <string> status-text: "Pick a source folder to begin.";
+    in property <bool> copying: false;
+
+    // Callbacks (wired in Rust)
+    callback close-requested;
+    callback pick-source;
+    callback pick-dest;
+    callback start-scan;
+    callback item-clicked(int);  // toggle-select + preview
+    callback copy-selected;
+    callback nav-prev;
+    callback nav-next;
+
+    init => { key-scope.focus(); }
+
+    key-scope := FocusScope {
+        width: 100%;
+        height: 100%;
+
+        key-pressed(event) => {
+            if event.text == Key.Escape {
+                root.close-requested();
+                return accept;
+            }
+            if root.in-browser {
+                if event.text == Key.LeftArrow || event.text == Key.UpArrow {
+                    root.nav-prev();
+                    return accept;
+                }
+                if event.text == Key.RightArrow || event.text == Key.DownArrow {
+                    root.nav-next();
+                    return accept;
+                }
+            }
+            return reject;
+        }
+
+        VerticalLayout {
+            width: 100%;
+            height: 100%;
+
+            // ── Header ──────────────────────────────────────────────
+            Rectangle {
+                height: 46px;
+                background: Theme.sidebar-bg;
+                HorizontalLayout {
+                    padding-left: 8px;
+                    padding-right: 8px;
+                    padding-top: 6px;
+                    padding-bottom: 6px;
+                    spacing: 6px;
+
+                    FlatButton {
+                        text: "← Back";
+                        clicked => { root.close-requested(); }
+                    }
+
+                    Text {
+                        text: root.in-browser ? "Import Photos" : "Choose Folders";
+                        color: Theme.fg;
+                        font-size: 16px;
+                        font-weight: 600;
+                        vertical-alignment: center;
+                        horizontal-stretch: 1;
+                    }
+
+                    if root.in-browser: Text {
+                        text: root.selected-count > 0
+                            ? "\{root.selected-count} selected"
+                            : "\{root.total-count} photos";
+                        color: Theme.dim-fg;
+                        font-size: 13px;
+                        vertical-alignment: center;
+                    }
+
+                    if root.in-browser: FlatButton {
+                        text: root.copying ? "Copying…" : "Copy Selected";
+                        enabled: root.selected-count > 0 && !root.copying;
+                        clicked => { root.copy-selected(); }
+                    }
+                }
+            }
+
+            // ── Picker (phase 1) ─────────────────────────────────────
+            if !root.in-browser: VerticalLayout {
+                vertical-stretch: 1;
+                alignment: center;
+                spacing: 20px;
+                padding-left: 60px;
+                padding-right: 60px;
+
+                Text {
+                    text: "Source folder";
+                    color: Theme.dim-fg;
+                    font-size: 12px;
+                    horizontal-alignment: center;
+                }
+                HorizontalLayout {
+                    spacing: 10px;
+                    alignment: center;
+                    FlatButton {
+                        text: root.source-path == "" ? "Choose Source…" : root.source-path;
+                        clicked => { root.pick-source(); }
+                    }
+                }
+
+                Text {
+                    text: "Destination folder";
+                    color: Theme.dim-fg;
+                    font-size: 12px;
+                    horizontal-alignment: center;
+                }
+                HorizontalLayout {
+                    spacing: 10px;
+                    alignment: center;
+                    FlatButton {
+                        text: root.dest-path == "" ? "Choose Destination…" : root.dest-path;
+                        clicked => { root.pick-dest(); }
+                    }
+                }
+
+                HorizontalLayout {
+                    alignment: center;
+                    PillButton {
+                        width: 220px;
+                        text: "Start Scan";
+                        primary: true;
+                        enabled: root.source-path != "" && root.dest-path != "";
+                        clicked => { root.start-scan(); }
+                    }
+                }
+
+                if root.status-text != "": Text {
+                    text: root.status-text;
+                    color: Theme.dim-fg;
+                    font-size: 12px;
+                    horizontal-alignment: center;
+                }
+            }
+
+            // ── Browser (phase 2) ─────────────────────────────────────
+            if root.in-browser: HorizontalLayout {
+                vertical-stretch: 1;
+                spacing: 0;
+
+                // Preview pane (left, takes most space)
+                VerticalLayout {
+                    horizontal-stretch: 1;
+
+                    // Large preview image
+                    Rectangle {
+                        vertical-stretch: 1;
+                        background: Theme.photo-surface;
+                        clip: true;
+
+                        if root.preview-loading: Text {
+                            text: "Loading…";
+                            color: Theme.dim-fg;
+                            font-size: 14px;
+                            horizontal-alignment: center;
+                            vertical-alignment: center;
+                        }
+
+                        if !root.preview-loading: Image {
+                            source: root.preview-photo;
+                            image-fit: contain;
+                            width: 100%;
+                            height: 100%;
+                        }
+                    }
+
+                    // Filename + nav + status strip
+                    Rectangle {
+                        height: 36px;
+                        background: Theme.sidebar-bg;
+                        HorizontalLayout {
+                            padding-left: 8px;
+                            padding-right: 8px;
+                            spacing: 6px;
+                            FlatButton {
+                                text: "‹";
+                                clicked => { root.nav-prev(); }
+                            }
+                            Text {
+                                text: root.preview-filename;
+                                color: Theme.fg;
+                                font-size: 13px;
+                                vertical-alignment: center;
+                                horizontal-stretch: 1;
+                                horizontal-alignment: center;
+                                overflow: elide;
+                            }
+                            FlatButton {
+                                text: "›";
+                                clicked => { root.nav-next(); }
+                            }
+                        }
+                    }
+                }
+
+                // Thin separator
+                Rectangle {
+                    width: 1px;
+                    background: Theme.separator-color;
+                }
+
+                // Thumbnail grid / filmstrip (right panel)
+                VerticalLayout {
+                    width: 280px;
+
+                    ImportGridView {
+                        vertical-stretch: 1;
+                        items: root.items;
+                        current-index: root.current-index;
+                        cell-size: 100px;
+                        clicked(i) => { root.item-clicked(i); }
+                    }
+
+                    // Status / progress bar
+                    Rectangle {
+                        height: 28px;
+                        background: Theme.card-bg;
+                        Text {
+                            text: root.status-text;
+                            color: Theme.dim-fg;
+                            font-size: 11px;
+                            vertical-alignment: center;
+                            horizontal-alignment: center;
+                            overflow: elide;
+                        }
+                    }
+                }
+            }
+        }
+    }
+}

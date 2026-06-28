@@ -199,6 +199,22 @@ impl Database {
         Ok(())
     }
 
+    /// Delete **all** face data: every detection and every named person.
+    ///
+    /// Resets face recognition to a clean slate.  The background face tagger
+    /// re-detects every image on its next pass, since
+    /// [`images_needing_face_detection`](Self::images_needing_face_detection)
+    /// keys off the absence of any `face_detections` row.  Used by the Settings
+    /// "Delete All Face Data" debug action (e.g. to recover from duplicate
+    /// detections left over from earlier detection runs).
+    ///
+    /// Returns `(faces_deleted, persons_deleted)`.
+    pub fn clear_all_face_data(&self) -> anyhow::Result<(usize, usize)> {
+        let faces = self.conn.execute("DELETE FROM face_detections", [])?;
+        let persons = self.conn.execute("DELETE FROM persons", [])?;
+        Ok((faces, persons))
+    }
+
     /// Insert or retrieve a person by name.  Returns the person's `id`.
     pub fn upsert_person(&self, name: &str) -> anyhow::Result<i64> {
         let now = SystemTime::now()

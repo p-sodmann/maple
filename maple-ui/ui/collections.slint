@@ -1,0 +1,219 @@
+// Collections manager window (Slint port of views/library/collection_manager.rs).
+//
+// A separate top-level Window (thread_local singleton in
+// src/collections_window.rs). Lists all collections, allows creating new ones
+// (name + colour) and deleting existing ones.
+
+import { Theme } from "theme.slint";
+import { FlatButton } from "widgets.slint";
+import { LineEdit, ScrollView } from "std-widgets.slint";
+
+export struct CollectionEntry {
+    id: int,
+    name: string,
+    color: color,
+    image-count: int,
+}
+
+export component CollectionsWindow inherits Window {
+    title: "Maple — Collections";
+    preferred-width: 480px;
+    preferred-height: 520px;
+    min-width: 360px;
+    min-height: 300px;
+    background: Theme.window-bg;
+    default-font-size: 14px;
+
+    in property <[CollectionEntry]> collections;
+    in-out property <string> new-name: "";
+    // Selected colour for a new collection; Rust reads this via get_new_color().
+    in-out property <color> new-color: #e8590c;
+    in-out property <string> status-text: "";
+
+    callback close-requested;
+    // Rust receives (name, color) and formats color as "#rrggbb".
+    callback create-collection(string, color);
+    callback delete-collection(int);
+
+    // Fixed palette for new-collection colour picker.
+    property <[color]> palette: [
+        #e8590c, #3388ff, #33d770, #ffa500, #ff6b6b,
+        #9b59b6, #1abc9c, #f39c12, #e74c3c, #2c3e50,
+    ];
+
+    init => { key-scope.focus(); }
+
+    key-scope := FocusScope {
+        width: 100%;
+        height: 100%;
+
+        key-pressed(event) => {
+            if event.text == Key.Escape {
+                root.close-requested();
+                return accept;
+            }
+            return reject;
+        }
+
+        VerticalLayout {
+            // Header
+            Rectangle {
+                height: 46px;
+                background: Theme.sidebar-bg;
+                HorizontalLayout {
+                    padding: 8px;
+                    spacing: 6px;
+                    Text {
+                        text: "Collections";
+                        color: Theme.fg;
+                        font-size: 16px;
+                        font-weight: 600;
+                        vertical-alignment: center;
+                        horizontal-stretch: 1;
+                    }
+                    FlatButton {
+                        text: "✕ Close";
+                        clicked => { root.close-requested(); }
+                    }
+                }
+            }
+
+            // Collection list
+            ScrollView {
+                vertical-stretch: 1;
+
+                VerticalLayout {
+                    spacing: 0;
+
+                    for coll in root.collections: Rectangle {
+                        height: 44px;
+                        background: del-ta.has-hover
+                            ? Theme.card-bg-hover
+                            : Theme.card-bg;
+
+                        HorizontalLayout {
+                            padding-left: 12px;
+                            padding-right: 8px;
+                            spacing: 10px;
+
+                            VerticalLayout {
+                                alignment: center;
+                                Rectangle {
+                                    width: 14px;
+                                    height: 14px;
+                                    border-radius: 7px;
+                                    background: coll.color;
+                                }
+                            }
+
+                            Text {
+                                text: coll.name;
+                                color: Theme.fg;
+                                font-size: 14px;
+                                vertical-alignment: center;
+                                horizontal-stretch: 1;
+                                overflow: elide;
+                            }
+
+                            Text {
+                                text: coll.image-count > 0
+                                    ? "\{coll.image-count} photos"
+                                    : "";
+                                color: Theme.dim-fg;
+                                font-size: 12px;
+                                vertical-alignment: center;
+                            }
+
+                            del-ta := TouchArea {
+                                width: 32px;
+                                Text {
+                                    text: "✕";
+                                    color: del-ta.has-hover ? #ff6b6b : Theme.dim-fg;
+                                    font-size: 13px;
+                                    horizontal-alignment: center;
+                                    vertical-alignment: center;
+                                }
+                                clicked => { root.delete-collection(coll.id); }
+                            }
+                        }
+
+                        Rectangle {
+                            y: parent.height - 1px;
+                            height: 1px;
+                            background: Theme.separator-color;
+                        }
+                    }
+
+                    if root.collections.length == 0: Rectangle {
+                        height: 60px;
+                        Text {
+                            text: "No collections yet.";
+                            color: Theme.dim-fg;
+                            font-size: 14px;
+                            horizontal-alignment: center;
+                            vertical-alignment: center;
+                        }
+                    }
+                }
+            }
+
+            // Create new collection
+            Rectangle {
+                height: 100px;
+                background: Theme.sidebar-bg;
+                VerticalLayout {
+                    padding: 10px;
+                    spacing: 8px;
+
+                    LineEdit {
+                        placeholder-text: "New collection name…";
+                        text <=> root.new-name;
+                        accepted(t) => {
+                            if t != "" {
+                                root.create-collection(t, root.new-color);
+                                root.new-name = "";
+                            }
+                        }
+                    }
+
+                    HorizontalLayout {
+                        spacing: 6px;
+
+                        // Colour swatches (fixed palette).
+                        for col in root.palette: swatch-ta := TouchArea {
+                            width: 22px;
+                            height: 22px;
+                            Rectangle {
+                                border-radius: 11px;
+                                background: col;
+                                border-width: col == root.new-color ? 2px : 0;
+                                border-color: white;
+                            }
+                            clicked => { root.new-color = col; }
+                        }
+
+                        Rectangle { horizontal-stretch: 1; }
+
+                        FlatButton {
+                            text: "Create";
+                            enabled: root.new-name != "";
+                            clicked => {
+                                if root.new-name != "" {
+                                    root.create-collection(root.new-name, root.new-color);
+                                    root.new-name = "";
+                                }
+                            }
+                        }
+                    }
+
+                    if root.status-text != "": Text {
+                        text: root.status-text;
+                        color: Theme.accent;
+                        font-size: 12px;
+                        height: 18px;
+                    }
+                }
+            }
+        }
+    }
+}

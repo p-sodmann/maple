@@ -131,6 +131,9 @@ export component LibraryPage inherits Rectangle {
     callback search-changed(string);
     callback activated(int);
     callback settings-clicked;
+    callback collections-clicked;
+    callback detect-faces-clicked;
+    callback tag-faces-clicked;
 
     background: Theme.window-bg;
 
@@ -156,6 +159,18 @@ export component LibraryPage inherits Rectangle {
                 width: 320px;
                 placeholder-text: "Search filename, camera, lens…";
                 edited(text) => { root.search-changed(text); }
+            }
+            FlatButton {
+                text: "Detect Faces";
+                clicked => { root.detect-faces-clicked(); }
+            }
+            FlatButton {
+                text: "Tag Faces";
+                clicked => { root.tag-faces-clicked(); }
+            }
+            FlatButton {
+                text: "Collections";
+                clicked => { root.collections-clicked(); }
             }
             FlatButton {
                 text: "Settings";

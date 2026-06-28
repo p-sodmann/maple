@@ -1,10 +1,9 @@
 //! maple-ui — Slint UI for Maple.
 //!
-//! Port in progress (sprint P5): replacing the former GTK4/libadwaita UI with
-//! Slint. The background-work architecture is unchanged — all heavy work runs
-//! on `std::thread` + `std::sync::mpsc`; only the UI-side delivery moves from
-//! `glib::timeout_add_local` polling to Slint's event-loop primitives
-//! (`slint::Timer`, `Weak::upgrade_in_event_loop`).
+//! GTK4/libadwaita has been fully replaced with Slint (sprint P5).  The
+//! background-work architecture is unchanged — all heavy work runs on
+//! `std::thread` + `std::sync::mpsc`; UI-side delivery uses `slint::Timer`
+//! and `Weak::upgrade_in_event_loop`.
 //!
 //! The Slint markup in `ui/` is compiled by `build.rs` and pulled in below.
 
@@ -17,11 +16,17 @@ use slint::{Timer, TimerMode};
 
 use maple_db::SearchQuery;
 
+
 slint::include_modules!();
 
+mod collections_window;
 mod detail;
+mod face_overlay;
+mod face_tag;
 mod grid;
 mod image_loader;
+mod import;
+mod settings_window;
 pub mod thumbnail;
 
 use grid::LibraryGrid;
@@ -128,15 +133,71 @@ pub fn run() -> anyhow::Result<()> {
         }
     });
 
-    // Actions whose windows/flows are ported in later phases (log for now).
-    window.on_settings_clicked(|| tracing::info!("settings window — not yet ported"));
-    window.on_debug_clicked(|| tracing::info!("debug window — not yet ported"));
-    window.on_import_requested(|| tracing::info!("import flow — not yet ported"));
+    // Phase 7 windows.
+    window.on_settings_clicked({
+        let db = db.clone();
+        move || settings_window::open(db.clone())
+    });
+    window.on_collections_clicked({
+        let db = db.clone();
+        move || collections_window::open(db.clone())
+    });
+    window.on_debug_clicked(|| tracing::info!("debug window — phase 7 placeholder"));
+    window.on_import_requested({
+        let db = db.clone();
+        move || import::open(db.clone())
+    });
 
-    // Keep `db`/`cache` alive for the window's lifetime (workers hold clones
-    // too, but later phases move these into UI callbacks directly).
+    // "Detect Faces" — load the ONNX face detector on a background thread to
+    // avoid blocking the UI, then hand the FaceTagger back via an Arc so it
+    // stays alive on the main thread for the window's lifetime.
+    let face_tagger: Arc<Mutex<Option<maple_db::FaceTagger>>> = Arc::new(Mutex::new(None));
+    window.on_detect_faces_clicked({
+        let db = db.clone();
+        let face_tagger = face_tagger.clone();
+        move || {
+            let db = db.clone();
+            let face_tagger = face_tagger.clone();
+            std::thread::spawn(move || {
+                let settings = maple_state::Settings::load();
+                if !settings.face.models_available() {
+                    tracing::warn!(
+                        "Detect Faces: no face model configured — set [face] detector_model in settings.toml"
+                    );
+                    return;
+                }
+                let device: maple_db::models::ModelDevice =
+                    settings.face.device.parse().unwrap_or_default();
+                match maple_db::FaceDetector::with_device(
+                    &settings.face.detector_model,
+                    settings.face.embedder_path(),
+                    &device,
+                    settings.face.detector_type,
+                    None,
+                ) {
+                    Ok(detector) => {
+                        let tagger = maple_db::spawn_face_tagger(db, detector);
+                        if let Ok(mut guard) = face_tagger.lock() {
+                            *guard = Some(tagger);
+                        }
+                        tracing::info!("Face tagger started");
+                    }
+                    Err(e) => tracing::error!("Detect Faces: failed to load model: {e}"),
+                }
+            });
+        }
+    });
+
+    // "Tag Faces" — open the dedicated face-tagging window.
+    window.on_tag_faces_clicked({
+        let db = db.clone();
+        move || face_tag::open(db.clone())
+    });
+
+    // Keep handles alive for the window's lifetime.
     let _db = db;
     let _cache = cache;
+    let _face_tagger = face_tagger;
 
     window.run()?;
     Ok(())

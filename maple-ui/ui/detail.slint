@@ -4,27 +4,54 @@
 // thread-local singleton (see src/detail.rs). It presents one full-resolution
 // image over a dark photo surface with pointer-anchored scroll-zoom and
 // drag-to-pan, prev/next navigation through the records the grid was showing,
-// a toggleable one-line EXIF strip, and a collection-chips bar.
+// a toggleable one-line EXIF strip, a collection-chips bar, and a face
+// detection overlay with click-to-assign and draw-new-box support.
 //
 // ── Zoom / pan model ──────────────────────────────────────────────
 // Pan is handled natively by the `Flickable`: the image lives inside a
 // viewport sized to the displayed image (but never smaller than the visible
 // surface, so a fit-sized image stays centred). Zoom is a `zoom` factor
-// (1.0 = fit-to-window … 20.0). On every scroll tick we recompute the
-// viewport offset so the image pixel under the cursor stays put — the
-// Slint reimplementation of the anchor math in the old `zoom_pan.rs`.
+// (1.0 = fit-to-window … 20.0).
 //
-// Slint's expression language has no local variables, so the anchor math is
-// expressed through small `pure function`s parameterised by the zoom factor.
+// ── Face overlay ──────────────────────────────────────────────────
+// Face boxes are absolutely-positioned Rectangles inside the Flickable
+// viewport (no per-box TouchArea — click hit-testing is done in Rust via
+// the zoom-area's `clicked` callback + the geo-* properties below). This
+// preserves zoom-area's scroll-event handling for all cursor positions.
+// Draw-mode is a TouchArea stacked above zoom-area that captures drag
+// gestures; it is invisible (and therefore non-hit-testable) when not in use.
 
 import { Theme } from "theme.slint";
 import { FlatButton } from "widgets.slint";
+import { LineEdit, ScrollView } from "std-widgets.slint";
 
-// One collection membership chip (built in Rust from maple_db::Collection).
+// ── Exported structs ──────────────────────────────────────────────
+
+// One collection membership chip.
 export struct CollectionChip {
     id: int,
     name: string,
     color: color,
+}
+
+// One face detection bounding box.  x1/y1/x2/y2 are normalised [0, 1]
+// relative to the displayed image.
+export struct FaceBox {
+    face-id: int,
+    x1: float,
+    y1: float,
+    x2: float,
+    y2: float,
+    label: string,       // person name, suggestion, or "?"
+    is-assigned: bool,   // has a confirmed person_id
+    is-suggestion: bool, // ArcFace-matched suggestion above threshold
+}
+
+// One person suggestion in the face-assign panel.
+export struct FacePersonSuggestion {
+    person-id: int,
+    name: string,
+    sim-text: string,   // "83%" or "" when no embedding score
 }
 
 export component DetailWindow inherits Window {
@@ -38,22 +65,48 @@ export component DetailWindow inherits Window {
 
     // ── Data (set from Rust) ──────────────────────────────────────
     in-out property <image> photo;
-    in property <int> img-w;          // native pixel size (post-orientation)
+    in property <int> img-w;
     in property <int> img-h;
     in property <string> filename;
-    in property <string> info-text;   // one-line EXIF summary (info_bar.rs)
+    in property <string> info-text;
     in property <bool> loading;
     in property <string> error-text;
     in property <bool> is-fullscreen;
     in property <[CollectionChip]> collection-chips;
+    // All collections (loaded when the add-picker opens).
+    in property <[CollectionChip]> available-collections;
+    in-out property <bool> add-coll-panel-open: false;
 
-    // ── View state (UI-local) ─────────────────────────────────────
+    in property <[FaceBox]> face-boxes;
+    in property <bool> show-faces: false;
+    in-out property <bool> face-draw-mode: false;
+
+    in property <[FacePersonSuggestion]> face-suggestions;
+    in property <int> face-panel-id: -1;
+    in-out property <bool> face-panel-open: false;
+    in-out property <string> face-name-entry: "";
+
+    // ── View state ────────────────────────────────────────────────
     property <float> zoom: 1.0;
     property <bool> show-info: true;
-    // Snapshots captured at the start of a scroll-zoom (no locals in callbacks).
     property <float> prev-zoom: 1.0;
     property <length> prev-ox: 0;
     property <length> prev-oy: 0;
+
+    // Draw-mode drag state (no locals in Slint callbacks).
+    property <length> draw-x0: 0;
+    property <length> draw-y0: 0;
+    property <length> draw-x1: 0;
+    property <length> draw-y1: 0;
+    // Exposed so Rust can clear it on toggle-off.
+    in-out property <bool> draw-dragging: false;
+
+    // ── Geometry exposed to Rust for face hit-testing ─────────────
+    // (Rust receives length as f32 logical pixels.)
+    out property <length> geo-img-left: img-left-for(root.zoom);
+    out property <length> geo-img-top: img-top-for(root.zoom);
+    out property <length> geo-disp-w: root.disp-w;
+    out property <length> geo-disp-h: root.disp-h;
 
     // ── Callbacks (wired in Rust) ─────────────────────────────────
     callback prev;
@@ -62,40 +115,47 @@ export component DetailWindow inherits Window {
     callback toggle-fullscreen;
     callback open-external;
     callback remove-collection(int);
+    // add-to-collection: Rust loads available-collections, opens picker panel.
+    callback add-to-collection;
+    // add-to-collection-confirm(id): user chose a collection from the picker.
+    callback add-to-collection-confirm(int);
 
-    // ── Geometry ──────────────────────────────────────────────────
+    // Face overlay callbacks
+    callback toggle-faces;
+    callback toggle-face-draw;
+    // Fired by zoom-area.clicked; Rust does hit-testing using geo-* props.
+    callback face-area-clicked(length, length);          // viewport vp-x, vp-y
+    callback face-assign-name(int, string);              // face-id, name
+    callback face-assign-person(int, int);               // face-id, person-id
+    callback face-delete(int);                           // face-id
+    // Fired when draw-ta drag ends; Rust normalises with geo-* props.
+    callback face-draw-done(length, length, length, length); // vp-x0,y0,x1,y1
+    callback face-panel-close;
+
+    // ── Geometry helpers ──────────────────────────────────────────
     property <length> view-w: surface.width;
     property <length> view-h: surface.height;
-    // Screen length per image pixel at zoom == 1.0 (the "fit" scale).
     property <float> fit-scale: (root.img-w <= 0 || root.img-h <= 0)
         ? 1.0
         : min(root.view-w / (root.img-w * 1px), root.view-h / (root.img-h * 1px));
     property <length> disp-w: root.img-w * 1px * root.fit-scale * root.zoom;
     property <length> disp-h: root.img-h * 1px * root.fit-scale * root.zoom;
-    // Viewport never smaller than the surface, so a fit image stays centred.
     property <length> vp-w: max(root.view-w, root.disp-w);
     property <length> vp-h: max(root.view-h, root.disp-h);
 
-    // Screen length per image pixel at zoom factor `z`.
-    pure function ppx-for(z: float) -> float {
-        return root.fit-scale * z;
-    }
+    pure function ppx-for(z: float) -> float { return root.fit-scale * z; }
     pure function disp-w-for(z: float) -> length {
         return root.img-w * 1px * root.fit-scale * z;
     }
     pure function disp-h-for(z: float) -> length {
         return root.img-h * 1px * root.fit-scale * z;
     }
-    // Centring offset of the image inside the viewport at zoom `z`.
     pure function img-left-for(z: float) -> length {
         return (max(root.view-w, disp-w-for(z)) - disp-w-for(z)) / 2;
     }
     pure function img-top-for(z: float) -> length {
         return (max(root.view-h, disp-h-for(z)) - disp-h-for(z)) / 2;
     }
-    // New viewport-x/y that keeps the image pixel under the cursor fixed.
-    // `m` is the cursor position in viewport coords; `o0` the viewport offset
-    // before the zoom; `z0`/`z1` the old/new zoom factors.
     pure function anchored-ox(m: length, z0: float, z1: float, o0: length) -> length {
         return m + o0 - (img-left-for(z1)
             + (m - img-left-for(z0)) * (ppx-for(z1) / ppx-for(z0)));
@@ -105,21 +165,16 @@ export component DetailWindow inherits Window {
             + (m - img-top-for(z0)) * (ppx-for(z1) / ppx-for(z0)));
     }
     pure function stepped-zoom(delta: length) -> float {
-        // winit reports wheel-up as a positive delta-y; wheel-up zooms in.
         return clamp(delta > 0 ? root.zoom * 1.15 : root.zoom / 1.15, 1.0, 20.0);
     }
 
-    // Reset to fit-to-window. Called from Rust after each image load and on
-    // double-click.
     public function reset-view() {
         root.zoom = 1.0;
         flick.viewport-x = 0;
         flick.viewport-y = 0;
     }
 
-    init => {
-        key-scope.focus();
-    }
+    init => { key-scope.focus(); }
 
     key-scope := FocusScope {
         width: 100%;
@@ -127,7 +182,16 @@ export component DetailWindow inherits Window {
 
         key-pressed(event) => {
             if event.text == Key.Escape {
-                root.close-requested();
+                if root.add-coll-panel-open {
+                    root.add-coll-panel-open = false;
+                } else if root.face-panel-open {
+                    root.face-panel-close();
+                } else if root.face-draw-mode {
+                    root.face-draw-mode = false;
+                    root.draw-dragging = false;
+                } else {
+                    root.close-requested();
+                }
                 return accept;
             }
             if event.text == Key.LeftArrow || event.text == Key.UpArrow {
@@ -156,14 +220,8 @@ export component DetailWindow inherits Window {
                     padding-bottom: 6px;
                     spacing: 6px;
 
-                    FlatButton {
-                        text: "‹ Prev";
-                        clicked => { root.prev(); }
-                    }
-                    FlatButton {
-                        text: "Next ›";
-                        clicked => { root.next(); }
-                    }
+                    FlatButton { text: "‹ Prev"; clicked => { root.prev(); } }
+                    FlatButton { text: "Next ›"; clicked => { root.next(); } }
                     Rectangle {
                         horizontal-stretch: 1;
                         Text {
@@ -181,21 +239,24 @@ export component DetailWindow inherits Window {
                         clicked => { root.show-info = !root.show-info; }
                     }
                     FlatButton {
-                        text: "Open";
-                        clicked => { root.open-external(); }
+                        text: root.show-faces ? "Faces ●" : "Faces";
+                        clicked => { root.toggle-faces(); }
                     }
+                    FlatButton {
+                        text: root.face-draw-mode ? "Stop Draw" : "Draw Face";
+                        enabled: root.show-faces;
+                        clicked => { root.toggle-face-draw(); }
+                    }
+                    FlatButton { text: "Open"; clicked => { root.open-external(); } }
                     FlatButton {
                         text: root.is-fullscreen ? "Windowed" : "Fullscreen";
                         clicked => { root.toggle-fullscreen(); }
                     }
-                    FlatButton {
-                        text: "✕ Close";
-                        clicked => { root.close-requested(); }
-                    }
+                    FlatButton { text: "✕ Close"; clicked => { root.close-requested(); } }
                 }
             }
 
-            // ── One-line EXIF strip (info_bar.rs) ─────────────────
+            // ── EXIF strip ────────────────────────────────────────
             if root.show-info && root.info-text != "": Rectangle {
                 height: 26px;
                 background: Theme.card-bg;
@@ -209,7 +270,7 @@ export component DetailWindow inherits Window {
                 }
             }
 
-            // ── Photo surface (zoom + pan) ────────────────────────
+            // ── Photo surface (zoom + pan + face overlay) ─────────
             surface := Rectangle {
                 vertical-stretch: 1;
                 clip: true;
@@ -220,49 +281,130 @@ export component DetailWindow inherits Window {
                     height: 100%;
                     viewport-width: root.vp-w;
                     viewport-height: root.vp-h;
-                    // Disable native wheel-scroll; the zoom-area below owns the
-                    // wheel. Drag-to-pan stays active.
                     interactive: root.zoom > 1.0;
 
+                    // ── Image ──────────────────────────────────────
                     Image {
                         x: (root.vp-w - root.disp-w) / 2;
                         y: (root.vp-h - root.disp-h) / 2;
                         width: root.disp-w;
                         height: root.disp-h;
                         source: root.photo;
-                        // Box matches the image aspect exactly, so `fill` never
-                        // distorts and guarantees the box == the drawn pixels
-                        // (the anchor math depends on that).
                         image-fit: fill;
                     }
 
+                    // ── Face overlay boxes (pure visual, no TouchArea)
+                    // Click hit-testing is delegated to zoom-area.clicked + Rust.
+                    // Using `visible` instead of `if ... for` (Slint does not
+                    // support combining `if` and `for` in one expression).
+                    for fb in root.face-boxes: Rectangle {
+                        visible: root.show-faces;
+                        x: img-left-for(root.zoom) + fb.x1 * root.disp-w;
+                        y: img-top-for(root.zoom) + fb.y1 * root.disp-h;
+                        width: max(4px, (fb.x2 - fb.x1) * root.disp-w);
+                        height: max(4px, (fb.y2 - fb.y1) * root.disp-h);
+                        border-width: 2px;
+                        border-color: fb.is-assigned
+                            ? #33d770
+                            : (fb.is-suggestion ? #ffa500 : #3388ff);
+                        background: fb.is-assigned
+                            ? #33d77012
+                            : (fb.is-suggestion ? #ffa50012 : #3388ff12);
+
+                        // Label just below the box.  Rectangles don't clip
+                        // children by default, so this is visible outside.
+                        Text {
+                            x: 0;
+                            y: parent.height + 2px;
+                            text: fb.label;
+                            color: fb.is-assigned
+                                ? #33d770
+                                : (fb.is-suggestion ? #ffa500 : #3388ff);
+                            font-size: clamp(10px, parent.height * 0.15, 18px);
+                        }
+                    }
+
+                    // ── Scroll-to-zoom + face-click area ──────────
+                    // Listed after face boxes so it is on top; it handles
+                    // scroll events (accepted → Flickable never scrolls) and
+                    // click events (delegated to Rust hit-testing when faces
+                    // are shown).
                     zoom-area := TouchArea {
                         width: root.vp-w;
                         height: root.vp-h;
 
                         scroll-event(event) => {
-                            if root.img-w <= 0 || root.img-h <= 0 {
-                                return accept;
-                            }
-                            // Snapshot pre-zoom state (no locals in callbacks).
+                            if root.img-w <= 0 || root.img-h <= 0 { return accept; }
                             root.prev-zoom = root.zoom;
                             root.prev-ox = flick.viewport-x;
                             root.prev-oy = flick.viewport-y;
-                            // Apply the new zoom first so the viewport resizes,
-                            // then re-anchor the offsets from the snapshot.
                             root.zoom = stepped-zoom(event.delta-y);
                             flick.viewport-x = anchored-ox(self.mouse-x, root.prev-zoom, root.zoom, root.prev-ox);
                             flick.viewport-y = anchored-oy(self.mouse-y, root.prev-zoom, root.zoom, root.prev-oy);
                             return accept;
                         }
 
-                        double-clicked => {
-                            root.reset-view();
+                        // Delegate face hit-testing to Rust; Rust checks
+                        // show-faces / face-draw-mode and the geo-* geometry.
+                        clicked => {
+                            root.face-area-clicked(self.mouse-x, self.mouse-y);
                         }
+
+                        double-clicked => { root.reset-view(); }
+                    }
+
+                    // ── Draw-mode drag area ────────────────────────
+                    // Stacked ABOVE zoom-area; visible (and hit-testable) only
+                    // in draw mode.  Captures the drag gesture for a new bbox;
+                    // scroll-zoom is blocked for the brief draw-mode session.
+                    draw-ta := TouchArea {
+                        visible: root.show-faces && root.face-draw-mode;
+                        width: root.vp-w;
+                        height: root.vp-h;
+
+                        pointer-event(e) => {
+                            if e.kind == PointerEventKind.down {
+                                root.draw-x0 = self.mouse-x;
+                                root.draw-y0 = self.mouse-y;
+                                root.draw-x1 = self.mouse-x;
+                                root.draw-y1 = self.mouse-y;
+                                root.draw-dragging = true;
+                            } else if e.kind == PointerEventKind.up {
+                                if root.draw-dragging {
+                                    root.draw-dragging = false;
+                                    root.face-draw-done(
+                                        root.draw-x0, root.draw-y0,
+                                        self.mouse-x, self.mouse-y,
+                                    );
+                                    root.face-draw-mode = false;
+                                }
+                            }
+                        }
+
+                        moved => {
+                            root.draw-x1 = self.mouse-x;
+                            root.draw-y1 = self.mouse-y;
+                        }
+                    }
+
+                    // ── Live drag preview ──────────────────────────
+                    Rectangle {
+                        visible: root.face-draw-mode && root.draw-dragging;
+                        x: min(root.draw-x0, root.draw-x1);
+                        y: min(root.draw-y0, root.draw-y1);
+                        width: root.draw-x1 >= root.draw-x0
+                            ? root.draw-x1 - root.draw-x0
+                            : root.draw-x0 - root.draw-x1;
+                        height: root.draw-y1 >= root.draw-y0
+                            ? root.draw-y1 - root.draw-y0
+                            : root.draw-y0 - root.draw-y1;
+                        border-width: 2px;
+                        border-color: white.with-alpha(0.9);
+                        background: transparent;
                     }
                 }
 
-                // Loading / error overlays over the photo.
+                // Loading / error overlays.
                 if root.loading: Rectangle {
                     Text {
                         text: "Loading…";
@@ -280,6 +422,205 @@ export component DetailWindow inherits Window {
                         wrap: word-wrap;
                         horizontal-alignment: center;
                         vertical-alignment: center;
+                    }
+                }
+            }
+
+            // ── Face assignment panel ─────────────────────────────
+            if root.face-panel-open: Rectangle {
+                height: 134px;
+                background: Theme.card-bg;
+
+                HorizontalLayout {
+                    padding: 8px;
+                    spacing: 8px;
+
+                    // Suggestion list
+                    VerticalLayout {
+                        width: 200px;
+                        spacing: 2px;
+
+                        Text {
+                            text: "Known persons:";
+                            color: Theme.dim-fg;
+                            font-size: 11px;
+                            height: 16px;
+                        }
+
+                        ScrollView {
+                            vertical-stretch: 1;
+                            VerticalLayout {
+                                spacing: 0;
+                                for sug in root.face-suggestions: sug-rect := Rectangle {
+                                    height: 26px;
+                                    background: sug-ta.has-hover
+                                        ? Theme.card-bg-hover
+                                        : transparent;
+                                    border-radius: 4px;
+
+                                    sug-ta := TouchArea {
+                                        clicked => {
+                                            root.face-assign-person(
+                                                root.face-panel-id,
+                                                sug.person-id,
+                                            );
+                                        }
+                                    }
+
+                                    HorizontalLayout {
+                                        padding-left: 4px;
+                                        padding-right: 4px;
+                                        spacing: 4px;
+                                        Text {
+                                            text: sug.name;
+                                            color: sug-ta.has-hover
+                                                ? Theme.accent
+                                                : Theme.fg;
+                                            font-size: 12px;
+                                            vertical-alignment: center;
+                                            horizontal-stretch: 1;
+                                            overflow: elide;
+                                        }
+                                        if sug.sim-text != "": Text {
+                                            text: sug.sim-text;
+                                            color: Theme.dim-fg;
+                                            font-size: 11px;
+                                            vertical-alignment: center;
+                                        }
+                                    }
+                                }
+                                if root.face-suggestions.length == 0: Text {
+                                    text: "No persons yet";
+                                    color: Theme.dim-fg;
+                                    font-size: 12px;
+                                    height: 26px;
+                                    vertical-alignment: center;
+                                }
+                            }
+                        }
+                    }
+
+                    // Name entry + action buttons
+                    VerticalLayout {
+                        horizontal-stretch: 1;
+                        spacing: 6px;
+
+                        Text {
+                            text: "Or enter name:";
+                            color: Theme.dim-fg;
+                            font-size: 11px;
+                            height: 16px;
+                        }
+
+                        name-edit := LineEdit {
+                            text <=> root.face-name-entry;
+                            placeholder-text: "Person name…";
+                            accepted(text) => {
+                                root.face-assign-name(root.face-panel-id, text);
+                            }
+                        }
+
+                        HorizontalLayout {
+                            spacing: 4px;
+                            FlatButton {
+                                text: "Assign";
+                                clicked => {
+                                    root.face-assign-name(
+                                        root.face-panel-id,
+                                        root.face-name-entry,
+                                    );
+                                }
+                            }
+                            FlatButton {
+                                text: "Delete";
+                                clicked => { root.face-delete(root.face-panel-id); }
+                            }
+                            Rectangle { horizontal-stretch: 1; }
+                            FlatButton {
+                                text: "Cancel";
+                                clicked => { root.face-panel-close(); }
+                            }
+                        }
+                    }
+                }
+            }
+
+            // ── Add-to-collection picker panel ───────────────────
+            if root.add-coll-panel-open: Rectangle {
+                height: 110px;
+                background: Theme.card-bg;
+                VerticalLayout {
+                    padding: 8px;
+                    spacing: 4px;
+                    HorizontalLayout {
+                        Text {
+                            text: "Add to collection:";
+                            color: Theme.dim-fg;
+                            font-size: 11px;
+                            height: 16px;
+                            horizontal-stretch: 1;
+                        }
+                        close-add-ta := TouchArea {
+                            width: 20px;
+                            height: 16px;
+                            Text {
+                                text: "✕";
+                                font-size: 11px;
+                                color: Theme.dim-fg;
+                                horizontal-alignment: center;
+                                vertical-alignment: center;
+                            }
+                            clicked => { root.add-coll-panel-open = false; }
+                        }
+                    }
+                    ScrollView {
+                        vertical-stretch: 1;
+                        VerticalLayout {
+                            spacing: 0;
+                            for coll in root.available-collections: coll-pick-ta := TouchArea {
+                                height: 26px;
+                                Rectangle {
+                                    background: coll-pick-ta.has-hover
+                                        ? Theme.card-bg-hover
+                                        : transparent;
+                                    border-radius: 4px;
+                                    HorizontalLayout {
+                                        padding-left: 4px;
+                                        spacing: 6px;
+                                        VerticalLayout {
+                                            alignment: center;
+                                            Rectangle {
+                                                width: 10px;
+                                                height: 10px;
+                                                border-radius: 5px;
+                                                background: coll.color;
+                                            }
+                                        }
+                                        Text {
+                                            text: coll.name;
+                                            color: coll-pick-ta.has-hover
+                                                ? Theme.accent
+                                                : Theme.fg;
+                                            font-size: 12px;
+                                            vertical-alignment: center;
+                                            horizontal-stretch: 1;
+                                            overflow: elide;
+                                        }
+                                    }
+                                }
+                                clicked => {
+                                    root.add-to-collection-confirm(coll.id);
+                                    root.add-coll-panel-open = false;
+                                }
+                            }
+                            if root.available-collections.length == 0: Text {
+                                text: "No collections — create one in Settings.";
+                                color: Theme.dim-fg;
+                                font-size: 12px;
+                                height: 24px;
+                                vertical-alignment: center;
+                            }
+                        }
                     }
                 }
             }
@@ -343,6 +684,18 @@ export component DetailWindow inherits Window {
                         color: Theme.dim-fg;
                         font-size: 12px;
                         vertical-alignment: center;
+                    }
+
+                    add-ta := TouchArea {
+                        width: 24px;
+                        Text {
+                            text: "+";
+                            color: add-ta.has-hover ? Theme.accent : Theme.dim-fg;
+                            font-size: 16px;
+                            horizontal-alignment: center;
+                            vertical-alignment: center;
+                        }
+                        clicked => { root.add-to-collection(); }
                     }
 
                     Rectangle { horizontal-stretch: 1; }
