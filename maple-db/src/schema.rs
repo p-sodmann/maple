@@ -298,6 +298,36 @@ const V10: &str = "
 const V11: &str =
     "ALTER TABLE stacks ADD COLUMN cover_image_id INTEGER REFERENCES images(id) ON DELETE SET NULL";
 
+// ── V12: starred import source paths ─────────────────────────────
+//
+// Persists which file-system paths the user has starred on the Import page.
+// One row per starred path; starred = shown in "Favorites", unstarred = "Recent".
+
+const V12: &str = "
+    CREATE TABLE IF NOT EXISTS import_starred_paths (
+        id         INTEGER PRIMARY KEY,
+        path       TEXT    NOT NULL UNIQUE,
+        created_at INTEGER NOT NULL
+    );
+";
+
+// ── V13: person centroids + representative faces ──────────────────
+//
+// Each person row gains:
+//   `centroid_embedding` — the mean of all its assigned face embeddings
+//     (L2-normalised 512-dim f32, updated after every assignment).
+//   `representative_face_id` — the face_detection whose embedding is closest
+//     to the centroid; used as the avatar on the People page.
+//
+// Both are NULL until at least one face has been assigned and
+// `Database::update_person_representative` is called.
+
+const V13_CENTROID: &str =
+    "ALTER TABLE persons ADD COLUMN centroid_embedding BLOB";
+const V13_REP: &str =
+    "ALTER TABLE persons ADD COLUMN representative_face_id INTEGER \
+     REFERENCES face_detections(id) ON DELETE SET NULL";
+
 // ── Migration runner ─────────────────────────────────────────────
 
 /// Apply all pending schema migrations to `conn`.
@@ -395,6 +425,22 @@ pub fn ensure_schema(conn: &Connection) -> anyhow::Result<()> {
             }
         }
         conn.execute_batch("PRAGMA user_version = 11")?;
+    }
+
+    if version < 12 {
+        conn.execute_batch(V12)?;
+        conn.execute_batch("PRAGMA user_version = 12")?;
+    }
+
+    if version < 13 {
+        for sql in &[V13_CENTROID, V13_REP] {
+            if let Err(e) = conn.execute_batch(sql) {
+                if !e.to_string().to_lowercase().contains("duplicate column") {
+                    return Err(e.into());
+                }
+            }
+        }
+        conn.execute_batch("PRAGMA user_version = 13")?;
     }
 
     Ok(())

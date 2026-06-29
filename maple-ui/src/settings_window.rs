@@ -15,8 +15,8 @@ thread_local! {
     static SETTINGS: RefCell<Option<SettingsWindow>> = const { RefCell::new(None) };
 }
 
-/// Open (or reuse) the settings window.
-pub fn open(db: Arc<Mutex<maple_db::Database>>) {
+/// Open (or reuse) the settings window, syncing the current dark-mode state.
+pub fn open(db: Arc<Mutex<maple_db::Database>>, is_dark: bool) {
     if SETTINGS.with(|s| s.borrow().is_none()) {
         match build(db) {
             Ok(win) => SETTINGS.with(|cell| *cell.borrow_mut() = Some(win)),
@@ -29,10 +29,21 @@ pub fn open(db: Arc<Mutex<maple_db::Database>>) {
     SETTINGS.with(|cell| {
         let guard = cell.borrow();
         if let Some(win) = guard.as_ref() {
+            win.set_dark(is_dark);
             populate(win);
             if let Err(e) = win.show() {
                 tracing::error!("Failed to show settings window: {e}");
             }
+        }
+    });
+}
+
+/// Propagate a theme change to the settings window while it is open.
+pub fn set_dark(dark: bool) {
+    SETTINGS.with(|s| {
+        let guard = s.borrow();
+        if let Some(win) = guard.as_ref() {
+            win.set_dark(dark);
         }
     });
 }

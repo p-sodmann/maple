@@ -63,6 +63,9 @@ export component DetailWindow inherits Window {
     background: Theme.window-bg;
     default-font-size: 14px;
 
+    // Two-way alias so Rust can sync the theme from AppWindow.
+    in-out property <bool> dark <=> Theme.dark;
+
     // ── Data (set from Rust) ──────────────────────────────────────
     in-out property <image> photo;
     in property <int> img-w;

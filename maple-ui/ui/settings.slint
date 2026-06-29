@@ -83,6 +83,9 @@ export component SettingsWindow inherits Window {
     background: Theme.bg;
     default-font-size: 14px;
 
+    // Two-way alias so Rust can sync the theme from AppWindow.
+    in-out property <bool> dark <=> Theme.dark;
+
     in property <string> library-dir:        "";
     in property <string> database-path:      "";
     in property <string> cache-path:         "";

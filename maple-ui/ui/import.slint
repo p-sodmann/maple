@@ -427,13 +427,26 @@ component LocationRow inherits Rectangle {
     background: root.loc.is-selected ? Theme.accent-tint : transparent;
     animate background { duration: 100ms; }
 
+    // row-ta declared first = lowest z-index, so the star on top intercepts its area
+    row-ta := TouchArea {
+        clicked => { root.selected(); }
+    }
+
     HorizontalLayout {
         padding-left: 15px;
-        padding-right: 10px;
+        padding-right: 48px;  // reserve space for the absolutely-placed star
         spacing: 13px;
         alignment: start;
 
-        FolderIcon { clr: Theme.ink-2; sz: 20px; }
+        Rectangle {
+            horizontal-stretch: 0;
+            width: 20px;
+            FolderIcon {
+                clr: Theme.ink-2;
+                sz: 20px;
+                y: (parent.height - self.height) / 2;
+            }
+        }
 
         VerticalLayout {
             horizontal-stretch: 1;
@@ -462,42 +475,27 @@ component LocationRow inherits Rectangle {
             font-weight: 500;
             vertical-alignment: center;
         }
-
-        // Star button
-        Rectangle {
-            width: 30px; height: 30px;
-            border-radius: 6px;
-            background: star-ta.has-hover ? Theme.border : transparent;
-            Text {
-                text: root.loc.is-starred ? "★" : "☆";
-                color: root.loc.is-starred ? Theme.accent : Theme.ink-3;
-                font-size: 15px;
-                horizontal-alignment: center;
-                vertical-alignment: center;
-            }
-            star-ta := TouchArea {
-                clicked => { root.star-clicked(); }
-            }
-        }
-
-        // Selection tick
-        if root.loc.is-selected: Rectangle {
-            width: 20px; height: 20px;
-            border-radius: 10px;
-            background: Theme.accent;
-            Text {
-                text: "✓";
-                color: white;
-                font-size: 11px;
-                font-weight: 700;
-                horizontal-alignment: center;
-                vertical-alignment: center;
-            }
-        }
     }
 
-    row-ta := TouchArea {
-        clicked => { root.selected(); }
+    // Star absolutely anchored to the right edge — declared last = highest z-index,
+    // so its TouchArea wins over row-ta when the user clicks the star.
+    Rectangle {
+        x: parent.width - 42px;
+        y: (parent.height - self.height) / 2;
+        width: 32px;
+        height: 32px;
+        border-radius: 6px;
+        background: star-ta.has-hover ? Theme.border : transparent;
+        Text {
+            text: root.loc.is-starred ? "★" : "☆";
+            color: root.loc.is-starred ? Theme.accent : Theme.ink-3;
+            font-size: 15px;
+            horizontal-alignment: center;
+            vertical-alignment: center;
+        }
+        star-ta := TouchArea {
+            clicked => { root.star-clicked(); }
+        }
     }
 }
 
@@ -521,53 +519,41 @@ export component ImportPage inherits Rectangle {
         VerticalLayout {
             width: min(760px, parent.visible-width - 44px);
             x: max(22px, (parent.visible-width - 760px) / 2);
-            padding-top: 30px;
+            padding-top: 20px;
             padding-bottom: 40px;
             spacing: 0;
-
-            Text {
-                text: "Import Photos";
-                color: Theme.ink;
-                font-size: 30px;
-                font-weight: 800;
-                letter-spacing: -0.75px;
-            }
-            Rectangle { height: 6px; }
-            Text {
-                text: "Choose where your photos come from. They'll be copied into your library.";
-                color: Theme.ink-2;
-                font-size: 15px;
-                font-weight: 500;
-                wrap: word-wrap;
-            }
+            alignment: start;
 
             // ── Source selector ───────────────────────────────────
-            Rectangle { height: 24px; }
+            Rectangle { height: 4px; }
 
-            // Selected state
+            // Selected state — entire card opens the folder picker
             if root.source-path != "": Rectangle {
                 height: 78px;
                 border-radius: Theme.radius-card;
-                background: Theme.surface;
+                background: src-ta.has-hover ? Theme.field : Theme.surface;
                 border-width: 1px;
-                border-color: Theme.border;
+                border-color: src-ta.has-hover ? Theme.accent.with-alpha(0.4) : Theme.border;
                 drop-shadow-blur: 2px;
                 drop-shadow-color: #00000008;
+                animate background { duration: 100ms; }
+                animate border-color { duration: 100ms; }
 
                 HorizontalLayout {
                     padding: 18px;
                     spacing: 14px;
                     alignment: start;
 
-                    // Folder icon in accent tint circle
+                    // Folder icon — fills accent on hover
                     Rectangle {
                         width: 44px; height: 44px;
                         border-radius: 11px;
-                        background: Theme.accent-tint;
+                        background: src-ta.has-hover ? Theme.accent : Theme.accent-tint;
+                        animate background { duration: 100ms; }
                         FolderIcon {
                             x: (parent.width - self.width) / 2;
                             y: (parent.height - self.height) / 2;
-                            clr: Theme.accent-text;
+                            clr: src-ta.has-hover ? #FFFFFF : Theme.accent-text;
                             sz: 22px;
                         }
                     }
@@ -584,8 +570,10 @@ export component ImportPage inherits Rectangle {
                             overflow: elide;
                         }
                         Text {
-                            text: root.source-path;
-                            color: Theme.ink-3;
+                            text: src-ta.has-hover
+                                ? "Click to choose a different folder"
+                                : root.source-path;
+                            color: src-ta.has-hover ? Theme.accent-text : Theme.ink-3;
                             font-size: 12.5px;
                             font-weight: 500;
                             overflow: elide;
@@ -599,39 +587,24 @@ export component ImportPage inherits Rectangle {
                         font-weight: 500;
                         vertical-alignment: center;
                     }
+                }
 
-                    // Change button
-                    Rectangle {
-                        height: 36px;
-                        border-radius: Theme.radius-btn;
-                        background: change-ta.has-hover ? Theme.border : transparent;
-                        border-width: 1px;
-                        border-color: Theme.border;
-                        HorizontalLayout {
-                            padding-left: 14px;
-                            padding-right: 14px;
-                            alignment: center;
-                            Text {
-                                text: "Change";
-                                color: Theme.ink-2;
-                                font-size: 13px;
-                                font-weight: 600;
-                                vertical-alignment: center;
-                            }
-                        }
-                        change-ta := TouchArea { clicked => { root.clear(); } }
-                    }
+                src-ta := TouchArea {
+                    mouse-cursor: pointer;
+                    clicked => { root.browse(); }
                 }
             }
 
-            // Empty / browse state
+            // Empty / browse state — entire card is clickable
             if root.source-path == "": Rectangle {
                 height: 160px;
                 border-radius: Theme.radius-card;
-                background: Theme.surface;
+                background: card-ta.has-hover ? Theme.field : Theme.surface;
                 border-width: 1.5px;
-                border-color: Theme.border;
+                border-color: card-ta.has-hover ? Theme.accent.with-alpha(0.4) : Theme.border;
                 clip: true;
+                animate background { duration: 100ms; }
+                animate border-color { duration: 100ms; }
 
                 VerticalLayout {
                     alignment: center;
@@ -643,11 +616,11 @@ export component ImportPage inherits Rectangle {
                         Rectangle {
                             width: 52px; height: 52px;
                             border-radius: 13px;
-                            background: Theme.field;
+                            background: card-ta.has-hover ? Theme.accent-tint : Theme.field;
                             FolderIcon {
                                 x: (parent.width - self.width) / 2;
                                 y: (parent.height - self.height) / 2;
-                                clr: Theme.ink-2;
+                                clr: card-ta.has-hover ? Theme.accent-text : Theme.ink-2;
                                 sz: 26px;
                             }
                         }
@@ -674,7 +647,7 @@ export component ImportPage inherits Rectangle {
                             width: 130px;
                             height: 40px;
                             border-radius: Theme.radius-btn;
-                            background: browse-ta.has-hover ? Theme.accent.darker(0.1) : Theme.accent;
+                            background: card-ta.has-hover ? Theme.accent.darker(0.1) : Theme.accent;
                             animate background { duration: 100ms; }
                             drop-shadow-blur: 2px;
                             drop-shadow-color: #A4422D55;
@@ -686,16 +659,20 @@ export component ImportPage inherits Rectangle {
                                 horizontal-alignment: center;
                                 vertical-alignment: center;
                             }
-                            browse-ta := TouchArea { clicked => { root.browse(); } }
                         }
                     }
+                }
+
+                card-ta := TouchArea {
+                    mouse-cursor: pointer;
+                    clicked => { root.browse(); }
                 }
             }
 
             // ── Favorites ─────────────────────────────────────────
-            if root.favorites.length > 0: Rectangle { height: 30px; }
+            if root.favorites.length > 0: Rectangle { height: 20px; }
             if root.favorites.length > 0: SectionLabel { text: "FAVORITES"; }
-            if root.favorites.length > 0: Rectangle { height: 8px; }
+            if root.favorites.length > 0: Rectangle { height: 5px; }
             if root.favorites.length > 0: Rectangle {
                 height: root.favorites.length * 51px;
                 border-radius: Theme.radius-card;
@@ -714,9 +691,9 @@ export component ImportPage inherits Rectangle {
             }
 
             // ── Recent locations ──────────────────────────────────
-            Rectangle { height: 26px; }
+            Rectangle { height: 20px; }
             SectionLabel { text: "RECENT LOCATIONS"; }
-            Rectangle { height: 8px; }
+            Rectangle { height: 5px; }
 
             if root.recents.length == 0: Rectangle {
                 height: 60px;

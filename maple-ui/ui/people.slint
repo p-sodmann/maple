@@ -1,0 +1,168 @@
+// People page — grid of named persons with their representative face crop.
+
+import { Theme } from "theme.slint";
+import { ScrollView } from "std-widgets.slint";
+
+export struct PersonItem {
+    person-id: int,
+    name: string,
+    face-image: image,
+    face-loaded: bool,
+}
+
+// ── Person tile ───────────────────────────────────────────────────
+
+component PersonTile inherits Rectangle {
+    in property <PersonItem> item;
+    callback activated;
+
+    property <length> face-size: 120px;
+    property <length> label-h:   26px;
+
+    width: root.face-size;
+    height: root.face-size + root.label-h + 6px;
+
+    ta := TouchArea { clicked => { root.activated(); } }
+
+    VerticalLayout {
+        spacing: 6px;
+
+        frame := Rectangle {
+            height: root.face-size;
+            width: root.face-size;
+            border-radius: root.face-size / 2;
+            clip: true;
+            background: Theme.placeholder-bg;
+
+            if root.item.face-loaded: Image {
+                source: root.item.face-image;
+                width: 100%;
+                height: 100%;
+                image-fit: fill;
+            }
+            if !root.item.face-loaded: Text {
+                text: "?";
+                color: Theme.dim-fg;
+                font-size: 28px;
+                horizontal-alignment: center;
+                vertical-alignment: center;
+            }
+
+            if ta.has-hover: Rectangle {
+                border-radius: root.face-size / 2;
+                border-width: 2.5px;
+                border-color: Theme.accent;
+            }
+        }
+
+        Text {
+            text: root.item.name;
+            color: ta.has-hover ? Theme.accent : Theme.fg;
+            font-size: 12px;
+            font-weight: 500;
+            horizontal-alignment: center;
+            overflow: elide;
+            height: root.label-h;
+        }
+    }
+}
+
+// ── People page ───────────────────────────────────────────────────
+
+export component PeoplePage inherits Rectangle {
+    in property <[PersonItem]> people;
+    in property <int> untagged-count: 0;
+
+    callback person-activated(int);
+    callback tag-faces-clicked;
+
+    background: Theme.bg;
+
+    property <length> cell-size: 120px;
+    property <length> gap:  Theme.gap;
+    property <length> pad:  Theme.pad;
+    property <length> tile-h: root.cell-size + 32px;
+    property <length> pitch-x: root.cell-size + root.gap;
+    property <length> pitch-y: root.tile-h + root.gap;
+    // Use root.width so the columns calculation works without referencing a
+    // conditionally-instantiated element.
+    property <float>  columns: Math.max(1, Math.floor((root.width - 2 * root.pad + root.gap) / root.pitch-x));
+    property <float>  row-count: Math.ceil(root.people.length / root.columns);
+
+    if root.people.length == 0: VerticalLayout {
+        alignment: center;
+        spacing: 14px;
+        padding: 40px;
+
+        Rectangle {
+            height: 56px;
+            HorizontalLayout {
+                alignment: center;
+                Rectangle {
+                    width: 56px; height: 56px;
+                    border-radius: 14px;
+                    background: Theme.field;
+                    Text {
+                        text: "👤";
+                        font-size: 22px;
+                        horizontal-alignment: center;
+                        vertical-alignment: center;
+                    }
+                }
+            }
+        }
+        Text {
+            text: "No people yet";
+            color: Theme.ink;
+            font-size: 22px;
+            font-weight: 700;
+            horizontal-alignment: center;
+        }
+        Text {
+            text: root.untagged-count > 0
+                ? "You have " + root.untagged-count + " untagged face(s) — label them to build your people library."
+                : "Enable \"Detect Faces\" on the Library page to find faces in your photos.";
+            color: Theme.ink-3;
+            font-size: 14px;
+            font-weight: 500;
+            horizontal-alignment: center;
+            wrap: word-wrap;
+        }
+
+        if root.untagged-count > 0: HorizontalLayout {
+            alignment: center;
+            Rectangle {
+                height: 38px;
+                border-radius: Theme.radius-btn;
+                background: Theme.accent;
+                HorizontalLayout {
+                    padding-left: 20px;
+                    padding-right: 20px;
+                    alignment: center;
+                    Text {
+                        text: "Tag " + root.untagged-count + " Face(s)";
+                        color: #FFFFFF;
+                        font-size: 13.5px;
+                        font-weight: 600;
+                        vertical-alignment: center;
+                    }
+                }
+                TouchArea { clicked => { root.tag-faces-clicked(); } }
+            }
+        }
+    }
+
+    if root.people.length > 0: ScrollView {
+        viewport-width: self.visible-width;
+        viewport-height: root.row-count * root.pitch-y + root.pad;
+
+        for person[idx] in root.people: PersonTile {
+            property <float> grid-col: Math.mod(idx, root.columns);
+            property <float> grid-row: Math.floor(idx / root.columns);
+            x: root.pad + grid-col * root.pitch-x;
+            y: root.pad + grid-row * root.pitch-y;
+            item: person;
+            activated => { root.person-activated(person.person-id); }
+        }
+    }
+}

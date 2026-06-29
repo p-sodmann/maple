@@ -125,9 +125,13 @@ fn build(db: Arc<Mutex<maple_db::Database>>) -> Result<FaceTagCtx, slint::Platfo
         let db = db.clone();
         move |face_id, person_id| {
             let ok = db.lock().ok().map_or(false, |g| {
-                g.assign_face_to_person(face_id as i64, Some(person_id as i64))
+                let r = g.assign_face_to_person(face_id as i64, Some(person_id as i64))
                     .map_err(|e| tracing::warn!("face_tag: assign_to_person: {e}"))
-                    .is_ok()
+                    .is_ok();
+                if r {
+                    let _ = g.update_person_representative(person_id as i64);
+                }
+                r
             });
             if ok {
                 advance(&w, &entries, &index, &known);
@@ -160,6 +164,7 @@ fn build(db: Arc<Mutex<maple_db::Database>>) -> Result<FaceTagCtx, slint::Platfo
                 g.assign_face_to_person(face_id as i64, Some(pid))
                     .map_err(|e| tracing::warn!("face_tag: assign_face: {e}"))
                     .ok()?;
+                let _ = g.update_person_representative(pid);
                 Some(pid)
             });
 
@@ -246,7 +251,7 @@ fn load_face(
     }
 
     std::thread::spawn(move || {
-        let result = extract_crop(&path, bbox);
+        let result = extract_crop(&path, bbox, CROP_PX);
         let _ = w.upgrade_in_event_loop(move |win| {
             if let Ok(pixels) = result {
                 let mut pb = SharedPixelBuffer::<Rgb8Pixel>::new(CROP_PX, CROP_PX);
@@ -279,11 +284,11 @@ fn collect_untagged_faces(db: &Arc<Mutex<maple_db::Database>>) -> Vec<FaceEntry>
 // ── Crop extraction ────────────────────────────────────────────────
 
 /// Decode `path`, extract a square face crop padded by one bbox-diameter, and
-/// resize to `CROP_PX × CROP_PX` RGB pixels.
+/// resize to `out_px × out_px` RGB pixels.
 ///
 /// The crop is centred on the face centre.  Padding outside the image is filled
 /// with mid-grey so the face is always at a visually consistent size.
-fn extract_crop(path: &std::path::Path, bbox: [f32; 4]) -> anyhow::Result<Vec<u8>> {
+pub fn extract_crop(path: &std::path::Path, bbox: [f32; 4], out_px: u32) -> anyhow::Result<Vec<u8>> {
     let rgb = maple_import::decode_image(path)?.into_rgb8();
     let (iw, ih) = rgb.dimensions();
     let [x1, y1, x2, y2] = bbox;
@@ -336,8 +341,8 @@ fn extract_crop(path: &std::path::Path, bbox: [f32; 4]) -> anyhow::Result<Vec<u8
 
     let final_img = image::imageops::resize(
         &square,
-        CROP_PX,
-        CROP_PX,
+        out_px,
+        out_px,
         image::imageops::FilterType::Lanczos3,
     );
     Ok(final_img.into_raw())

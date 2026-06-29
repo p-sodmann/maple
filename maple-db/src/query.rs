@@ -33,6 +33,8 @@ pub struct SearchQuery {
     /// Number of nearest sentence vectors to retrieve for the semantic side
     /// (0 falls back to a built-in default).
     pub semantic_k: usize,
+    /// When set, restrict results to images that have a face assigned to this person.
+    pub person_id: Option<i64>,
 }
 
 impl SearchQuery {
@@ -71,8 +73,14 @@ impl SearchQuery {
         self
     }
 
+    /// Filter by person: only images where a face is assigned to `person_id`.
+    pub fn with_person(mut self, id: i64) -> Self {
+        self.person_id = Some(id);
+        self
+    }
+
     pub fn is_empty(&self) -> bool {
-        self.text.is_none() && self.collection_id.is_none()
+        self.text.is_none() && self.collection_id.is_none() && self.person_id.is_none()
     }
 }
 

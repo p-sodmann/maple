@@ -47,8 +47,13 @@ struct Detail {
     current_image_id: Rc<Cell<i64>>,
 }
 
-/// Open (or reuse) the detail window for `records[index]`.
-pub fn open(records: Vec<LibraryImage>, index: usize, db: Arc<Mutex<maple_db::Database>>) {
+/// Open (or reuse) the detail window for `records[index]`, syncing dark-mode state.
+pub fn open(
+    records: Vec<LibraryImage>,
+    index: usize,
+    db: Arc<Mutex<maple_db::Database>>,
+    is_dark: bool,
+) {
     if DETAIL.with(|d| d.borrow().is_none()) {
         match build(db) {
             Ok(d) => DETAIL.with(|cell| *cell.borrow_mut() = Some(d)),
@@ -62,6 +67,7 @@ pub fn open(records: Vec<LibraryImage>, index: usize, db: Arc<Mutex<maple_db::Da
     DETAIL.with(|cell| {
         let guard = cell.borrow();
         let Some(detail) = guard.as_ref() else { return };
+        detail.window.set_dark(is_dark);
         let len = records.len();
         *detail.records.borrow_mut() = records;
         detail.index.set(index.min(len.saturating_sub(1)));
@@ -70,6 +76,16 @@ pub fn open(records: Vec<LibraryImage>, index: usize, db: Arc<Mutex<maple_db::Da
 
         if let Err(e) = detail.window.show() {
             tracing::error!("Failed to show detail window: {e}");
+        }
+    });
+}
+
+/// Propagate a theme change to the detail window while it is open.
+pub fn set_dark(dark: bool) {
+    DETAIL.with(|d| {
+        let guard = d.borrow();
+        if let Some(detail) = guard.as_ref() {
+            detail.window.set_dark(dark);
         }
     });
 }

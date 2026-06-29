@@ -264,7 +264,7 @@ impl Database {
 
         // Keyword hits already carry SearchHit::Direct (with snippet) from
         // search_images_text.
-        let keyword = self.search_images_text(text, Some(pool), Some(0), collection_id)?;
+        let keyword = self.search_images_text(text, Some(pool), Some(0), collection_id, None)?;
         // Semantic hits: (image_id, cosine_distance, best_sentence).
         let semantic = self.semantic_search(query_embedding, k)?;
 

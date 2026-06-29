@@ -77,26 +77,6 @@ export component LibraryGridView {
                         vertical-alignment: center;
                     }
 
-                    // Stack-count badge (bottom-left), shown for stacks of ≥2.
-                    if item.stack-size >= 2: Rectangle {
-                        x: 4px;
-                        y: parent.height - self.height - 4px;
-                        border-radius: 4px;
-                        background: #000000.with-alpha(0.55);
-                        HorizontalLayout {
-                            padding-left: 5px;
-                            padding-right: 5px;
-                            padding-top: 1px;
-                            padding-bottom: 1px;
-                            Text {
-                                text: "⊞ \{item.stack-size}";
-                                color: white;
-                                font-size: 11px;
-                                font-weight: 700;
-                            }
-                        }
-                    }
-
                     // Hover ring.
                     if ta.has-hover: Rectangle {
                         border-radius: Theme.thumb-radius;
@@ -105,12 +85,28 @@ export component LibraryGridView {
                     }
                 }
 
-                Text {
-                    text: item.score == "" ? item.name : item.name + "  ·  " + item.score;
-                    color: item.score == "" ? Theme.dim-fg : Theme.accent;
-                    font-size: 12px;
-                    overflow: elide;
-                    horizontal-alignment: center;
+                HorizontalLayout {
+                    padding-left: 6px;
+                    padding-right: 6px;
+                    spacing: 4px;
+
+                    if item.stack-size >= 2: Text {
+                        text: "⊞ \{item.stack-size}";
+                        color: Theme.dim-fg;
+                        font-size: 11px;
+                        font-weight: 700;
+                        vertical-alignment: center;
+                    }
+
+                    Text {
+                        text: item.score == "" ? item.name : item.name + "  ·  " + item.score;
+                        color: item.score == "" ? Theme.dim-fg : Theme.accent;
+                        font-size: 12px;
+                        overflow: elide;
+                        horizontal-alignment: right;
+                        horizontal-stretch: 1;
+                        vertical-alignment: center;
+                    }
                 }
             }
 

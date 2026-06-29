@@ -50,6 +50,18 @@ pub struct Person {
     pub name: String,
 }
 
+/// A person together with the data needed to render their representative face.
+#[derive(Debug, Clone)]
+pub struct PersonWithRep {
+    pub id: i64,
+    pub name: String,
+    /// Path to the image that contains the representative face.
+    pub image_path: Option<PathBuf>,
+    /// Bounding box `[x1, y1, x2, y2]` in [0,1] of the representative face.
+    pub bbox: Option<[f32; 4]>,
+    pub face_id: Option<i64>,
+}
+
 // ── Cosine similarity ─────────────────────────────────────────────
 
 /// Dot product of two L2-normalised vectors — equals cosine similarity when
@@ -439,6 +451,134 @@ impl Database {
             .prepare("SELECT name FROM persons WHERE id = ?1")?;
         let mut rows = stmt.query(params![person_id])?;
         Ok(rows.next()?.map(|r| r.get::<_, String>(0)).transpose()?)
+    }
+
+    /// Recompute the centroid embedding and representative face for `person_id`.
+    ///
+    /// Fetches all assigned embeddings, averages them (then L2-normalises),
+    /// picks the face whose embedding is closest to the centroid, and writes
+    /// both back to the `persons` row.  No-op (clears both fields) when the
+    /// person has no assigned faces.
+    pub fn update_person_representative(&self, person_id: i64) -> anyhow::Result<()> {
+        // Collect all (face_id, embedding) pairs for this person.
+        let mut stmt = self.conn.prepare(
+            "SELECT id, embedding FROM face_detections WHERE person_id = ?1",
+        )?;
+        let faces: Vec<(i64, Vec<f32>)> = stmt
+            .query_map(params![person_id], |row| {
+                let blob: Vec<u8> = row.get(1)?;
+                Ok((row.get::<_, i64>(0)?, blob))
+            })?
+            .filter_map(|r| r.ok())
+            .map(|(id, blob)| (id, blob_to_embedding(&blob)))
+            .collect();
+
+        if faces.is_empty() {
+            self.conn.execute(
+                "UPDATE persons SET centroid_embedding = NULL, representative_face_id = NULL \
+                 WHERE id = ?1",
+                params![person_id],
+            )?;
+            return Ok(());
+        }
+
+        // Compute the mean embedding.
+        let dim = faces[0].1.len();
+        let mut centroid = vec![0f32; dim];
+        for (_, emb) in &faces {
+            for (c, v) in centroid.iter_mut().zip(emb.iter()) {
+                *c += v;
+            }
+        }
+        let n = faces.len() as f32;
+        for c in &mut centroid {
+            *c /= n;
+        }
+
+        // L2-normalise the centroid so cosine similarity still works.
+        let norm: f32 = centroid.iter().map(|v| v * v).sum::<f32>().sqrt().max(1e-9);
+        for c in &mut centroid {
+            *c /= norm;
+        }
+
+        // Pick the face closest to the centroid.
+        let best_id = faces
+            .iter()
+            .max_by(|(_, a), (_, b)| {
+                cosine_similarity(a, &centroid)
+                    .partial_cmp(&cosine_similarity(b, &centroid))
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+            .map(|(id, _)| *id);
+
+        let centroid_blob = embedding_to_blob(&centroid);
+        self.conn.execute(
+            "UPDATE persons SET centroid_embedding = ?1, representative_face_id = ?2 WHERE id = ?3",
+            params![centroid_blob, best_id, person_id],
+        )?;
+        Ok(())
+    }
+
+    /// Return every person together with image path and bbox of their
+    /// representative face (the detection closest to the person centroid).
+    ///
+    /// Persons with no assigned faces still appear in the list but with
+    /// `image_path = None` and `bbox = None`.
+    pub fn all_persons_with_representatives(&self) -> anyhow::Result<Vec<PersonWithRep>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT p.id, p.name,
+                    i.path,
+                    fd.bbox_x1, fd.bbox_y1, fd.bbox_x2, fd.bbox_y2,
+                    fd.id
+             FROM persons p
+             LEFT JOIN face_detections fd ON fd.id = p.representative_face_id
+             LEFT JOIN images i           ON i.id  = fd.image_id
+             ORDER BY p.name",
+        )?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                    row.get::<_, Option<f32>>(3)?,
+                    row.get::<_, Option<f32>>(4)?,
+                    row.get::<_, Option<f32>>(5)?,
+                    row.get::<_, Option<f32>>(6)?,
+                    row.get::<_, Option<i64>>(7)?,
+                ))
+            })?
+            .filter_map(|r| r.ok())
+            .map(|(id, name, path, x1, y1, x2, y2, face_id)| PersonWithRep {
+                id,
+                name,
+                image_path: path.map(crate::path_from_db),
+                bbox: match (x1, y1, x2, y2) {
+                    (Some(a), Some(b), Some(c), Some(d)) => Some([a, b, c, d]),
+                    _ => None,
+                },
+                face_id,
+            })
+            .collect();
+        Ok(rows)
+    }
+
+    /// Count real untagged non-skipped faces across all present images.
+    pub fn untagged_face_count(&self) -> anyhow::Result<usize> {
+        let count: i64 = self.conn.query_row(
+            "SELECT COUNT(*)
+             FROM face_detections fd
+             JOIN images i ON i.id = fd.image_id
+             WHERE fd.person_id IS NULL
+               AND fd.skipped = 0
+               AND fd.confidence >= 0.0
+               AND NOT (fd.bbox_x1 = 0.0 AND fd.bbox_y1 = 0.0
+                        AND fd.bbox_x2 = 0.0 AND fd.bbox_y2 = 0.0)
+               AND i.status = 'present'",
+            [],
+            |r| r.get(0),
+        )?;
+        Ok(count as usize)
     }
 }
 

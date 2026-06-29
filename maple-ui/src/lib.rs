@@ -22,6 +22,7 @@ mod face_tag;
 mod grid;
 mod image_loader;
 mod import;
+mod people_page;
 mod settings_window;
 pub mod thumbnail;
 
@@ -78,6 +79,48 @@ pub fn run() -> anyhow::Result<()> {
     // Library is the default page — load immediately.
     grid.load(SearchQuery::default());
 
+    // ── People page ────────────────────────────────────────────────
+    let people = people_page::PeoplePage::new(db.clone());
+    window.set_people_items(people.model());
+
+    window.on_people_page_shown({
+        let people = people.clone();
+        let w = window.as_weak();
+        move || {
+            let w2 = w.clone();
+            if let Some(win) = w.upgrade() {
+                win.set_people_untagged_count(people.untagged_count() as i32);
+            }
+            people.load(w2);
+        }
+    });
+
+    window.on_people_person_activated({
+        let grid = grid.clone();
+        let w = window.as_weak();
+        move |person_id| {
+            grid.load(SearchQuery::default().with_person(person_id as i64));
+            if let Some(win) = w.upgrade() {
+                win.set_page(crate::Page::Library);
+            }
+        }
+    });
+
+    window.on_people_tag_faces({
+        let db = db.clone();
+        let people = people.clone();
+        let w = window.as_weak();
+        move || {
+            face_tag::open(db.clone());
+            // Refresh untagged count after the wizard is closed (best-effort;
+            // the window fires this callback synchronously, so the count
+            // updates when the user returns to the People page).
+            if let Some(win) = w.upgrade() {
+                win.set_people_untagged_count(people.untagged_count() as i32);
+            }
+        }
+    });
+
     window.on_library_shown({
         let grid = grid.clone();
         move || grid.load(SearchQuery::default())
@@ -109,10 +152,12 @@ pub fn run() -> anyhow::Result<()> {
     window.on_library_activated({
         let records = grid.records();
         let db = db.clone();
+        let w = window.as_weak();
         move |idx| {
             let snapshot = records.borrow().clone();
             if (idx as usize) < snapshot.len() {
-                detail::open(snapshot, idx as usize, db.clone());
+                let is_dark = w.upgrade().map(|w| w.get_dark()).unwrap_or(false);
+                detail::open(snapshot, idx as usize, db.clone(), is_dark);
             }
         }
     });
@@ -125,11 +170,13 @@ pub fn run() -> anyhow::Result<()> {
     // Build the initial location lists.
     window.on_import_page_shown({
         let w = window.as_weak();
+        let db = db.clone();
         let settings = maple_state::Settings::load();
         let home = home_dir();
         move || {
             let Some(w) = w.upgrade() else { return };
-            let locs = build_import_locations(&settings, &home);
+            let starred = starred_paths(&db);
+            let locs = build_import_locations(&settings, &home, &starred);
             let (favs, recents) = partition_locations(locs);
             w.set_import_favorites(favs);
             w.set_import_recents(recents);
@@ -174,12 +221,14 @@ pub fn run() -> anyhow::Result<()> {
 
     window.on_import_location_selected({
         let w = window.as_weak();
+        let db = db.clone();
         let source = import_source.clone();
         let settings = maple_state::Settings::load();
         let home = home_dir();
         move |id| {
             let Some(w) = w.upgrade() else { return };
-            let mut locs = build_import_locations(&settings, &home);
+            let starred = starred_paths(&db);
+            let mut locs = build_import_locations(&settings, &home, &starred);
 
             // Mark selected, deselect others.
             for loc in &mut locs {
@@ -201,17 +250,23 @@ pub fn run() -> anyhow::Result<()> {
 
     window.on_import_star_toggled({
         let w = window.as_weak();
+        let db = db.clone();
         let settings = maple_state::Settings::load();
         let home = home_dir();
         move |id| {
             let Some(w) = w.upgrade() else { return };
-            // Toggle star in-place (no persistence for now).
-            let mut locs = build_import_locations(&settings, &home);
-            for loc in &mut locs {
-                if loc.id == id.as_str() {
-                    loc.is_starred = !loc.is_starred;
+            let starred = starred_paths(&db);
+            let locs = build_import_locations(&settings, &home, &starred);
+            if let Some(loc) = locs.iter().find(|l| l.id == id.as_str()) {
+                let path = loc.path.as_str();
+                if starred.contains(path) {
+                    if let Ok(g) = db.lock() { let _ = g.remove_starred_path(path); }
+                } else {
+                    if let Ok(g) = db.lock() { let _ = g.add_starred_path(path); }
                 }
             }
+            let starred = starred_paths(&db);
+            let locs = build_import_locations(&settings, &home, &starred);
             let (favs, recents) = partition_locations(locs);
             w.set_import_favorites(favs);
             w.set_import_recents(recents);
@@ -278,10 +333,20 @@ pub fn run() -> anyhow::Result<()> {
         }
     });
 
+    // ── Theme propagation ──────────────────────────────────────────
+    window.on_theme_toggled(|is_dark| {
+        settings_window::set_dark(is_dark);
+        detail::set_dark(is_dark);
+    });
+
     // ── Other secondary windows ────────────────────────────────────
     window.on_settings_clicked({
         let db = db.clone();
-        move || settings_window::open(db.clone())
+        let w = window.as_weak();
+        move || {
+            let is_dark = w.upgrade().map(|w| w.get_dark()).unwrap_or(false);
+            settings_window::open(db.clone(), is_dark);
+        }
     });
     window.on_collections_clicked({
         let db = db.clone();
@@ -319,21 +384,32 @@ struct LocData {
     is_selected: bool,
 }
 
+fn starred_paths(db: &std::sync::Arc<std::sync::Mutex<maple_db::Database>>) -> std::collections::HashSet<String> {
+    db.lock()
+        .ok()
+        .and_then(|g| g.get_starred_paths().ok())
+        .unwrap_or_default()
+        .into_iter()
+        .collect()
+}
+
 fn build_import_locations(
     settings: &maple_state::Settings,
     home: &std::path::PathBuf,
+    starred: &std::collections::HashSet<String>,
 ) -> Vec<LocData> {
     let mut locs: Vec<LocData> = Vec::new();
 
     // Pictures directory
     let pictures = home.join("Pictures");
     if pictures.is_dir() {
+        let path = pictures.to_string_lossy().into_owned();
         locs.push(LocData {
             id: "pictures".into(),
             name: "Pictures Library".into(),
-            path: pictures.to_string_lossy().into_owned(),
+            is_starred: starred.contains(&path),
+            path,
             count: 0,
-            is_starred: true,
             is_selected: false,
         });
     }
@@ -341,12 +417,13 @@ fn build_import_locations(
     // Desktop
     let desktop = home.join("Desktop");
     if desktop.is_dir() {
+        let path = desktop.to_string_lossy().into_owned();
         locs.push(LocData {
             id: "desktop".into(),
             name: "Desktop".into(),
-            path: desktop.to_string_lossy().into_owned(),
+            is_starred: starred.contains(&path),
+            path,
             count: 0,
-            is_starred: false,
             is_selected: false,
         });
     }
@@ -354,12 +431,13 @@ fn build_import_locations(
     // Downloads
     let downloads = home.join("Downloads");
     if downloads.is_dir() {
+        let path = downloads.to_string_lossy().into_owned();
         locs.push(LocData {
             id: "downloads".into(),
             name: "Downloads".into(),
-            path: downloads.to_string_lossy().into_owned(),
+            is_starred: starred.contains(&path),
+            path,
             count: 0,
-            is_starred: false,
             is_selected: false,
         });
     }
@@ -367,12 +445,13 @@ fn build_import_locations(
     // Library directory (from settings) if different from Pictures
     let lib = settings.library_dir.clone();
     if lib.is_dir() && lib != home.join("Pictures") {
+        let path = lib.to_string_lossy().into_owned();
         locs.push(LocData {
             id: "library".into(),
             name: "Library Folder".into(),
-            path: lib.to_string_lossy().into_owned(),
+            is_starred: starred.contains(&path),
+            path,
             count: 0,
-            is_starred: false,
             is_selected: false,
         });
     }

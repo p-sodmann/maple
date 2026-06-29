@@ -11,11 +11,12 @@ import { ImportWindow, ImportItem } from "import.slint";
 import { SettingsWindow } from "settings.slint";
 import { CollectionsWindow, CollectionEntry } from "collections.slint";
 import { FaceTagWindow } from "face_tag.slint";
+import { PeoplePage, PersonItem } from "people.slint";
 
 // Re-export second-window types so Rust can build & show them.
 export { ThumbItem, DetailWindow, CollectionChip, FaceBox, FacePersonSuggestion,
          ImportWindow, ImportItem, SettingsWindow, CollectionsWindow, CollectionEntry,
-         FaceTagWindow, ImportLocation }
+         FaceTagWindow, ImportLocation, PersonItem }
 
 export enum Page { library, import, people, collections }
 
@@ -284,6 +285,9 @@ export component AppWindow inherits Window {
     background: Theme.bg;
     default-font-size: 14px;
 
+    // Exposes the current dark-mode state so Rust can read it for secondary windows.
+    in-out property <bool> dark <=> Theme.dark;
+
     // ── Navigation state ─────────────────────────────────────────
     in-out property <Page> page: Page.library;
 
@@ -298,6 +302,10 @@ export component AppWindow inherits Window {
     in property <[ImportLocation]> import-favorites:    [];
     in property <[ImportLocation]> import-recents:      [];
     in-out property <bool>         import-scanning:     false;
+
+    // ── People page ───────────────────────────────────────────────
+    in property <[PersonItem]> people-items;
+    in property <int>          people-untagged-count: 0;
 
     // ── AI / faces toggle state (library top-bar) ─────────────────
     in-out property <bool> ai-on:    false;
@@ -317,6 +325,10 @@ export component AppWindow inherits Window {
     callback import-star-toggled(string);
     callback import-start-scan;
 
+    callback people-page-shown;
+    callback people-person-activated(int);  // person_id → filter library
+    callback people-tag-faces;
+
     callback toggle-ai;
     callback toggle-faces;
     callback detect-faces-clicked;
@@ -325,6 +337,7 @@ export component AppWindow inherits Window {
     callback settings-clicked;
     callback collections-clicked;
     callback debug-clicked;
+    callback theme-toggled(bool);  // fires with new dark value so Rust can sync secondary windows
 
     // ── Shell layout ──────────────────────────────────────────────
     HorizontalLayout {
@@ -401,7 +414,12 @@ export component AppWindow inherits Window {
                 NavItem {
                     active: root.page == Page.people;
                     label: "People";
-                    clicked => { root.page = Page.people; }
+                    clicked => {
+                        if (root.page != Page.people) {
+                            root.page = Page.people;
+                            root.people-page-shown();
+                        }
+                    }
                     PeopleIcon {
                         clr: root.page == Page.people ? Theme.accent-text : Theme.ink-2;
                     }
@@ -521,7 +539,10 @@ export component AppWindow inherits Window {
                             }
 
                             theme-ta := TouchArea {
-                                clicked => { Theme.dark = !Theme.dark; }
+                                clicked => {
+                                    Theme.dark = !Theme.dark;
+                                    root.theme-toggled(Theme.dark);
+                                }
                             }
                         }
                     }
@@ -577,11 +598,61 @@ export component AppWindow inherits Window {
                         }
                     }
 
+                    // Page title — import
+                    if root.page == Page.import: Rectangle {
+                        horizontal-stretch: 0;
+                        height: 44px;
+                        y: (parent.height - self.height) / 2;
+                        VerticalLayout {
+                            spacing: 2px;
+                            alignment: center;
+                            Text {
+                                text: "Import Photos";
+                                color: Theme.ink;
+                                font-size: 18px;
+                                font-weight: 700;
+                                letter-spacing: -0.2px;
+                            }
+                            Text {
+                                text: "Choose where your photos come from";
+                                color: Theme.ink-3;
+                                font-size: 12px;
+                                font-weight: 500;
+                            }
+                        }
+                    }
+
+                    // Page title — people
+                    if root.page == Page.people: Rectangle {
+                        height: 38px;
+                        horizontal-stretch: 0;
+                        y: (parent.height - self.height) / 2;
+                        HorizontalLayout {
+                            spacing: 8px;
+                            alignment: start;
+                            Text {
+                                text: "People";
+                                color: Theme.ink;
+                                font-size: 18px;
+                                font-weight: 700;
+                                letter-spacing: -0.2px;
+                                vertical-alignment: center;
+                            }
+                            Text {
+                                text: root.people-items.length + " people";
+                                color: Theme.ink-3;
+                                font-size: 13px;
+                                font-weight: 500;
+                                vertical-alignment: center;
+                            }
+                        }
+                    }
+
                     // Spacer — pushes search and actions to the right
                     Rectangle { horizontal-stretch: 1; }
 
-                    // Search field
-                    Rectangle {
+                    // Search field — library only
+                    if root.page == Page.library: Rectangle {
                         width: 300px;
                         height: 38px;
                         horizontal-stretch: 0;
@@ -689,6 +760,31 @@ export component AppWindow inherits Window {
                             clicked => { root.import-start-scan(); }
                         }
                     }
+
+                    // People actions
+                    if root.page == Page.people: Rectangle {
+                        height: 38px;
+                        horizontal-stretch: 0;
+                        y: (parent.height - self.height) / 2;
+                        border-radius: Theme.radius-btn;
+                        background: root.people-untagged-count > 0
+                            ? Theme.accent
+                            : Theme.field;
+                        border-width: root.people-untagged-count > 0 ? 0 : 1px;
+                        border-color: Theme.border;
+                        HorizontalLayout {
+                            padding-left: 18px; padding-right: 18px;
+                            alignment: center;
+                            Text {
+                                text: root.people-untagged-count > 0
+                                    ? "Tag Faces  ·  " + root.people-untagged-count + " left"
+                                    : "Tag Faces";
+                                color: root.people-untagged-count > 0 ? #FFFFFF : Theme.ink-3;
+                                font-size: 13.5px; font-weight: 600; vertical-alignment: center;
+                            }
+                        }
+                        TouchArea { clicked => { root.people-tag-faces(); } }
+                    }
                 }
             }
 
@@ -714,10 +810,12 @@ export component AppWindow inherits Window {
                 star-toggled(id)      => { root.import-star-toggled(id); }
             }
 
-            if root.page == Page.people: StubPage {
+            if root.page == Page.people: PeoplePage {
                 vertical-stretch: 1;
-                title: "People";
-                body: "Face groups and naming. Use Detect Faces to start building your people library.";
+                people: root.people-items;
+                untagged-count: root.people-untagged-count;
+                person-activated(id) => { root.people-person-activated(id); }
+                tag-faces-clicked    => { root.people-tag-faces(); }
             }
 
             if root.page == Page.collections: StubPage {

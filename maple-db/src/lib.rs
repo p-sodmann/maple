@@ -29,7 +29,7 @@ pub use collections::Collection;
 pub use hasher::spawn_hasher;
 pub use stacker::update_stacks;
 pub use face_detector::{spawn_face_tagger, DetectedFace, FaceDetector, FaceTagger};
-pub use faces::{best_person_match, best_person_matches, cosine_similarity, FaceDetection, Person};
+pub use faces::{best_person_match, best_person_matches, cosine_similarity, FaceDetection, Person, PersonWithRep};
 pub use metadata::{extract_metadata, spawn_metadata_filler, ImageMetadata};
 pub use query::SearchQuery;
 pub use scanner::LibraryScanner;
@@ -193,6 +193,37 @@ impl Database {
         conn.execute_batch("PRAGMA journal_mode=WAL;")?;
         schema::ensure_schema(&conn)?;
         Ok(Self { conn })
+    }
+
+    // ── Starred import paths ──────────────────────────────────────
+
+    pub fn add_starred_path(&self, path: &str) -> anyhow::Result<()> {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as i64;
+        self.conn.execute(
+            "INSERT OR IGNORE INTO import_starred_paths (path, created_at) VALUES (?1, ?2)",
+            params![path, now],
+        )?;
+        Ok(())
+    }
+
+    pub fn remove_starred_path(&self, path: &str) -> anyhow::Result<()> {
+        self.conn.execute(
+            "DELETE FROM import_starred_paths WHERE path = ?1",
+            params![path],
+        )?;
+        Ok(())
+    }
+
+    pub fn get_starred_paths(&self) -> anyhow::Result<Vec<String>> {
+        let mut stmt = self.conn.prepare("SELECT path FROM import_starred_paths")?;
+        let paths = stmt
+            .query_map([], |r| r.get::<_, String>(0))?
+            .filter_map(|r| r.ok())
+            .collect();
+        Ok(paths)
     }
 
     // ── Write operations ─────────────────────────────────────────
@@ -576,9 +607,9 @@ impl Database {
                 )
             }
             (Some(text), None) => {
-                self.search_images_text(text, query.limit, query.offset, query.collection_id)
+                self.search_images_text(text, query.limit, query.offset, query.collection_id, query.person_id)
             }
-            (None, _) => self.search_images_all(query.limit, query.offset, query.collection_id),
+            (None, _) => self.search_images_all(query.limit, query.offset, query.collection_id, query.person_id),
         }
     }
 
@@ -588,6 +619,7 @@ impl Database {
         limit: Option<usize>,
         offset: Option<usize>,
         collection_id: Option<i64>,
+        person_id: Option<i64>,
     ) -> anyhow::Result<Vec<LibraryImage>> {
         use rusqlite::types::Value;
 
@@ -596,6 +628,11 @@ impl Database {
 
         let coll_clause = if collection_id.is_some() {
             " AND i.id IN (SELECT image_id FROM collection_images WHERE collection_id = ?)"
+        } else {
+            ""
+        };
+        let person_clause = if person_id.is_some() {
+            " AND i.id IN (SELECT image_id FROM face_detections WHERE person_id = ?)"
         } else {
             ""
         };
@@ -621,7 +658,7 @@ impl Database {
                AND (
                  i.stack_id IS NULL
                  OR i.id = sc.cover_id
-               ){coll_clause}
+               ){coll_clause}{person_clause}
              ORDER BY i.added_at DESC
              LIMIT ? OFFSET ?"
         );
@@ -629,6 +666,9 @@ impl Database {
         let mut params: Vec<Value> = Vec::new();
         if let Some(cid) = collection_id {
             params.push(Value::Integer(cid));
+        }
+        if let Some(pid) = person_id {
+            params.push(Value::Integer(pid));
         }
         params.push(Value::Integer(limit));
         params.push(Value::Integer(offset));
@@ -651,6 +691,7 @@ impl Database {
         limit: Option<usize>,
         offset: Option<usize>,
         collection_id: Option<i64>,
+        person_id: Option<i64>,
     ) -> anyhow::Result<Vec<LibraryImage>> {
         let limit = limit.unwrap_or(500) as i64;
         let offset = offset.unwrap_or(0) as i64;
@@ -691,6 +732,11 @@ impl Database {
         } else {
             ""
         };
+        let person_clause = if person_id.is_some() {
+            " AND i.id IN (SELECT image_id FROM face_detections WHERE person_id = ?)"
+        } else {
+            ""
+        };
 
         let sql = format!(
             "WITH stack_covers AS (
@@ -717,7 +763,7 @@ impl Database {
                AND (
                  i.stack_id IS NULL
                  OR i.id = sc.cover_id
-               ){coll_clause}
+               ){coll_clause}{person_clause}
              ORDER BY i.added_at DESC
              LIMIT ? OFFSET ?"
         );
@@ -730,6 +776,9 @@ impl Database {
             .collect();
         if let Some(cid) = collection_id {
             params.push(Value::Integer(cid));
+        }
+        if let Some(pid) = person_id {
+            params.push(Value::Integer(pid));
         }
         let params: Vec<Value> = params
             .into_iter()
