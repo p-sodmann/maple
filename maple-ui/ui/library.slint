@@ -6,8 +6,7 @@
 // thumbnails on background threads (see src/grid.rs). Like the old FlowBox this
 // instantiates every tile; true virtualization is a later optimisation.
 import { Theme } from "theme.slint";
-import { FlatButton } from "widgets.slint";
-import { LineEdit, ScrollView } from "std-widgets.slint";
+import { ScrollView } from "std-widgets.slint";
 
 // One grid cell. `image` is empty until `loaded` flips true.
 export struct ThumbItem {
@@ -127,57 +126,12 @@ export component LibraryGridView {
 export component LibraryPage inherits Rectangle {
     in property <[ThumbItem]> items;
     in property <length> cell-size: 160px;
-    callback back;
     callback search-changed(string);
     callback activated(int);
-    callback settings-clicked;
-    callback collections-clicked;
-    callback detect-faces-clicked;
-    callback tag-faces-clicked;
 
-    background: Theme.window-bg;
+    background: Theme.bg;
 
     VerticalLayout {
-        // ── Header (back + title + search + settings) ────────────
-        HorizontalLayout {
-            padding: 8px;
-            spacing: 8px;
-
-            FlatButton {
-                text: "← Back";
-                clicked => { root.back(); }
-            }
-            Text {
-                text: "Library";
-                color: Theme.fg;
-                font-size: 18px;
-                font-weight: 600;
-                vertical-alignment: center;
-            }
-            Rectangle { horizontal-stretch: 1; }
-            LineEdit {
-                width: 320px;
-                placeholder-text: "Search filename, camera, lens…";
-                edited(text) => { root.search-changed(text); }
-            }
-            FlatButton {
-                text: "Detect Faces";
-                clicked => { root.detect-faces-clicked(); }
-            }
-            FlatButton {
-                text: "Tag Faces";
-                clicked => { root.tag-faces-clicked(); }
-            }
-            FlatButton {
-                text: "Collections";
-                clicked => { root.collections-clicked(); }
-            }
-            FlatButton {
-                text: "Settings";
-                clicked => { root.settings-clicked(); }
-            }
-        }
-
         // ── Grid ─────────────────────────────────────────────────
         LibraryGridView {
             vertical-stretch: 1;

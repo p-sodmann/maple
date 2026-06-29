@@ -1,20 +1,23 @@
-// Import browser window (Slint port of views/source_picker.rs + image_browser/).
+// Import browser window + embedded ImportPage.
 //
-// A separate top-level Window opened from the home page (not a page within
-// AppWindow). Held as a thread_local singleton in src/import.rs.
-//
-// Two internal phases driven by `root.in-browser`:
-//   false → picker:  choose source + destination folders, then "Start Scan"
-//   true  → browser: scan-results grid + large preview + filmstrip + copy
-//
-// The grid follows the same LibraryGridView pattern: absolute-positioned
-// tiles inside a ScrollView viewport, column count derived from width.
+// ImportWindow: separate top-level Window (legacy browser phase).
+// ImportPage:   Rectangle embedded in AppWindow's sidebar shell.
 
 import { Theme } from "theme.slint";
 import { FlatButton, PillButton } from "widgets.slint";
 import { ScrollView } from "std-widgets.slint";
 
 // ── Exported structs ──────────────────────────────────────────────
+
+// A source location shown in the ImportPage favourites / recents lists.
+export struct ImportLocation {
+    id:          string,
+    name:        string,
+    path:        string,
+    count:       int,
+    is-starred:  bool,
+    is-selected: bool,
+}
 
 export struct ImportItem {
     index: int,
@@ -82,13 +85,11 @@ component ImportGridView {
                         vertical-alignment: center;
                     }
 
-                    // Selected overlay (accent tint).
                     if item.is-selected: Rectangle {
                         border-radius: Theme.thumb-radius;
                         background: Theme.accent.with-alpha(0.35);
                     }
 
-                    // Imported badge (dimming + tick).
                     if item.is-imported: Rectangle {
                         border-radius: Theme.thumb-radius;
                         background: #000000.with-alpha(0.45);
@@ -101,7 +102,6 @@ component ImportGridView {
                         }
                     }
 
-                    // Selected checkmark (over the imported overlay if both).
                     if item.is-selected: Rectangle {
                         x: parent.width - 22px;
                         y: 4px;
@@ -119,7 +119,6 @@ component ImportGridView {
                         }
                     }
 
-                    // Hover ring.
                     if ta.has-hover: Rectangle {
                         border-radius: Theme.thumb-radius;
                         border-width: 2px;
@@ -154,7 +153,6 @@ export component ImportWindow inherits Window {
     background: Theme.window-bg;
     default-font-size: 14px;
 
-    // State (set from Rust)
     in-out property <bool> in-browser: false;
 
     // Picker state
@@ -172,12 +170,11 @@ export component ImportWindow inherits Window {
     in property <string> status-text: "Pick a source folder to begin.";
     in property <bool> copying: false;
 
-    // Callbacks (wired in Rust)
     callback close-requested;
     callback pick-source;
     callback pick-dest;
     callback start-scan;
-    callback item-clicked(int);  // toggle-select + preview
+    callback item-clicked(int);
     callback copy-selected;
     callback nav-prev;
     callback nav-next;
@@ -210,7 +207,6 @@ export component ImportWindow inherits Window {
             width: 100%;
             height: 100%;
 
-            // ── Header ──────────────────────────────────────────────
             Rectangle {
                 height: 46px;
                 background: Theme.sidebar-bg;
@@ -252,7 +248,6 @@ export component ImportWindow inherits Window {
                 }
             }
 
-            // ── Picker (phase 1) ─────────────────────────────────────
             if !root.in-browser: VerticalLayout {
                 vertical-stretch: 1;
                 alignment: center;
@@ -309,16 +304,13 @@ export component ImportWindow inherits Window {
                 }
             }
 
-            // ── Browser (phase 2) ─────────────────────────────────────
             if root.in-browser: HorizontalLayout {
                 vertical-stretch: 1;
                 spacing: 0;
 
-                // Preview pane (left, takes most space)
                 VerticalLayout {
                     horizontal-stretch: 1;
 
-                    // Large preview image
                     Rectangle {
                         vertical-stretch: 1;
                         background: Theme.photo-surface;
@@ -340,7 +332,6 @@ export component ImportWindow inherits Window {
                         }
                     }
 
-                    // Filename + nav + status strip
                     Rectangle {
                         height: 36px;
                         background: Theme.sidebar-bg;
@@ -369,13 +360,11 @@ export component ImportWindow inherits Window {
                     }
                 }
 
-                // Thin separator
                 Rectangle {
                     width: 1px;
                     background: Theme.separator-color;
                 }
 
-                // Thumbnail grid / filmstrip (right panel)
                 VerticalLayout {
                     width: 280px;
 
@@ -387,7 +376,6 @@ export component ImportWindow inherits Window {
                         clicked(i) => { root.item-clicked(i); }
                     }
 
-                    // Status / progress bar
                     Rectangle {
                         height: 28px;
                         background: Theme.card-bg;
@@ -399,6 +387,366 @@ export component ImportWindow inherits Window {
                             horizontal-alignment: center;
                             overflow: elide;
                         }
+                    }
+                }
+            }
+        }
+    }
+}
+
+// ── Embedded import source-picker (sidebar-shell design) ──────────
+//
+// Shown as a page inside AppWindow.  Lets the user pick a source folder
+// (browse or choose a favourite / recent) then fires import-start-scan
+// via the top-bar "Start Scan" button.
+
+component FolderIcon inherits Path {
+    in property <color> clr: Theme.ink-2;
+    in property <length> sz: 20px;
+    width: root.sz;
+    height: root.sz;
+    viewbox-width: 24;
+    viewbox-height: 24;
+    fill: root.clr;
+    commands: "M3 7Q3 5 5 5H9L11 7.2H19Q21 7.2 21 9.2V19Q21 21 19 21H5Q3 21 3 19Z";
+}
+
+component SectionLabel inherits Text {
+    color: Theme.ink-3;
+    font-size: 11px;
+    font-weight: 600;
+    letter-spacing: 0.7px;
+}
+
+component LocationRow inherits Rectangle {
+    in property <ImportLocation> loc;
+    callback selected;
+    callback star-clicked;
+
+    height: 50px;
+    background: root.loc.is-selected ? Theme.accent-tint : transparent;
+    animate background { duration: 100ms; }
+
+    HorizontalLayout {
+        padding-left: 15px;
+        padding-right: 10px;
+        spacing: 13px;
+        alignment: start;
+
+        FolderIcon { clr: Theme.ink-2; sz: 20px; }
+
+        VerticalLayout {
+            horizontal-stretch: 1;
+            alignment: center;
+            spacing: 2px;
+            Text {
+                text: root.loc.name;
+                color: Theme.ink;
+                font-size: 14px;
+                font-weight: 600;
+                overflow: elide;
+            }
+            Text {
+                text: root.loc.path;
+                color: Theme.ink-3;
+                font-size: 12px;
+                font-weight: 500;
+                overflow: elide;
+            }
+        }
+
+        Text {
+            text: root.loc.count > 0 ? root.loc.count + "" : "";
+            color: Theme.ink-3;
+            font-size: 11.5px;
+            font-weight: 500;
+            vertical-alignment: center;
+        }
+
+        // Star button
+        Rectangle {
+            width: 30px; height: 30px;
+            border-radius: 6px;
+            background: star-ta.has-hover ? Theme.border : transparent;
+            Text {
+                text: root.loc.is-starred ? "★" : "☆";
+                color: root.loc.is-starred ? Theme.accent : Theme.ink-3;
+                font-size: 15px;
+                horizontal-alignment: center;
+                vertical-alignment: center;
+            }
+            star-ta := TouchArea {
+                clicked => { root.star-clicked(); }
+            }
+        }
+
+        // Selection tick
+        if root.loc.is-selected: Rectangle {
+            width: 20px; height: 20px;
+            border-radius: 10px;
+            background: Theme.accent;
+            Text {
+                text: "✓";
+                color: white;
+                font-size: 11px;
+                font-weight: 700;
+                horizontal-alignment: center;
+                vertical-alignment: center;
+            }
+        }
+    }
+
+    row-ta := TouchArea {
+        clicked => { root.selected(); }
+    }
+}
+
+export component ImportPage inherits Rectangle {
+    in property <string>           source-path:  "";
+    in property <string>           source-name:  "";
+    in property <int>              source-count: 0;
+    in property <[ImportLocation]> favorites:    [];
+    in property <[ImportLocation]> recents:      [];
+
+    callback browse;
+    callback clear;
+    callback location-selected(string);
+    callback star-toggled(string);
+
+    background: Theme.bg;
+
+    ScrollView {
+        viewport-width: self.visible-width;
+
+        VerticalLayout {
+            width: min(760px, parent.visible-width - 44px);
+            x: max(22px, (parent.visible-width - 760px) / 2);
+            padding-top: 30px;
+            padding-bottom: 40px;
+            spacing: 0;
+
+            Text {
+                text: "Import Photos";
+                color: Theme.ink;
+                font-size: 30px;
+                font-weight: 800;
+                letter-spacing: -0.75px;
+            }
+            Rectangle { height: 6px; }
+            Text {
+                text: "Choose where your photos come from. They'll be copied into your library.";
+                color: Theme.ink-2;
+                font-size: 15px;
+                font-weight: 500;
+                wrap: word-wrap;
+            }
+
+            // ── Source selector ───────────────────────────────────
+            Rectangle { height: 24px; }
+
+            // Selected state
+            if root.source-path != "": Rectangle {
+                height: 78px;
+                border-radius: Theme.radius-card;
+                background: Theme.surface;
+                border-width: 1px;
+                border-color: Theme.border;
+                drop-shadow-blur: 2px;
+                drop-shadow-color: #00000008;
+
+                HorizontalLayout {
+                    padding: 18px;
+                    spacing: 14px;
+                    alignment: start;
+
+                    // Folder icon in accent tint circle
+                    Rectangle {
+                        width: 44px; height: 44px;
+                        border-radius: 11px;
+                        background: Theme.accent-tint;
+                        FolderIcon {
+                            x: (parent.width - self.width) / 2;
+                            y: (parent.height - self.height) / 2;
+                            clr: Theme.accent-text;
+                            sz: 22px;
+                        }
+                    }
+
+                    VerticalLayout {
+                        horizontal-stretch: 1;
+                        alignment: center;
+                        spacing: 3px;
+                        Text {
+                            text: root.source-name;
+                            color: Theme.ink;
+                            font-size: 15px;
+                            font-weight: 600;
+                            overflow: elide;
+                        }
+                        Text {
+                            text: root.source-path;
+                            color: Theme.ink-3;
+                            font-size: 12.5px;
+                            font-weight: 500;
+                            overflow: elide;
+                        }
+                    }
+
+                    Text {
+                        text: root.source-count > 0 ? root.source-count + " photos" : "";
+                        color: Theme.ink-3;
+                        font-size: 12px;
+                        font-weight: 500;
+                        vertical-alignment: center;
+                    }
+
+                    // Change button
+                    Rectangle {
+                        height: 36px;
+                        border-radius: Theme.radius-btn;
+                        background: change-ta.has-hover ? Theme.border : transparent;
+                        border-width: 1px;
+                        border-color: Theme.border;
+                        HorizontalLayout {
+                            padding-left: 14px;
+                            padding-right: 14px;
+                            alignment: center;
+                            Text {
+                                text: "Change";
+                                color: Theme.ink-2;
+                                font-size: 13px;
+                                font-weight: 600;
+                                vertical-alignment: center;
+                            }
+                        }
+                        change-ta := TouchArea { clicked => { root.clear(); } }
+                    }
+                }
+            }
+
+            // Empty / browse state
+            if root.source-path == "": Rectangle {
+                height: 160px;
+                border-radius: Theme.radius-card;
+                background: Theme.surface;
+                border-width: 1.5px;
+                border-color: Theme.border;
+                clip: true;
+
+                VerticalLayout {
+                    alignment: center;
+                    spacing: 14px;
+                    padding: 30px;
+
+                    HorizontalLayout {
+                        alignment: center;
+                        Rectangle {
+                            width: 52px; height: 52px;
+                            border-radius: 13px;
+                            background: Theme.field;
+                            FolderIcon {
+                                x: (parent.width - self.width) / 2;
+                                y: (parent.height - self.height) / 2;
+                                clr: Theme.ink-2;
+                                sz: 26px;
+                            }
+                        }
+                    }
+
+                    Text {
+                        text: "Choose a source folder";
+                        color: Theme.ink;
+                        font-size: 16px;
+                        font-weight: 600;
+                        horizontal-alignment: center;
+                    }
+                    Text {
+                        text: "Or pick one from Favorites or Recent below";
+                        color: Theme.ink-3;
+                        font-size: 13.5px;
+                        font-weight: 500;
+                        horizontal-alignment: center;
+                    }
+
+                    HorizontalLayout {
+                        alignment: center;
+                        Rectangle {
+                            width: 130px;
+                            height: 40px;
+                            border-radius: Theme.radius-btn;
+                            background: browse-ta.has-hover ? Theme.accent.darker(0.1) : Theme.accent;
+                            animate background { duration: 100ms; }
+                            drop-shadow-blur: 2px;
+                            drop-shadow-color: #A4422D55;
+                            Text {
+                                text: "Browse…";
+                                color: #FFFFFF;
+                                font-size: 14px;
+                                font-weight: 600;
+                                horizontal-alignment: center;
+                                vertical-alignment: center;
+                            }
+                            browse-ta := TouchArea { clicked => { root.browse(); } }
+                        }
+                    }
+                }
+            }
+
+            // ── Favorites ─────────────────────────────────────────
+            if root.favorites.length > 0: Rectangle { height: 30px; }
+            if root.favorites.length > 0: SectionLabel { text: "FAVORITES"; }
+            if root.favorites.length > 0: Rectangle { height: 8px; }
+            if root.favorites.length > 0: Rectangle {
+                height: root.favorites.length * 51px;
+                border-radius: Theme.radius-card;
+                background: Theme.surface;
+                border-width: 1px;
+                border-color: Theme.border;
+                clip: true;
+
+                VerticalLayout {
+                    for loc in root.favorites: LocationRow {
+                        loc: loc;
+                        selected => { root.location-selected(loc.id); }
+                        star-clicked => { root.star-toggled(loc.id); }
+                    }
+                }
+            }
+
+            // ── Recent locations ──────────────────────────────────
+            Rectangle { height: 26px; }
+            SectionLabel { text: "RECENT LOCATIONS"; }
+            Rectangle { height: 8px; }
+
+            if root.recents.length == 0: Rectangle {
+                height: 60px;
+                border-radius: Theme.radius-card;
+                background: Theme.surface;
+                border-width: 1px;
+                border-color: Theme.border;
+                Text {
+                    text: "No recent locations yet";
+                    color: Theme.ink-3;
+                    font-size: 13.5px;
+                    font-weight: 500;
+                    horizontal-alignment: center;
+                    vertical-alignment: center;
+                }
+            }
+
+            if root.recents.length > 0: Rectangle {
+                height: root.recents.length * 51px;
+                border-radius: Theme.radius-card;
+                background: Theme.surface;
+                border-width: 1px;
+                border-color: Theme.border;
+                clip: true;
+
+                VerticalLayout {
+                    for loc in root.recents: LocationRow {
+                        loc: loc;
+                        selected => { root.location-selected(loc.id); }
+                        star-clicked => { root.star-toggled(loc.id); }
                     }
                 }
             }

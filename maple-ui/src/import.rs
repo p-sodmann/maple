@@ -76,8 +76,17 @@ struct Import {
     _copy_timer: Rc<RefCell<Option<Timer>>>,
 }
 
-/// Open (or reuse) the import window.
+/// Open (or reuse) the import window (legacy entry point).
+#[allow(dead_code)]
 pub fn open(db: Arc<Mutex<maple_db::Database>>) {
+    open_with_source(db, std::path::PathBuf::new());
+}
+
+/// Open the import browser window pre-seeded with `source_path`.
+///
+/// Called when the user clicks "Start Scan" on the embedded ImportPage.
+/// If `source_path` is empty the window opens on the picker phase as before.
+pub fn open_with_source(db: Arc<Mutex<maple_db::Database>>, source_path: std::path::PathBuf) {
     if IMPORT.with(|i| i.borrow().is_none()) {
         match build(db) {
             Ok(imp) => IMPORT.with(|cell| *cell.borrow_mut() = Some(imp)),
@@ -90,6 +99,13 @@ pub fn open(db: Arc<Mutex<maple_db::Database>>) {
     IMPORT.with(|cell| {
         let guard = cell.borrow();
         if let Some(imp) = guard.as_ref() {
+            // Pre-set the source path then trigger a scan if one was provided.
+            if !source_path.as_os_str().is_empty() {
+                let s = source_path.to_string_lossy().into_owned();
+                imp.window.set_source_path(SharedString::from(s));
+                *imp.source.borrow_mut() = source_path;
+                imp.window.invoke_start_scan();
+            }
             if let Err(e) = imp.window.show() {
                 tracing::error!("Failed to show import window: {e}");
             }

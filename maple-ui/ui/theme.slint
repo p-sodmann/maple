@@ -1,33 +1,49 @@
-// Maple design tokens — Slint port of the former GTK `style.css` palette.
+// Maple design tokens — CI system (light & dark).
 //
-// The old stylesheet used libadwaita named colours that adapted to light/dark.
-// Slint needs concrete values; a photo manager reads best on a dark neutral, so
-// the port ships a dark theme by default. Light-mode support can come later by
-// switching these to a `Palette`-driven scheme.
+// All components reference token names; swapping Theme.dark flips every colour
+// at once.  Legacy aliases at the bottom keep existing components compiling
+// without change during the incremental port.
 export global Theme {
-    // ── Brand ──────────────────────────────────────────────────────
-    // Warm maple-orange accent (was @accent_bg_color).
-    out property <color> accent: #e8590c;
-    out property <color> accent-fg: #ffffff;
+    // Toggle from the sidebar footer.
+    in-out property <bool> dark: false;
 
-    // ── Surfaces ───────────────────────────────────────────────────
-    out property <color> window-bg: #1c1c1f;
-    out property <color> card-bg: #2a2a2e;
-    out property <color> card-bg-hover: #34343a;
-    out property <color> sidebar-bg: #232327;
-    out property <color> photo-surface: #16161a; // backdrop behind full images
-    out property <color> placeholder-bg: #26262a;
+    // ── Semantic tokens ────────────────────────────────────────────
+    out property <color> bg:          root.dark ? #1B1714 : #FAF8F5;
+    out property <color> surface:     root.dark ? #241F1B : #FFFFFF;
+    out property <color> sidebar:     root.dark ? #141110 : #F4F0EA;
+    out property <color> border:      root.dark ? #322C26 : #EBE5DD;
+    out property <color> ink:         root.dark ? #F3EEE7 : #29251F;
+    out property <color> ink-2:       root.dark ? #B0A698 : #6F6960;
+    out property <color> ink-3:       root.dark ? #766E63 : #A39A8E;
+    out property <color> accent:      root.dark ? #CB6B52 : #B5543E;
+    out property <color> accent-text: root.dark ? #E08A72 : #8E3E2C;
+    out property <color> accent-tint: root.dark ? #3A2B25 : #F2E2DA;
+    out property <color> field:       root.dark ? #241F1B : #F4F0EA;
 
-    // ── Text ───────────────────────────────────────────────────────
-    out property <color> fg: #f2f2f2;
-    out property <color> dim-fg: #9a9a9a;
+    // ── Layout ─────────────────────────────────────────────────────
+    out property <length> sidebar-width:   228px;
+    out property <length> topbar-height:   62px;
+    out property <length> content-pad:     22px;
 
-    // ── Radii / spacing ────────────────────────────────────────────
-    out property <length> card-radius: 12px;
-    out property <length> thumb-radius: 8px;
-    out property <length> gap: 8px;
-    out property <length> pad: 12px;
+    // ── Radii ──────────────────────────────────────────────────────
+    out property <length> radius-thumb:    10px;
+    out property <length> radius-btn:      9px;
+    out property <length> radius-field:    10px;
+    out property <length> radius-card:     12px;
 
-    // ── Misc ───────────────────────────────────────────────────────
-    out property <color> separator-color: #3a3a3e;
+    // ── Legacy aliases (keep existing components compiling) ────────
+    out property <color> accent-fg:       #FFFFFF;
+    out property <color> window-bg:        root.bg;
+    out property <color> card-bg:          root.dark ? #2A2520 : #FFFFFF;
+    out property <color> card-bg-hover:    root.dark ? #322B25 : #F7F4F0;
+    out property <color> sidebar-bg:       root.sidebar;
+    out property <color> photo-surface:    root.dark ? #161614 : #F0EBE3;
+    out property <color> placeholder-bg:   root.dark ? #2C2824 : #E8E2DA;
+    out property <color> fg:               root.ink;
+    out property <color> dim-fg:           root.ink-3;
+    out property <color> separator-color:  root.border;
+    out property <length> card-radius:     root.radius-card;
+    out property <length> thumb-radius:    root.radius-thumb;
+    out property <length> gap:             14px;
+    out property <length> pad:             root.content-pad;
 }

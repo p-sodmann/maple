@@ -1,0 +1,414 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<script src="./support.js"></script>
+</head>
+<body>
+<x-dc>
+<helmet>
+<meta name="design_doc_mode" content="canvas">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Hanken+Grotesk:wght@400;500;600;700;800&family=IBM+Plex+Mono:wght@400;500&display=swap" rel="stylesheet">
+<style>
+  body{margin:0;font-family:'Hanken Grotesk',system-ui,sans-serif;-webkit-font-smoothing:antialiased;}
+  *{box-sizing:border-box;}
+</style>
+</helmet>
+
+<!-- ============ TITLE ============ -->
+<div style="position:absolute;left:60px;top:34px;width:900px">
+  <div style="font:800 30px 'Hanken Grotesk';color:#29251F;letter-spacing:-.02em">Maple — Visual Identity</div>
+  <div style="font:500 15px 'Hanken Grotesk';color:#7A726A;margin-top:6px">A warm, editorial light system for the photo library. Clean sans UI, muted maple accent, film-strip heritage. Built for light &amp; dark.</div>
+</div>
+
+<!-- ============ IDENTITY ============ -->
+<div data-drags-parent="1" style="position:absolute;left:60px;top:140px;font:600 13px 'Hanken Grotesk';color:#B5543E;letter-spacing:.08em;text-transform:uppercase">01 · Identity</div>
+
+<!-- logo frame -->
+<div style="position:absolute;left:60px;top:178px;width:560px">
+  <div data-drags-parent="1" style="position:absolute;top:-22px;font:500 12px 'Hanken Grotesk';color:rgba(60,50,40,.6)">Logo &amp; mark</div>
+  <div style="background:#fff;border:1px solid #EBE5DD;border-radius:10px;box-shadow:0 1px 3px rgba(0,0,0,.07);padding:30px">
+    <div style="display:flex;align-items:center;gap:16px">
+      <div style="position:relative;width:54px;height:54px;border-radius:15px;background:linear-gradient(150deg,#C2604A,#A4422D);box-shadow:0 3px 10px rgba(164,66,45,.32)">
+        <div style="position:absolute;left:8px;top:9px;bottom:9px;width:6px;display:flex;flex-direction:column;justify-content:space-between">
+          <span style="height:5px;border-radius:2px;background:#FAF3EC"></span><span style="height:5px;border-radius:2px;background:#FAF3EC"></span><span style="height:5px;border-radius:2px;background:#FAF3EC"></span>
+        </div>
+        <div style="position:absolute;left:20px;right:9px;top:9px;bottom:9px;border-radius:6px;background:#FAF3EC"></div>
+      </div>
+      <div>
+        <div style="font:700 30px 'Hanken Grotesk';color:#29251F;letter-spacing:-.03em;line-height:1">Maple</div>
+        <div style="font:500 11px 'IBM Plex Mono';color:#A39A8E;letter-spacing:.18em;margin-top:5px">PHOTO LIBRARY</div>
+      </div>
+    </div>
+    <div style="height:1px;background:#EBE5DD;margin:26px 0"></div>
+    <div style="display:flex;gap:30px;align-items:center">
+      <div style="text-align:center">
+        <img src="assets/logo.png" alt="current logo" style="width:150px;display:block;border-radius:6px"/>
+        <div style="font:500 11px 'IBM Plex Mono';color:#A39A8E;margin-top:8px">current — kept as app icon</div>
+      </div>
+      <div style="flex:1;font:500 13.5px 'Hanken Grotesk';color:#7A726A;line-height:1.55">The leaf-on-film mark stays as the app/launcher icon. In-app we lead with a quieter geometric film-frame mark + a clean wordmark so the chrome recedes behind the photos.</div>
+    </div>
+  </div>
+</div>
+
+<!-- light palette -->
+<div style="position:absolute;left:660px;top:178px;width:520px">
+  <div data-drags-parent="1" style="position:absolute;top:-22px;font:500 12px 'Hanken Grotesk';color:rgba(60,50,40,.6)">Color — Light</div>
+  <div style="background:#fff;border:1px solid #EBE5DD;border-radius:10px;box-shadow:0 1px 3px rgba(0,0,0,.07);padding:24px;display:flex;flex-wrap:wrap;gap:16px">
+    <div style="width:104px"><div style="height:52px;border-radius:8px;background:#FAF8F5;box-shadow:inset 0 0 0 1px rgba(0,0,0,.09)"></div><div style="font:600 12.5px 'Hanken Grotesk';color:#29251F;margin-top:7px">Paper</div><div style="font:500 10.5px 'IBM Plex Mono';color:#A39A8E">#FAF8F5</div></div>
+    <div style="width:104px"><div style="height:52px;border-radius:8px;background:#FFFFFF;box-shadow:inset 0 0 0 1px rgba(0,0,0,.09)"></div><div style="font:600 12.5px 'Hanken Grotesk';color:#29251F;margin-top:7px">Surface</div><div style="font:500 10.5px 'IBM Plex Mono';color:#A39A8E">#FFFFFF</div></div>
+    <div style="width:104px"><div style="height:52px;border-radius:8px;background:#F4F0EA;box-shadow:inset 0 0 0 1px rgba(0,0,0,.05)"></div><div style="font:600 12.5px 'Hanken Grotesk';color:#29251F;margin-top:7px">Sidebar</div><div style="font:500 10.5px 'IBM Plex Mono';color:#A39A8E">#F4F0EA</div></div>
+    <div style="width:104px"><div style="height:52px;border-radius:8px;background:#EBE5DD;box-shadow:inset 0 0 0 1px rgba(0,0,0,.04)"></div><div style="font:600 12.5px 'Hanken Grotesk';color:#29251F;margin-top:7px">Border</div><div style="font:500 10.5px 'IBM Plex Mono';color:#A39A8E">#EBE5DD</div></div>
+    <div style="width:104px"><div style="height:52px;border-radius:8px;background:#29251F"></div><div style="font:600 12.5px 'Hanken Grotesk';color:#29251F;margin-top:7px">Ink</div><div style="font:500 10.5px 'IBM Plex Mono';color:#A39A8E">#29251F</div></div>
+    <div style="width:104px"><div style="height:52px;border-radius:8px;background:#6F6960"></div><div style="font:600 12.5px 'Hanken Grotesk';color:#29251F;margin-top:7px">Ink-2</div><div style="font:500 10.5px 'IBM Plex Mono';color:#A39A8E">#6F6960</div></div>
+    <div style="width:104px"><div style="height:52px;border-radius:8px;background:#A39A8E"></div><div style="font:600 12.5px 'Hanken Grotesk';color:#29251F;margin-top:7px">Ink-3</div><div style="font:500 10.5px 'IBM Plex Mono';color:#A39A8E">#A39A8E</div></div>
+    <div style="width:104px"><div style="height:52px;border-radius:8px;background:#B5543E"></div><div style="font:600 12.5px 'Hanken Grotesk';color:#29251F;margin-top:7px">Accent</div><div style="font:500 10.5px 'IBM Plex Mono';color:#A39A8E">#B5543E</div></div>
+    <div style="width:104px"><div style="height:52px;border-radius:8px;background:#97402E"></div><div style="font:600 12.5px 'Hanken Grotesk';color:#29251F;margin-top:7px">Accent-dk</div><div style="font:500 10.5px 'IBM Plex Mono';color:#A39A8E">#97402E</div></div>
+    <div style="width:104px"><div style="height:52px;border-radius:8px;background:#F2E2DA;box-shadow:inset 0 0 0 1px rgba(0,0,0,.05)"></div><div style="font:600 12.5px 'Hanken Grotesk';color:#29251F;margin-top:7px">Accent-tint</div><div style="font:500 10.5px 'IBM Plex Mono';color:#A39A8E">#F2E2DA</div></div>
+  </div>
+</div>
+
+<!-- dark palette -->
+<div style="position:absolute;left:1200px;top:178px;width:520px">
+  <div data-drags-parent="1" style="position:absolute;top:-22px;font:500 12px 'Hanken Grotesk';color:rgba(60,50,40,.6)">Color — Dark</div>
+  <div style="background:#1B1714;border:1px solid #322C26;border-radius:10px;box-shadow:0 1px 3px rgba(0,0,0,.18);padding:24px;display:flex;flex-wrap:wrap;gap:16px">
+    <div style="width:104px"><div style="height:52px;border-radius:8px;background:#1B1714;box-shadow:inset 0 0 0 1px rgba(255,255,255,.12)"></div><div style="font:600 12.5px 'Hanken Grotesk';color:#F3EEE7;margin-top:7px">Base</div><div style="font:500 10.5px 'IBM Plex Mono';color:#766E63">#1B1714</div></div>
+    <div style="width:104px"><div style="height:52px;border-radius:8px;background:#241F1B;box-shadow:inset 0 0 0 1px rgba(255,255,255,.08)"></div><div style="font:600 12.5px 'Hanken Grotesk';color:#F3EEE7;margin-top:7px">Surface</div><div style="font:500 10.5px 'IBM Plex Mono';color:#766E63">#241F1B</div></div>
+    <div style="width:104px"><div style="height:52px;border-radius:8px;background:#141110;box-shadow:inset 0 0 0 1px rgba(255,255,255,.07)"></div><div style="font:600 12.5px 'Hanken Grotesk';color:#F3EEE7;margin-top:7px">Sidebar</div><div style="font:500 10.5px 'IBM Plex Mono';color:#766E63">#141110</div></div>
+    <div style="width:104px"><div style="height:52px;border-radius:8px;background:#322C26"></div><div style="font:600 12.5px 'Hanken Grotesk';color:#F3EEE7;margin-top:7px">Border</div><div style="font:500 10.5px 'IBM Plex Mono';color:#766E63">#322C26</div></div>
+    <div style="width:104px"><div style="height:52px;border-radius:8px;background:#F3EEE7"></div><div style="font:600 12.5px 'Hanken Grotesk';color:#F3EEE7;margin-top:7px">Ink</div><div style="font:500 10.5px 'IBM Plex Mono';color:#766E63">#F3EEE7</div></div>
+    <div style="width:104px"><div style="height:52px;border-radius:8px;background:#B0A698"></div><div style="font:600 12.5px 'Hanken Grotesk';color:#F3EEE7;margin-top:7px">Ink-2</div><div style="font:500 10.5px 'IBM Plex Mono';color:#766E63">#B0A698</div></div>
+    <div style="width:104px"><div style="height:52px;border-radius:8px;background:#766E63"></div><div style="font:600 12.5px 'Hanken Grotesk';color:#F3EEE7;margin-top:7px">Ink-3</div><div style="font:500 10.5px 'IBM Plex Mono';color:#766E63">#766E63</div></div>
+    <div style="width:104px"><div style="height:52px;border-radius:8px;background:#CB6B52"></div><div style="font:600 12.5px 'Hanken Grotesk';color:#F3EEE7;margin-top:7px">Accent</div><div style="font:500 10.5px 'IBM Plex Mono';color:#766E63">#CB6B52</div></div>
+    <div style="width:104px"><div style="height:52px;border-radius:8px;background:#E08A72"></div><div style="font:600 12.5px 'Hanken Grotesk';color:#F3EEE7;margin-top:7px">Accent-lt</div><div style="font:500 10.5px 'IBM Plex Mono';color:#766E63">#E08A72</div></div>
+    <div style="width:104px"><div style="height:52px;border-radius:8px;background:#3A2B25"></div><div style="font:600 12.5px 'Hanken Grotesk';color:#F3EEE7;margin-top:7px">Accent-tint</div><div style="font:500 10.5px 'IBM Plex Mono';color:#766E63">#3A2B25</div></div>
+  </div>
+</div>
+
+<!-- ============ TYPOGRAPHY ============ -->
+<div data-drags-parent="1" style="position:absolute;left:60px;top:600px;font:600 13px 'Hanken Grotesk';color:#B5543E;letter-spacing:.08em;text-transform:uppercase">02 · Typography</div>
+
+<div style="position:absolute;left:60px;top:638px;width:1120px">
+  <div data-drags-parent="1" style="position:absolute;top:-22px;font:500 12px 'Hanken Grotesk';color:rgba(60,50,40,.6)">Type system</div>
+  <div style="background:#fff;border:1px solid #EBE5DD;border-radius:10px;box-shadow:0 1px 3px rgba(0,0,0,.07);padding:32px;display:flex;gap:48px">
+    <div style="width:300px;border-right:1px solid #EBE5DD;padding-right:40px">
+      <div style="font:700 44px 'Hanken Grotesk';color:#29251F;letter-spacing:-.02em;line-height:1">Aa</div>
+      <div style="font:700 18px 'Hanken Grotesk';color:#29251F;margin-top:14px">Hanken Grotesk</div>
+      <div style="font:500 13px 'Hanken Grotesk';color:#7A726A;margin-top:4px">UI &amp; display · all weights</div>
+      <div style="display:flex;gap:10px;flex-wrap:wrap;margin-top:18px">
+        <span style="font:400 14px 'Hanken Grotesk';color:#6F6960">Regular</span>
+        <span style="font:500 14px 'Hanken Grotesk';color:#6F6960">Medium</span>
+        <span style="font:600 14px 'Hanken Grotesk';color:#6F6960">Semibold</span>
+        <span style="font:700 14px 'Hanken Grotesk';color:#6F6960">Bold</span>
+      </div>
+      <div style="height:1px;background:#EBE5DD;margin:24px 0"></div>
+      <div style="font:500 15px 'IBM Plex Mono';color:#29251F">IBM Plex Mono</div>
+      <div style="font:500 13px 'Hanken Grotesk';color:#7A726A;margin-top:4px">Metadata · EXIF · paths</div>
+      <div style="font:500 12px 'IBM Plex Mono';color:#B5543E;margin-top:12px;letter-spacing:.01em">ISO 400 · 1/250s · ƒ2.8 · 35mm</div>
+    </div>
+    <div style="flex:1">
+      <div style="display:flex;align-items:baseline;gap:16px;padding:10px 0;border-bottom:1px solid #F2EEE8"><span style="width:78px;font:500 11px 'IBM Plex Mono';color:#A39A8E">Display</span><span style="font:800 38px 'Hanken Grotesk';color:#29251F;letter-spacing:-.025em">Your photo library</span></div>
+      <div style="display:flex;align-items:baseline;gap:16px;padding:10px 0;border-bottom:1px solid #F2EEE8"><span style="width:78px;font:500 11px 'IBM Plex Mono';color:#A39A8E">Title</span><span style="font:700 26px 'Hanken Grotesk';color:#29251F;letter-spacing:-.015em">All Photos</span></div>
+      <div style="display:flex;align-items:baseline;gap:16px;padding:10px 0;border-bottom:1px solid #F2EEE8"><span style="width:78px;font:500 11px 'IBM Plex Mono';color:#A39A8E">Heading</span><span style="font:600 19px 'Hanken Grotesk';color:#29251F">Collections &amp; people</span></div>
+      <div style="display:flex;align-items:baseline;gap:16px;padding:10px 0;border-bottom:1px solid #F2EEE8"><span style="width:78px;font:500 11px 'IBM Plex Mono';color:#A39A8E">Body</span><span style="font:400 15px 'Hanken Grotesk';color:#3F3A33">Import, browse, and organise everything in one warm, quiet workspace.</span></div>
+      <div style="display:flex;align-items:baseline;gap:16px;padding:10px 0"><span style="width:78px;font:500 11px 'IBM Plex Mono';color:#A39A8E">Caption</span><span style="font:500 13px 'Hanken Grotesk';color:#7A726A">2,481 photos · 18 collections · 64 people</span></div>
+    </div>
+  </div>
+</div>
+
+<!-- principles post-it -->
+<div style="position:absolute;left:1220px;top:638px;width:430px">
+  <div data-drags-parent="1" style="position:absolute;top:-22px;font:500 12px 'Hanken Grotesk';color:rgba(60,50,40,.6)">Principles</div>
+  <div style="background:#FEF4CE;border-radius:3px;box-shadow:0 2px 8px rgba(0,0,0,.1);padding:22px;transform:rotate(-.6deg)">
+    <div style="font:700 15px 'Hanken Grotesk';color:#5C4A1E;margin-bottom:12px">Chrome recedes, photos lead.</div>
+    <ul style="margin:0;padding-left:18px;font:500 13.5px 'Hanken Grotesk';color:#6B5826;line-height:1.7">
+      <li>Warm neutrals, never cold gray</li>
+      <li>One accent — muted maple — used sparingly</li>
+      <li>Generous gutters; photos get the contrast</li>
+      <li>Mono only for technical metadata</li>
+      <li>Same tokens drive light &amp; dark</li>
+    </ul>
+  </div>
+</div>
+
+<!-- ============ COMPONENTS ============ -->
+<div data-drags-parent="1" style="position:absolute;left:60px;top:1140px;font:600 13px 'Hanken Grotesk';color:#B5543E;letter-spacing:.08em;text-transform:uppercase">03 · Components</div>
+
+<!-- sidebar nav component -->
+<div style="position:absolute;left:60px;top:1178px;width:268px">
+  <div data-drags-parent="1" style="position:absolute;top:-22px;font:500 12px 'Hanken Grotesk';color:rgba(60,50,40,.6)">Sidebar nav</div>
+  <div style="background:#F4F0EA;border:1px solid #EBE5DD;border-radius:10px;box-shadow:0 1px 3px rgba(0,0,0,.07);padding:16px 12px">
+    <div style="display:flex;align-items:center;gap:10px;padding:4px 8px 14px">
+      <div style="position:relative;width:30px;height:30px;border-radius:9px;background:linear-gradient(150deg,#C2604A,#A4422D)"><div style="position:absolute;left:5px;top:5px;bottom:5px;width:3px;display:flex;flex-direction:column;justify-content:space-between"><span style="height:3px;border-radius:1px;background:#FAF3EC"></span><span style="height:3px;border-radius:1px;background:#FAF3EC"></span><span style="height:3px;border-radius:1px;background:#FAF3EC"></span></div><div style="position:absolute;left:11px;right:5px;top:5px;bottom:5px;border-radius:3px;background:#FAF3EC"></div></div>
+      <span style="font:700 17px 'Hanken Grotesk';color:#29251F;letter-spacing:-.02em">Maple</span>
+    </div>
+    <div style="display:flex;align-items:center;gap:11px;padding:9px 11px;border-radius:9px;background:#fff;color:#97402E;box-shadow:0 1px 2px rgba(0,0,0,.06);font:600 14px 'Hanken Grotesk'">
+      <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><rect x="3" y="3" width="7.5" height="7.5" rx="1.6"/><rect x="13.5" y="3" width="7.5" height="7.5" rx="1.6"/><rect x="3" y="13.5" width="7.5" height="7.5" rx="1.6"/><rect x="13.5" y="13.5" width="7.5" height="7.5" rx="1.6"/></svg>
+      Library
+    </div>
+    <div style="display:flex;align-items:center;gap:11px;padding:9px 11px;border-radius:9px;color:#6F6960;font:500 14px 'Hanken Grotesk'">
+      <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3v11"/><path d="M8 11l4 4 4-4"/><path d="M4 20h16"/></svg>
+      Import
+    </div>
+    <div style="display:flex;align-items:center;gap:11px;padding:9px 11px;border-radius:9px;color:#6F6960;font:500 14px 'Hanken Grotesk'">
+      <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><circle cx="9" cy="8" r="3.2"/><path d="M3.4 19.5a5.6 5.6 0 0 1 11.2 0"/><circle cx="17.4" cy="8.4" r="2.4" opacity=".55"/></svg>
+      People
+    </div>
+    <div style="display:flex;align-items:center;gap:11px;padding:9px 11px;border-radius:9px;color:#6F6960;font:500 14px 'Hanken Grotesk'">
+      <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="7.5" width="14" height="13" rx="2"/><path d="M7 7.5V6a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v10a2 2 0 0 1-2 2"/></svg>
+      Collections
+    </div>
+    <div style="font:600 11px 'IBM Plex Mono';color:#A39A8E;letter-spacing:.06em;padding:18px 11px 8px">COLLECTIONS</div>
+    <div style="display:flex;align-items:center;gap:10px;padding:7px 11px;font:500 13.5px 'Hanken Grotesk';color:#6F6960"><span style="width:9px;height:9px;border-radius:50%;background:#B5543E"></span>Iceland 2024<span style="margin-left:auto;font:500 11px 'IBM Plex Mono';color:#A39A8E">128</span></div>
+    <div style="display:flex;align-items:center;gap:10px;padding:7px 11px;font:500 13.5px 'Hanken Grotesk';color:#6F6960"><span style="width:9px;height:9px;border-radius:50%;background:#6E8B6F"></span>Family<span style="margin-left:auto;font:500 11px 'IBM Plex Mono';color:#A39A8E">540</span></div>
+    <div style="display:flex;align-items:center;gap:10px;padding:7px 11px;font:500 13.5px 'Hanken Grotesk';color:#6F6960"><span style="width:9px;height:9px;border-radius:50%;background:#C29A3E"></span>Studio work<span style="margin-left:auto;font:500 11px 'IBM Plex Mono';color:#A39A8E">76</span></div>
+  </div>
+</div>
+
+<!-- buttons & controls -->
+<div style="position:absolute;left:368px;top:1178px;width:560px">
+  <div data-drags-parent="1" style="position:absolute;top:-22px;font:500 12px 'Hanken Grotesk';color:rgba(60,50,40,.6)">Buttons &amp; controls</div>
+  <div style="background:#fff;border:1px solid #EBE5DD;border-radius:10px;box-shadow:0 1px 3px rgba(0,0,0,.07);padding:26px">
+    <div style="font:600 11px 'IBM Plex Mono';color:#A39A8E;letter-spacing:.06em;margin-bottom:14px">BUTTONS</div>
+    <div style="display:flex;flex-wrap:wrap;gap:12px;align-items:center">
+      <button style="border:none;background:#B5543E;color:#fff;font:600 14px 'Hanken Grotesk';padding:10px 18px;border-radius:9px;box-shadow:0 1px 2px rgba(164,66,45,.35);cursor:pointer">Start Scan</button>
+      <button style="background:#fff;color:#29251F;border:1px solid #E2DAD0;font:600 14px 'Hanken Grotesk';padding:10px 18px;border-radius:9px;cursor:pointer">Browse</button>
+      <button style="background:transparent;color:#6F6960;border:none;font:600 14px 'Hanken Grotesk';padding:10px 12px;border-radius:9px;cursor:pointer">Cancel</button>
+      <button style="background:#F2E2DA;color:#8E3E2C;border:none;font:600 14px 'Hanken Grotesk';padding:10px 16px;border-radius:9px;cursor:pointer;display:flex;align-items:center;gap:7px">
+        <svg width="15" height="15" viewBox="0 0 24 24" fill="currentColor"><path d="M12 2l1.9 6.1L20 10l-6.1 1.9L12 18l-1.9-6.1L4 10l6.1-1.9z"/></svg>Tag with AI
+      </button>
+    </div>
+    <div style="display:flex;flex-wrap:wrap;gap:12px;align-items:center;margin-top:14px">
+      <button style="background:#fff;color:#B5543E;border:1px solid #E7CFC6;font:600 14px 'Hanken Grotesk';padding:10px 18px;border-radius:9px;cursor:pointer">Detect Faces</button>
+      <button style="width:40px;height:40px;border-radius:9px;border:1px solid #E2DAD0;background:#fff;display:flex;align-items:center;justify-content:center;cursor:pointer;color:#6F6960"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><path d="M4 7h16M4 12h16M4 17h16"/></svg></button>
+      <button style="width:40px;height:40px;border-radius:9px;border:1px solid #E2DAD0;background:#fff;display:flex;align-items:center;justify-content:center;cursor:pointer;color:#6F6960"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><circle cx="11" cy="11" r="7"/><path d="M20.5 20.5l-4-4"/></svg></button>
+      <div style="display:flex;background:#F4F0EA;border-radius:9px;padding:3px;gap:2px">
+        <span style="width:34px;height:32px;border-radius:7px;background:#fff;box-shadow:0 1px 2px rgba(0,0,0,.08);display:flex;align-items:center;justify-content:center;color:#97402E"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><rect x="3" y="3" width="7.5" height="7.5" rx="1.4"/><rect x="13.5" y="3" width="7.5" height="7.5" rx="1.4"/><rect x="3" y="13.5" width="7.5" height="7.5" rx="1.4"/><rect x="13.5" y="13.5" width="7.5" height="7.5" rx="1.4"/></svg></span>
+        <span style="width:34px;height:32px;border-radius:7px;display:flex;align-items:center;justify-content:center;color:#A39A8E"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><path d="M4 5h16M4 12h16M4 19h16"/></svg></span>
+      </div>
+    </div>
+    <div style="font:600 11px 'IBM Plex Mono';color:#A39A8E;letter-spacing:.06em;margin:24px 0 14px">TOGGLES</div>
+    <div style="display:flex;gap:24px;align-items:center">
+      <div style="display:flex;align-items:center;gap:9px"><span style="width:38px;height:22px;border-radius:11px;background:#B5543E;position:relative;display:inline-block"><span style="position:absolute;top:2px;right:2px;width:18px;height:18px;border-radius:50%;background:#fff;box-shadow:0 1px 2px rgba(0,0,0,.25)"></span></span><span style="font:500 13.5px 'Hanken Grotesk';color:#3F3A33">AI tagging</span></div>
+      <div style="display:flex;align-items:center;gap:9px"><span style="width:38px;height:22px;border-radius:11px;background:#E2DAD0;position:relative;display:inline-block"><span style="position:absolute;top:2px;left:2px;width:18px;height:18px;border-radius:50%;background:#fff;box-shadow:0 1px 2px rgba(0,0,0,.25)"></span></span><span style="font:500 13.5px 'Hanken Grotesk';color:#7A726A">Face detect</span></div>
+    </div>
+  </div>
+</div>
+
+<!-- inputs, chips, cells -->
+<div style="position:absolute;left:968px;top:1178px;width:752px">
+  <div data-drags-parent="1" style="position:absolute;top:-22px;font:500 12px 'Hanken Grotesk';color:rgba(60,50,40,.6)">Inputs · chips · photo cell</div>
+  <div style="background:#fff;border:1px solid #EBE5DD;border-radius:10px;box-shadow:0 1px 3px rgba(0,0,0,.07);padding:26px;display:flex;gap:30px">
+    <div style="flex:1">
+      <div style="font:600 11px 'IBM Plex Mono';color:#A39A8E;letter-spacing:.06em;margin-bottom:12px">SEARCH</div>
+      <div style="display:flex;align-items:center;gap:10px;background:#F4F0EA;border:1px solid #EBE5DD;border-radius:10px;padding:10px 14px">
+        <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="#A39A8E" stroke-width="1.8" stroke-linecap="round"><circle cx="11" cy="11" r="7"/><path d="M20.5 20.5l-4-4"/></svg>
+        <span style="font:500 14px 'Hanken Grotesk';color:#A39A8E">Search your library…</span>
+        <span style="margin-left:auto;font:500 11px 'IBM Plex Mono';color:#B89C5A;background:#FAF1D8;padding:2px 7px;border-radius:5px">semantic</span>
+      </div>
+      <div style="font:600 11px 'IBM Plex Mono';color:#A39A8E;letter-spacing:.06em;margin:22px 0 12px">COLLECTION CHIPS</div>
+      <div style="display:flex;flex-wrap:wrap;gap:9px">
+        <span style="display:flex;align-items:center;gap:7px;background:#F2E2DA;color:#8E3E2C;font:600 13px 'Hanken Grotesk';padding:6px 12px;border-radius:20px"><span style="width:8px;height:8px;border-radius:50%;background:#B5543E"></span>Iceland 2024</span>
+        <span style="display:flex;align-items:center;gap:7px;background:#F4F0EA;color:#5A544B;font:500 13px 'Hanken Grotesk';padding:6px 12px;border-radius:20px"><span style="width:8px;height:8px;border-radius:50%;background:#6E8B6F"></span>Family</span>
+        <span style="display:flex;align-items:center;gap:7px;background:#F4F0EA;color:#5A544B;font:500 13px 'Hanken Grotesk';padding:6px 12px;border-radius:20px"><span style="width:8px;height:8px;border-radius:50%;background:#C29A3E"></span>Studio</span>
+        <span style="display:flex;align-items:center;gap:5px;background:#fff;border:1px dashed #D9CFC3;color:#A39A8E;font:500 13px 'Hanken Grotesk';padding:6px 12px;border-radius:20px">+ Add</span>
+      </div>
+      <div style="font:600 11px 'IBM Plex Mono';color:#A39A8E;letter-spacing:.06em;margin:22px 0 12px">STATUS</div>
+      <div style="display:flex;align-items:center;gap:9px;background:#FAF1D8;border:1px solid #EEDFB0;border-radius:9px;padding:9px 13px;width:fit-content">
+        <span style="width:9px;height:9px;border-radius:50%;background:#C29A3E;box-shadow:0 0 0 4px rgba(194,154,62,.18)"></span>
+        <span style="font:600 13px 'Hanken Grotesk';color:#7A6322">Tagging</span>
+        <span style="font:500 12px 'IBM Plex Mono';color:#9A8240">412 / 2,481</span>
+      </div>
+    </div>
+    <div style="width:230px">
+      <div style="font:600 11px 'IBM Plex Mono';color:#A39A8E;letter-spacing:.06em;margin-bottom:12px">PHOTO CELL</div>
+      <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px">
+        <div style="position:relative;aspect-ratio:1;border-radius:10px;background:linear-gradient(150deg,rgba(255,255,255,.16),rgba(0,0,0,.08)),#9FB0BD;outline:2.5px solid #B5543E;outline-offset:2px">
+          <span style="position:absolute;top:7px;left:7px;width:19px;height:19px;border-radius:50%;background:#B5543E;display:flex;align-items:center;justify-content:center"><svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="#fff" stroke-width="3.4" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12l5 5L20 6"/></svg></span>
+        </div>
+        <div style="position:relative;aspect-ratio:1;border-radius:10px;background:linear-gradient(150deg,rgba(255,255,255,.16),rgba(0,0,0,.08)),#C9BCA8">
+          <span style="position:absolute;top:7px;left:7px;width:19px;height:19px;border-radius:50%;border:2px solid rgba(255,255,255,.85)"></span>
+          <span style="position:absolute;bottom:6px;right:6px;font:500 10px 'IBM Plex Mono';color:#fff;background:rgba(0,0,0,.4);padding:1px 5px;border-radius:4px">RAF</span>
+        </div>
+        <div style="position:relative;aspect-ratio:1;border-radius:10px;background:linear-gradient(150deg,rgba(255,255,255,.16),rgba(0,0,0,.08)),#BAA99A"></div>
+        <div style="position:relative;aspect-ratio:1;border-radius:10px;background:linear-gradient(150deg,rgba(255,255,255,.16),rgba(0,0,0,.08)),#A7B2AE">
+          <span style="position:absolute;bottom:6px;left:6px;font:500 10px 'IBM Plex Mono';color:#fff;background:rgba(0,0,0,.4);padding:1px 6px;border-radius:4px">⊞ 4</span>
+        </div>
+      </div>
+      <div style="font:500 12px 'Hanken Grotesk';color:#A39A8E;margin-top:10px;line-height:1.4">Selected · unselected · raw badge · stack count</div>
+    </div>
+  </div>
+</div>
+
+<!-- ============ APPLICATION ============ -->
+<div data-drags-parent="1" style="position:absolute;left:60px;top:1850px;font:600 13px 'Hanken Grotesk';color:#B5543E;letter-spacing:.08em;text-transform:uppercase">04 · Application — Library, two directions</div>
+
+<!-- DIRECTION A: clean & minimal (light) -->
+<div style="position:absolute;left:60px;top:1900px;width:1340px">
+  <div data-drags-parent="1" style="position:absolute;top:-22px;font:600 12px 'Hanken Grotesk';color:#29251F">Direction A — Clean &amp; minimal · uniform grid · light</div>
+  <div style="display:flex;height:760px;border-radius:12px;overflow:hidden;background:#fff;border:1px solid #E2DAD0;box-shadow:0 6px 24px rgba(0,0,0,.1)">
+    <!-- sidebar -->
+    <div style="width:228px;background:#F4F0EA;border-right:1px solid #EBE5DD;padding:18px 13px;display:flex;flex-direction:column;flex:none">
+      <div style="display:flex;align-items:center;gap:10px;padding:4px 8px 18px">
+        <div style="position:relative;width:30px;height:30px;border-radius:9px;background:linear-gradient(150deg,#C2604A,#A4422D)"><div style="position:absolute;left:5px;top:5px;bottom:5px;width:3px;display:flex;flex-direction:column;justify-content:space-between"><span style="height:3px;border-radius:1px;background:#FAF3EC"></span><span style="height:3px;border-radius:1px;background:#FAF3EC"></span><span style="height:3px;border-radius:1px;background:#FAF3EC"></span></div><div style="position:absolute;left:11px;right:5px;top:5px;bottom:5px;border-radius:3px;background:#FAF3EC"></div></div>
+        <span style="font:700 17px 'Hanken Grotesk';color:#29251F;letter-spacing:-.02em">Maple</span>
+      </div>
+      <div style="display:flex;align-items:center;gap:11px;padding:9px 11px;border-radius:9px;background:#fff;color:#97402E;box-shadow:0 1px 2px rgba(0,0,0,.06);font:600 14px 'Hanken Grotesk'"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><rect x="3" y="3" width="7.5" height="7.5" rx="1.6"/><rect x="13.5" y="3" width="7.5" height="7.5" rx="1.6"/><rect x="3" y="13.5" width="7.5" height="7.5" rx="1.6"/><rect x="13.5" y="13.5" width="7.5" height="7.5" rx="1.6"/></svg>Library</div>
+      <div style="display:flex;align-items:center;gap:11px;padding:9px 11px;border-radius:9px;color:#6F6960;font:500 14px 'Hanken Grotesk'"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3v11"/><path d="M8 11l4 4 4-4"/><path d="M4 20h16"/></svg>Import</div>
+      <div style="display:flex;align-items:center;gap:11px;padding:9px 11px;border-radius:9px;color:#6F6960;font:500 14px 'Hanken Grotesk'"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><circle cx="9" cy="8" r="3.2"/><path d="M3.4 19.5a5.6 5.6 0 0 1 11.2 0"/><circle cx="17.4" cy="8.4" r="2.4" opacity=".55"/></svg>People</div>
+      <div style="display:flex;align-items:center;gap:11px;padding:9px 11px;border-radius:9px;color:#6F6960;font:500 14px 'Hanken Grotesk'"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"><rect x="3" y="7.5" width="14" height="13" rx="2"/><path d="M7 7.5V6a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v10a2 2 0 0 1-2 2"/></svg>Collections</div>
+      <div style="font:600 11px 'IBM Plex Mono';color:#A39A8E;letter-spacing:.06em;padding:20px 11px 8px">COLLECTIONS</div>
+      <div style="display:flex;align-items:center;gap:10px;padding:7px 11px;font:500 13.5px 'Hanken Grotesk';color:#5A544B"><span style="width:9px;height:9px;border-radius:50%;background:#B5543E"></span>Iceland 2024<span style="margin-left:auto;font:500 11px 'IBM Plex Mono';color:#A39A8E">128</span></div>
+      <div style="display:flex;align-items:center;gap:10px;padding:7px 11px;font:500 13.5px 'Hanken Grotesk';color:#5A544B"><span style="width:9px;height:9px;border-radius:50%;background:#6E8B6F"></span>Family<span style="margin-left:auto;font:500 11px 'IBM Plex Mono';color:#A39A8E">540</span></div>
+      <div style="display:flex;align-items:center;gap:10px;padding:7px 11px;font:500 13.5px 'Hanken Grotesk';color:#5A544B"><span style="width:9px;height:9px;border-radius:50%;background:#C29A3E"></span>Studio work<span style="margin-left:auto;font:500 11px 'IBM Plex Mono';color:#A39A8E">76</span></div>
+      <div style="margin-top:auto;display:flex;align-items:center;gap:9px;padding:8px 11px"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="#6F6960" stroke-width="1.8" stroke-linecap="round"><path d="M4 8h16M4 16h16"/><circle cx="9" cy="8" r="2.4" fill="#F4F0EA"/><circle cx="15" cy="16" r="2.4" fill="#F4F0EA"/></svg><span style="font:500 13.5px 'Hanken Grotesk';color:#6F6960">Settings</span></div>
+    </div>
+    <!-- main -->
+    <div style="flex:1;display:flex;flex-direction:column;min-width:0">
+      <div style="height:62px;border-bottom:1px solid #EBE5DD;display:flex;align-items:center;gap:14px;padding:0 22px;flex:none">
+        <div style="display:flex;align-items:center;gap:10px;background:#F4F0EA;border:1px solid #EBE5DD;border-radius:10px;padding:9px 14px;width:360px"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="#A39A8E" stroke-width="1.8" stroke-linecap="round"><circle cx="11" cy="11" r="7"/><path d="M20.5 20.5l-4-4"/></svg><span style="font:500 14px 'Hanken Grotesk';color:#A39A8E">Search your library…</span></div>
+        <div style="margin-left:auto;display:flex;align-items:center;gap:10px">
+          <button style="background:#F2E2DA;color:#8E3E2C;border:none;font:600 13.5px 'Hanken Grotesk';padding:9px 14px;border-radius:9px;display:flex;align-items:center;gap:7px;cursor:pointer"><svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor"><path d="M12 2l1.9 6.1L20 10l-6.1 1.9L12 18l-1.9-6.1L4 10l6.1-1.9z"/></svg>Tag with AI</button>
+          <button style="background:#fff;color:#B5543E;border:1px solid #E7CFC6;font:600 13.5px 'Hanken Grotesk';padding:9px 14px;border-radius:9px;cursor:pointer">Detect Faces</button>
+        </div>
+      </div>
+      <div style="display:flex;align-items:flex-end;justify-content:space-between;padding:22px 22px 16px;flex:none">
+        <div><div style="font:700 24px 'Hanken Grotesk';color:#29251F;letter-spacing:-.015em">All Photos</div><div style="font:500 13px 'Hanken Grotesk';color:#A39A8E;margin-top:3px">2,481 photos</div></div>
+        <div style="display:flex;background:#F4F0EA;border-radius:9px;padding:3px;gap:2px"><span style="width:32px;height:30px;border-radius:7px;background:#fff;box-shadow:0 1px 2px rgba(0,0,0,.08);display:flex;align-items:center;justify-content:center;color:#97402E"><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><rect x="3" y="3" width="7.5" height="7.5" rx="1.4"/><rect x="13.5" y="3" width="7.5" height="7.5" rx="1.4"/><rect x="3" y="13.5" width="7.5" height="7.5" rx="1.4"/><rect x="13.5" y="13.5" width="7.5" height="7.5" rx="1.4"/></svg></span><span style="width:32px;height:30px;border-radius:7px;display:flex;align-items:center;justify-content:center;color:#A39A8E"><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><path d="M4 5h16M4 12h16M4 19h16"/></svg></span></div>
+      </div>
+      <div style="flex:1;overflow:hidden;padding:0 22px 22px">
+        <div style="display:grid;grid-template-columns:repeat(6,1fr);gap:14px">
+          <sc-for list="{{ squaresA }}" as="t" hint-placeholder-count="18">
+            <div style="aspect-ratio:1;border-radius:10px;background:{{ t.bg }}"></div>
+          </sc-for>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- DIRECTION B: warm editorial (light) -->
+<div style="position:absolute;left:1460px;top:1900px;width:1340px">
+  <div data-drags-parent="1" style="position:absolute;top:-22px;font:600 12px 'Hanken Grotesk';color:#29251F">Direction B — Warm &amp; editorial · justified rows, date groups · light</div>
+  <div style="display:flex;height:760px;border-radius:12px;overflow:hidden;background:#FAF6F0;border:1px solid #E6DCCF;box-shadow:0 6px 24px rgba(0,0,0,.1)">
+    <!-- sidebar -->
+    <div style="width:228px;background:#F1E9DD;border-right:1px solid #E6DCCF;padding:18px 13px;display:flex;flex-direction:column;flex:none">
+      <div style="display:flex;align-items:center;gap:10px;padding:4px 8px 18px">
+        <div style="position:relative;width:30px;height:30px;border-radius:9px;background:linear-gradient(150deg,#C2604A,#A4422D)"><div style="position:absolute;left:5px;top:5px;bottom:5px;width:3px;display:flex;flex-direction:column;justify-content:space-between"><span style="height:3px;border-radius:1px;background:#FAF3EC"></span><span style="height:3px;border-radius:1px;background:#FAF3EC"></span><span style="height:3px;border-radius:1px;background:#FAF3EC"></span></div><div style="position:absolute;left:11px;right:5px;top:5px;bottom:5px;border-radius:3px;background:#FAF3EC"></div></div>
+        <span style="font:700 17px 'Hanken Grotesk';color:#29251F;letter-spacing:-.02em">Maple</span>
+      </div>
+      <div style="display:flex;align-items:center;gap:11px;padding:9px 11px;border-radius:9px;color:#8E3E2C;font:600 14px 'Hanken Grotesk';position:relative"><span style="position:absolute;left:0;top:8px;bottom:8px;width:3px;border-radius:2px;background:#B5543E"></span><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><rect x="3" y="3" width="7.5" height="7.5" rx="1.6"/><rect x="13.5" y="3" width="7.5" height="7.5" rx="1.6"/><rect x="3" y="13.5" width="7.5" height="7.5" rx="1.6"/><rect x="13.5" y="13.5" width="7.5" height="7.5" rx="1.6"/></svg>Library</div>
+      <div style="display:flex;align-items:center;gap:11px;padding:9px 11px;border-radius:9px;color:#6F6960;font:500 14px 'Hanken Grotesk'"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3v11"/><path d="M8 11l4 4 4-4"/><path d="M4 20h16"/></svg>Import</div>
+      <div style="display:flex;align-items:center;gap:11px;padding:9px 11px;border-radius:9px;color:#6F6960;font:500 14px 'Hanken Grotesk'"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><circle cx="9" cy="8" r="3.2"/><path d="M3.4 19.5a5.6 5.6 0 0 1 11.2 0"/><circle cx="17.4" cy="8.4" r="2.4" opacity=".55"/></svg>People</div>
+      <div style="display:flex;align-items:center;gap:11px;padding:9px 11px;border-radius:9px;color:#6F6960;font:500 14px 'Hanken Grotesk'"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"><rect x="3" y="7.5" width="14" height="13" rx="2"/><path d="M7 7.5V6a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v10a2 2 0 0 1-2 2"/></svg>Collections</div>
+      <div style="font:600 11px 'IBM Plex Mono';color:#B0A189;letter-spacing:.06em;padding:20px 11px 8px">COLLECTIONS</div>
+      <div style="display:flex;align-items:center;gap:10px;padding:7px 11px;font:500 13.5px 'Hanken Grotesk';color:#5A544B"><span style="width:9px;height:9px;border-radius:50%;background:#B5543E"></span>Iceland 2024<span style="margin-left:auto;font:500 11px 'IBM Plex Mono';color:#B0A189">128</span></div>
+      <div style="display:flex;align-items:center;gap:10px;padding:7px 11px;font:500 13.5px 'Hanken Grotesk';color:#5A544B"><span style="width:9px;height:9px;border-radius:50%;background:#6E8B6F"></span>Family<span style="margin-left:auto;font:500 11px 'IBM Plex Mono';color:#B0A189">540</span></div>
+      <div style="display:flex;align-items:center;gap:10px;padding:7px 11px;font:500 13.5px 'Hanken Grotesk';color:#5A544B"><span style="width:9px;height:9px;border-radius:50%;background:#C29A3E"></span>Studio work<span style="margin-left:auto;font:500 11px 'IBM Plex Mono';color:#B0A189">76</span></div>
+      <div style="margin-top:auto;display:flex;align-items:center;gap:9px;padding:8px 11px"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="#6F6960" stroke-width="1.8" stroke-linecap="round"><path d="M4 8h16M4 16h16"/><circle cx="9" cy="8" r="2.4" fill="#F1E9DD"/><circle cx="15" cy="16" r="2.4" fill="#F1E9DD"/></svg><span style="font:500 13.5px 'Hanken Grotesk';color:#6F6960">Settings</span></div>
+    </div>
+    <!-- main -->
+    <div style="flex:1;display:flex;flex-direction:column;min-width:0">
+      <div style="height:62px;border-bottom:1px solid #EADFCF;display:flex;align-items:center;gap:14px;padding:0 26px;flex:none">
+        <div style="display:flex;align-items:center;gap:10px;background:#fff;border:1px solid #EADFCF;border-radius:10px;padding:9px 14px;width:360px"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="#B0A189" stroke-width="1.8" stroke-linecap="round"><circle cx="11" cy="11" r="7"/><path d="M20.5 20.5l-4-4"/></svg><span style="font:500 14px 'Hanken Grotesk';color:#B0A189">Search your library…</span></div>
+        <div style="margin-left:auto;display:flex;align-items:center;gap:10px">
+          <button style="background:#B5543E;color:#fff;border:none;font:600 13.5px 'Hanken Grotesk';padding:9px 14px;border-radius:9px;display:flex;align-items:center;gap:7px;cursor:pointer;box-shadow:0 1px 2px rgba(164,66,45,.3)"><svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor"><path d="M12 2l1.9 6.1L20 10l-6.1 1.9L12 18l-1.9-6.1L4 10l6.1-1.9z"/></svg>Tag with AI</button>
+          <button style="background:transparent;color:#8E3E2C;border:1px solid #E0C2B7;font:600 13.5px 'Hanken Grotesk';padding:9px 14px;border-radius:9px;cursor:pointer">Detect Faces</button>
+        </div>
+      </div>
+      <div style="padding:24px 26px 14px;flex:none">
+        <div style="font:800 30px 'Hanken Grotesk';color:#29251F;letter-spacing:-.025em">Library</div>
+        <div style="display:flex;align-items:center;gap:10px;margin-top:10px"><span style="font:500 13px 'Hanken Grotesk';color:#9A8C76">2,481 photos · 18 collections</span><span style="flex:1;height:7px;background:repeating-linear-gradient(90deg,#E4D3BE 0 7px,transparent 7px 13px);border-radius:2px;opacity:.7"></span></div>
+      </div>
+      <div style="flex:1;overflow:hidden;padding:0 26px 22px">
+        <div style="font:600 12px 'IBM Plex Mono';color:#A8997F;letter-spacing:.04em;margin:4px 0 10px">JUNE 2026 · 9</div>
+        <div style="display:flex;gap:10px;margin-bottom:10px">
+          <div style="height:152px;width:228px;border-radius:8px;flex:none;background:linear-gradient(150deg,rgba(255,255,255,.16),rgba(0,0,0,.08)),#9FB0BD"></div>
+          <div style="height:152px;width:160px;border-radius:8px;flex:none;background:linear-gradient(150deg,rgba(255,255,255,.16),rgba(0,0,0,.08)),#C9BCA8"></div>
+          <div style="height:152px;width:270px;border-radius:8px;flex:none;background:linear-gradient(150deg,rgba(255,255,255,.16),rgba(0,0,0,.08)),#BAA99A"></div>
+          <div style="height:152px;width:200px;border-radius:8px;flex:none;background:linear-gradient(150deg,rgba(255,255,255,.16),rgba(0,0,0,.08)),#A7B2AE"></div>
+          <div style="height:152px;width:178px;border-radius:8px;flex:none;background:linear-gradient(150deg,rgba(255,255,255,.16),rgba(0,0,0,.08)),#CDB6A3"></div>
+        </div>
+        <div style="font:600 12px 'IBM Plex Mono';color:#A8997F;letter-spacing:.04em;margin:16px 0 10px">MAY 2026 · 14</div>
+        <div style="display:flex;gap:10px">
+          <div style="height:152px;width:190px;border-radius:8px;flex:none;background:linear-gradient(150deg,rgba(255,255,255,.16),rgba(0,0,0,.08)),#B6BCA6"></div>
+          <div style="height:152px;width:250px;border-radius:8px;flex:none;background:linear-gradient(150deg,rgba(255,255,255,.16),rgba(0,0,0,.08)),#A8A2AE"></div>
+          <div style="height:152px;width:168px;border-radius:8px;flex:none;background:linear-gradient(150deg,rgba(255,255,255,.16),rgba(0,0,0,.08)),#C3AF9F"></div>
+          <div style="height:152px;width:210px;border-radius:8px;flex:none;background:linear-gradient(150deg,rgba(255,255,255,.16),rgba(0,0,0,.08)),#97A6A8"></div>
+          <div style="height:152px;width:196px;border-radius:8px;flex:none;background:linear-gradient(150deg,rgba(255,255,255,.16),rgba(0,0,0,.08)),#BFA9A0"></div>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- DARK SHELL -->
+<div style="position:absolute;left:60px;top:2820px;width:1340px">
+  <div data-drags-parent="1" style="position:absolute;top:-22px;font:600 12px 'Hanken Grotesk';color:#29251F">Direction A — dark theme · same tokens</div>
+  <div style="display:flex;height:740px;border-radius:12px;overflow:hidden;background:#1B1714;border:1px solid #322C26;box-shadow:0 8px 30px rgba(0,0,0,.3)">
+    <div style="width:228px;background:#141110;border-right:1px solid #2B2620;padding:18px 13px;display:flex;flex-direction:column;flex:none">
+      <div style="display:flex;align-items:center;gap:10px;padding:4px 8px 18px">
+        <div style="position:relative;width:30px;height:30px;border-radius:9px;background:linear-gradient(150deg,#D07254,#A4422D)"><div style="position:absolute;left:5px;top:5px;bottom:5px;width:3px;display:flex;flex-direction:column;justify-content:space-between"><span style="height:3px;border-radius:1px;background:#1B1714"></span><span style="height:3px;border-radius:1px;background:#1B1714"></span><span style="height:3px;border-radius:1px;background:#1B1714"></span></div><div style="position:absolute;left:11px;right:5px;top:5px;bottom:5px;border-radius:3px;background:#1B1714"></div></div>
+        <span style="font:700 17px 'Hanken Grotesk';color:#F3EEE7;letter-spacing:-.02em">Maple</span>
+      </div>
+      <div style="display:flex;align-items:center;gap:11px;padding:9px 11px;border-radius:9px;background:#3A2B25;color:#E08A72;font:600 14px 'Hanken Grotesk'"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><rect x="3" y="3" width="7.5" height="7.5" rx="1.6"/><rect x="13.5" y="3" width="7.5" height="7.5" rx="1.6"/><rect x="3" y="13.5" width="7.5" height="7.5" rx="1.6"/><rect x="13.5" y="13.5" width="7.5" height="7.5" rx="1.6"/></svg>Library</div>
+      <div style="display:flex;align-items:center;gap:11px;padding:9px 11px;border-radius:9px;color:#B0A698;font:500 14px 'Hanken Grotesk'"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3v11"/><path d="M8 11l4 4 4-4"/><path d="M4 20h16"/></svg>Import</div>
+      <div style="display:flex;align-items:center;gap:11px;padding:9px 11px;border-radius:9px;color:#B0A698;font:500 14px 'Hanken Grotesk'"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><circle cx="9" cy="8" r="3.2"/><path d="M3.4 19.5a5.6 5.6 0 0 1 11.2 0"/><circle cx="17.4" cy="8.4" r="2.4" opacity=".55"/></svg>People</div>
+      <div style="display:flex;align-items:center;gap:11px;padding:9px 11px;border-radius:9px;color:#B0A698;font:500 14px 'Hanken Grotesk'"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"><rect x="3" y="7.5" width="14" height="13" rx="2"/><path d="M7 7.5V6a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v10a2 2 0 0 1-2 2"/></svg>Collections</div>
+      <div style="font:600 11px 'IBM Plex Mono';color:#766E63;letter-spacing:.06em;padding:20px 11px 8px">COLLECTIONS</div>
+      <div style="display:flex;align-items:center;gap:10px;padding:7px 11px;font:500 13.5px 'Hanken Grotesk';color:#C8BFB1"><span style="width:9px;height:9px;border-radius:50%;background:#CB6B52"></span>Iceland 2024<span style="margin-left:auto;font:500 11px 'IBM Plex Mono';color:#766E63">128</span></div>
+      <div style="display:flex;align-items:center;gap:10px;padding:7px 11px;font:500 13.5px 'Hanken Grotesk';color:#C8BFB1"><span style="width:9px;height:9px;border-radius:50%;background:#82A083"></span>Family<span style="margin-left:auto;font:500 11px 'IBM Plex Mono';color:#766E63">540</span></div>
+      <div style="display:flex;align-items:center;gap:10px;padding:7px 11px;font:500 13.5px 'Hanken Grotesk';color:#C8BFB1"><span style="width:9px;height:9px;border-radius:50%;background:#D4AE54"></span>Studio work<span style="margin-left:auto;font:500 11px 'IBM Plex Mono';color:#766E63">76</span></div>
+      <div style="margin-top:auto;display:flex;align-items:center;gap:9px;padding:8px 11px"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="#B0A698" stroke-width="1.8" stroke-linecap="round"><path d="M4 8h16M4 16h16"/><circle cx="9" cy="8" r="2.4" fill="#141110"/><circle cx="15" cy="16" r="2.4" fill="#141110"/></svg><span style="font:500 13.5px 'Hanken Grotesk';color:#B0A698">Settings</span></div>
+    </div>
+    <div style="flex:1;display:flex;flex-direction:column;min-width:0">
+      <div style="height:62px;border-bottom:1px solid #2B2620;display:flex;align-items:center;gap:14px;padding:0 22px;flex:none">
+        <div style="display:flex;align-items:center;gap:10px;background:#241F1B;border:1px solid #322C26;border-radius:10px;padding:9px 14px;width:360px"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="#766E63" stroke-width="1.8" stroke-linecap="round"><circle cx="11" cy="11" r="7"/><path d="M20.5 20.5l-4-4"/></svg><span style="font:500 14px 'Hanken Grotesk';color:#766E63">Search your library…</span></div>
+        <div style="margin-left:auto;display:flex;align-items:center;gap:10px">
+          <button style="background:#3A2B25;color:#E08A72;border:none;font:600 13.5px 'Hanken Grotesk';padding:9px 14px;border-radius:9px;display:flex;align-items:center;gap:7px;cursor:pointer"><svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor"><path d="M12 2l1.9 6.1L20 10l-6.1 1.9L12 18l-1.9-6.1L4 10l6.1-1.9z"/></svg>Tag with AI</button>
+          <button style="background:transparent;color:#E08A72;border:1px solid #4A352D;font:600 13.5px 'Hanken Grotesk';padding:9px 14px;border-radius:9px;cursor:pointer">Detect Faces</button>
+        </div>
+      </div>
+      <div style="display:flex;align-items:flex-end;justify-content:space-between;padding:22px 22px 16px;flex:none">
+        <div><div style="font:700 24px 'Hanken Grotesk';color:#F3EEE7;letter-spacing:-.015em">All Photos</div><div style="font:500 13px 'Hanken Grotesk';color:#766E63;margin-top:3px">2,481 photos</div></div>
+        <div style="display:flex;background:#241F1B;border-radius:9px;padding:3px;gap:2px"><span style="width:32px;height:30px;border-radius:7px;background:#3A2B25;display:flex;align-items:center;justify-content:center;color:#E08A72"><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><rect x="3" y="3" width="7.5" height="7.5" rx="1.4"/><rect x="13.5" y="3" width="7.5" height="7.5" rx="1.4"/><rect x="3" y="13.5" width="7.5" height="7.5" rx="1.4"/><rect x="13.5" y="13.5" width="7.5" height="7.5" rx="1.4"/></svg></span><span style="width:32px;height:30px;border-radius:7px;display:flex;align-items:center;justify-content:center;color:#766E63"><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><path d="M4 5h16M4 12h16M4 19h16"/></svg></span></div>
+      </div>
+      <div style="flex:1;overflow:hidden;padding:0 22px 22px">
+        <div style="display:grid;grid-template-columns:repeat(6,1fr);gap:14px">
+          <sc-for list="{{ squaresDark }}" as="t" hint-placeholder-count="18">
+            <div style="aspect-ratio:1;border-radius:10px;background:{{ t.bg }}"></div>
+          </sc-for>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- note post-it -->
+<div style="position:absolute;left:1460px;top:2820px;width:400px">
+  <div data-drags-parent="1" style="position:absolute;top:-22px;font:500 12px 'Hanken Grotesk';color:rgba(60,50,40,.6)">Next</div>
+  <div style="background:#FEF4CE;border-radius:3px;box-shadow:0 2px 8px rgba(0,0,0,.1);padding:22px;transform:rotate(.7deg)">
+    <div style="font:700 15px 'Hanken Grotesk';color:#5C4A1E;margin-bottom:10px">Where this goes</div>
+    <div style="font:500 13.5px 'Hanken Grotesk';color:#6B5826;line-height:1.6">Pick a direction (or mix: A's grid + B's date groups). Then I'll build the full app shell as a live, themeable prototype and extend the system to the detail viewer, import flow, and face-tagging wizard.</div>
+  </div>
+</div>
+</x-dc>
+<script type="text/x-dc" data-dc-script>
+class Component extends DCLogic {
+  renderVals() {
+    const P = ['#C9BCA8','#A7B2AE','#BAA99A','#9FB0BD','#CDB6A3','#B6BCA6','#A8A2AE','#C3AF9F','#97A6A8','#BFA9A0','#D0C3B0','#9DAAA0'];
+    const D = ['#3A4A52','#4A4036','#42504A','#534840','#3E4A54','#4C4738','#473F4C','#524034','#39474A','#4E4038','#444C3C','#3D4248'];
+    const g = c => `linear-gradient(150deg,rgba(255,255,255,.15),rgba(0,0,0,.10)),${c}`;
+    const make = (arr, n) => Array.from({length:n}, (_,i) => ({ bg: g(arr[i % arr.length]) }));
+    return {
+      squaresA: make(P, 18),
+      squaresDark: make(D, 18),
+    };
+  }
+}
+</script>
+</body>
+</html>

@@ -1,0 +1,310 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<script src="./support.js"></script>
+</head>
+<body>
+<x-dc>
+<helmet>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Hanken+Grotesk:wght@400;500;600;700;800&family=IBM+Plex+Mono:wght@400;500&display=swap" rel="stylesheet">
+<style>
+  html,body{margin:0;height:100%;}
+  *{box-sizing:border-box;}
+  ::-webkit-scrollbar{width:10px;height:10px;}
+  ::-webkit-scrollbar-thumb{background:rgba(120,110,99,.35);border-radius:6px;border:2px solid transparent;background-clip:padding-box;}
+  @keyframes mpl-pulse{0%,100%{opacity:1;transform:scale(1)}50%{opacity:.45;transform:scale(.82)}}
+</style>
+</helmet>
+
+<div style="{{ rootStyle }}">
+
+  <!-- ============ SIDEBAR ============ -->
+  <div style="width:228px;flex:none;background:var(--sidebar,#F4F0EA);border-right:1px solid var(--border,#EBE5DD);padding:18px 13px;display:flex;flex-direction:column">
+    <div style="display:flex;align-items:center;gap:10px;padding:4px 8px 18px">
+      <div style="position:relative;width:30px;height:30px;border-radius:9px;background:linear-gradient(150deg,#C2604A,#A4422D);flex:none">
+        <div style="position:absolute;left:5px;top:5px;bottom:5px;width:3px;display:flex;flex-direction:column;justify-content:space-between"><span style="height:3px;border-radius:1px;background:#FAF3EC"></span><span style="height:3px;border-radius:1px;background:#FAF3EC"></span><span style="height:3px;border-radius:1px;background:#FAF3EC"></span></div>
+        <div style="position:absolute;left:11px;right:5px;top:5px;bottom:5px;border-radius:3px;background:#FAF3EC"></div>
+      </div>
+      <span style="font:700 17px 'Hanken Grotesk';color:var(--ink,#29251F);letter-spacing:-.02em">Maple</span>
+    </div>
+
+    <div onClick="{{ goLibrary }}" style="{{ libStyle }}">
+      <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="{{ libIcon }}" stroke-width="1.8"><rect x="3" y="3" width="7.5" height="7.5" rx="1.6"/><rect x="13.5" y="3" width="7.5" height="7.5" rx="1.6"/><rect x="3" y="13.5" width="7.5" height="7.5" rx="1.6"/><rect x="13.5" y="13.5" width="7.5" height="7.5" rx="1.6"/></svg>Library
+    </div>
+    <div onClick="{{ goImport }}" style="{{ importStyle }}">
+      <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="{{ importIcon }}" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3v11"/><path d="M8 11l4 4 4-4"/><path d="M4 20h16"/></svg>Import
+    </div>
+    <div onClick="{{ goPeople }}" style="{{ peopleStyle }}">
+      <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="{{ peopleIcon }}" stroke-width="1.8" stroke-linecap="round"><circle cx="9" cy="8" r="3.2"/><path d="M3.4 19.5a5.6 5.6 0 0 1 11.2 0"/><circle cx="17.4" cy="8.4" r="2.4" opacity=".55"/></svg>People
+    </div>
+    <div onClick="{{ goTagFaces }}" style="{{ tagFacesStyle }}">
+      <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="{{ tagFacesIcon }}" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M4 8V6a2 2 0 0 1 2-2h2"/><path d="M16 4h2a2 2 0 0 1 2 2v2"/><path d="M20 16v2a2 2 0 0 1-2 2h-2"/><path d="M8 20H6a2 2 0 0 1-2-2v-2"/></svg>
+      Tag faces
+      <span style="margin-left:auto;font:600 10.5px 'IBM Plex Mono';color:#fff;background:var(--accent,#B5543E);padding:1px 7px;border-radius:9px">23</span>
+    </div>
+    <div onClick="{{ goCollections }}" style="{{ collStyle }}">
+      <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="{{ collIcon }}" stroke-width="1.8" stroke-linejoin="round"><rect x="3" y="7.5" width="14" height="13" rx="2"/><path d="M7 7.5V6a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v10a2 2 0 0 1-2 2"/></svg>Collections
+    </div>
+
+    <div style="font:600 11px 'IBM Plex Mono';color:var(--ink-3,#A39A8E);letter-spacing:.06em;padding:20px 11px 8px">COLLECTIONS</div>
+    <div style="display:flex;align-items:center;gap:10px;padding:7px 11px;font:500 13.5px 'Hanken Grotesk';color:var(--ink-2,#6F6960)"><span style="width:9px;height:9px;border-radius:50%;background:#B5543E"></span>Iceland 2024<span style="margin-left:auto;font:500 11px 'IBM Plex Mono';color:var(--ink-3,#A39A8E)">128</span></div>
+    <div style="display:flex;align-items:center;gap:10px;padding:7px 11px;font:500 13.5px 'Hanken Grotesk';color:var(--ink-2,#6F6960)"><span style="width:9px;height:9px;border-radius:50%;background:#6E8B6F"></span>Family<span style="margin-left:auto;font:500 11px 'IBM Plex Mono';color:var(--ink-3,#A39A8E)">540</span></div>
+    <div style="display:flex;align-items:center;gap:10px;padding:7px 11px;font:500 13.5px 'Hanken Grotesk';color:var(--ink-2,#6F6960)"><span style="width:9px;height:9px;border-radius:50%;background:#C29A3E"></span>Studio work<span style="margin-left:auto;font:500 11px 'IBM Plex Mono';color:var(--ink-3,#A39A8E)">76</span></div>
+
+    <div style="margin-top:auto;display:flex;align-items:center;justify-content:space-between;padding-top:14px;border-top:1px solid var(--border,#EBE5DD)">
+      <div style="display:flex;align-items:center;gap:9px;padding:8px 11px;cursor:pointer"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="var(--ink-2,#6F6960)" stroke-width="1.8" stroke-linecap="round"><path d="M4 8h16M4 16h16"/><circle cx="9" cy="8" r="2.4" fill="var(--sidebar,#F4F0EA)"/><circle cx="15" cy="16" r="2.4" fill="var(--sidebar,#F4F0EA)"/></svg><span style="font:500 13.5px 'Hanken Grotesk';color:var(--ink-2,#6F6960)">Settings</span></div>
+      <div onClick="{{ toggleTheme }}" title="Toggle theme" style="display:flex;align-items:center;gap:2px;background:var(--field,#F4F0EA);border:1px solid var(--border,#EBE5DD);border-radius:8px;padding:3px;cursor:pointer">
+        <span style="{{ sunStyle }}"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M2 12h2M20 12h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4"/></svg></span>
+        <span style="{{ moonStyle }}"><svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor" stroke="none"><path d="M21 12.8A8.5 8.5 0 1 1 11.2 3a6.5 6.5 0 0 0 9.8 9.8z"/></svg></span>
+      </div>
+    </div>
+  </div>
+
+  <!-- ============ MAIN ============ -->
+  <div style="flex:1;display:flex;flex-direction:column;min-width:0">
+
+    <!-- top bar -->
+    <div style="height:62px;flex:none;border-bottom:1px solid var(--border,#EBE5DD);display:flex;align-items:center;gap:14px;padding:0 22px">
+      <div style="display:flex;align-items:center;gap:10px;background:var(--field,#F4F0EA);border:1px solid var(--border,#EBE5DD);border-radius:10px;padding:9px 14px;width:340px">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="var(--ink-3,#A39A8E)" stroke-width="1.8" stroke-linecap="round"><circle cx="11" cy="11" r="7"/><path d="M20.5 20.5l-4-4"/></svg>
+        <span style="font:500 14px 'Hanken Grotesk';color:var(--ink-3,#A39A8E)">Search your library…</span>
+      </div>
+      <div style="margin-left:auto;display:flex;align-items:center;gap:10px">
+        <sc-if value="{{ isLibrary }}" hint-placeholder-val="{{ true }}">
+          <div style="display:flex;align-items:center;gap:10px">
+            <div onClick="{{ toggleAi }}" style="{{ aiStyle }}">
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor"><path d="M12 2l1.9 6.1L20 10l-6.1 1.9L12 18l-1.9-6.1L4 10l6.1-1.9z"/></svg>
+              Tag with AI
+              <sc-if value="{{ aiOn }}" hint-placeholder-val="{{ false }}"><span style="display:flex;align-items:center;gap:6px"><span style="width:7px;height:7px;border-radius:50%;background:currentColor;animation:mpl-pulse 1.4s ease-in-out infinite"></span><span style="font:500 11.5px 'IBM Plex Mono'">412 / 2,481</span></span></sc-if>
+            </div>
+            <div onClick="{{ toggleFaces }}" style="{{ facesStyle }}">
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M4 8V6a2 2 0 0 1 2-2h2"/><path d="M16 4h2a2 2 0 0 1 2 2v2"/><path d="M20 16v2a2 2 0 0 1-2 2h-2"/><path d="M8 20H6a2 2 0 0 1-2-2v-2"/></svg>
+              Detect Faces
+              <sc-if value="{{ facesOn }}" hint-placeholder-val="{{ false }}"><span style="display:flex;align-items:center;gap:6px"><span style="width:7px;height:7px;border-radius:50%;background:currentColor;animation:mpl-pulse 1.4s ease-in-out infinite"></span><span style="font:500 11.5px 'IBM Plex Mono'">88 / 2,481</span></span></sc-if>
+            </div>
+          </div>
+        </sc-if>
+        <sc-if value="{{ isImport }}" hint-placeholder-val="{{ false }}">
+          <button onClick="{{ startScan }}" style="{{ startStyle }}">{{ startLabel }}</button>
+        </sc-if>
+      </div>
+    </div>
+
+    <!-- scrollable content -->
+    <div style="flex:1;overflow-y:auto;min-height:0">
+
+      <!-- ===== LIBRARY ===== -->
+      <sc-if value="{{ isLibrary }}" hint-placeholder-val="{{ true }}">
+        <div>
+          <div style="display:flex;align-items:flex-end;justify-content:space-between;padding:22px 22px 16px">
+            <div><div style="font:700 24px 'Hanken Grotesk';color:var(--ink,#29251F);letter-spacing:-.015em">All Photos</div><div style="font:500 13px 'Hanken Grotesk';color:var(--ink-3,#A39A8E);margin-top:3px">2,481 photos</div></div>
+            <div style="display:flex;background:var(--field,#F4F0EA);border-radius:9px;padding:3px;gap:2px">
+              <span style="width:32px;height:30px;border-radius:7px;background:var(--surface,#fff);box-shadow:var(--shadow);display:flex;align-items:center;justify-content:center;color:var(--accent-text,#8E3E2C)"><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><rect x="3" y="3" width="7.5" height="7.5" rx="1.4"/><rect x="13.5" y="3" width="7.5" height="7.5" rx="1.4"/><rect x="3" y="13.5" width="7.5" height="7.5" rx="1.4"/><rect x="13.5" y="13.5" width="7.5" height="7.5" rx="1.4"/></svg></span>
+              <span style="width:32px;height:30px;border-radius:7px;display:flex;align-items:center;justify-content:center;color:var(--ink-3,#A39A8E)"><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><path d="M4 5h16M4 12h16M4 19h16"/></svg></span>
+            </div>
+          </div>
+          <div style="padding:0 22px 24px">
+            <div style="display:grid;grid-template-columns:repeat(6,1fr);gap:14px">
+              <sc-for list="{{ squares }}" as="t" hint-placeholder-count="30">
+                <div style="aspect-ratio:1;border-radius:10px;background:{{ t.bg }}"></div>
+              </sc-for>
+            </div>
+          </div>
+        </div>
+      </sc-if>
+
+      <!-- ===== IMPORT ===== -->
+      <sc-if value="{{ isImport }}" hint-placeholder-val="{{ false }}">
+        <div style="max-width:760px;margin:0 auto;padding:30px 22px 40px">
+          <div style="font:800 30px 'Hanken Grotesk';color:var(--ink,#29251F);letter-spacing:-.025em">Import Photos</div>
+          <div style="font:500 15px 'Hanken Grotesk';color:var(--ink-2,#6F6960);margin-top:6px">Choose where your photos come from. They'll be copied into your library.</div>
+
+          <!-- source selector -->
+          <div style="margin-top:24px">
+            <sc-if value="{{ hasSelection }}" hint-placeholder-val="{{ false }}">
+              <div style="display:flex;align-items:center;gap:14px;background:var(--surface,#fff);border:1px solid var(--border,#EBE5DD);border-radius:12px;padding:18px;box-shadow:var(--shadow)">
+                <div style="width:44px;height:44px;border-radius:11px;background:var(--accent-tint,#F2E2DA);display:flex;align-items:center;justify-content:center;flex:none"><svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="var(--accent-text,#8E3E2C)" stroke-width="1.8" stroke-linejoin="round"><path d="M3 7a2 2 0 0 1 2-2h4l2 2.2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/></svg></div>
+                <div style="min-width:0;flex:1"><div style="font:600 15px 'Hanken Grotesk';color:var(--ink,#29251F)">{{ selectedName }}</div><div style="font:500 12.5px 'IBM Plex Mono';color:var(--ink-3,#A39A8E);overflow:hidden;text-overflow:ellipsis;white-space:nowrap">{{ selectedPath }}</div></div>
+                <span style="font:500 12px 'IBM Plex Mono';color:var(--ink-3,#A39A8E)">{{ selectedCount }} photos</span>
+                <button onClick="{{ clearSelection }}" style="background:transparent;border:1px solid var(--border,#EBE5DD);color:var(--ink-2,#6F6960);font:600 13px 'Hanken Grotesk';padding:8px 14px;border-radius:9px;cursor:pointer">Change</button>
+              </div>
+            </sc-if>
+            <sc-if value="{{ noSelection }}" hint-placeholder-val="{{ true }}">
+              <div onClick="{{ browse }}" style="border:1.5px dashed var(--border,#D9CFC3);border-radius:12px;padding:34px;display:flex;flex-direction:column;align-items:center;text-align:center;cursor:pointer;background:var(--surface,#fff)">
+                <div style="width:52px;height:52px;border-radius:13px;background:var(--field,#F4F0EA);display:flex;align-items:center;justify-content:center;margin-bottom:14px"><svg width="26" height="26" viewBox="0 0 24 24" fill="none" stroke="var(--ink-2,#6F6960)" stroke-width="1.7" stroke-linejoin="round"><path d="M3 7a2 2 0 0 1 2-2h4l2 2.2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/></svg></div>
+                <div style="font:600 16px 'Hanken Grotesk';color:var(--ink,#29251F)">Choose a source folder</div>
+                <div style="font:500 13.5px 'Hanken Grotesk';color:var(--ink-3,#A39A8E);margin-top:4px">Drag a folder here, or pick one below</div>
+                <button style="margin-top:16px;background:var(--accent,#B5543E);color:#fff;border:none;font:600 14px 'Hanken Grotesk';padding:10px 20px;border-radius:9px;cursor:pointer;box-shadow:0 1px 2px rgba(164,66,45,.35)">Browse…</button>
+              </div>
+            </sc-if>
+          </div>
+
+          <!-- favorites -->
+          <div style="font:600 11px 'IBM Plex Mono';color:var(--ink-3,#A39A8E);letter-spacing:.06em;margin:30px 0 8px">FAVORITES</div>
+          <div style="background:var(--surface,#fff);border:1px solid var(--border,#EBE5DD);border-radius:12px;overflow:hidden">
+            <sc-for list="{{ favorites }}" as="loc" hint-placeholder-count="2">
+              <div onClick="{{ loc.onSelect }}" style="display:flex;align-items:center;gap:13px;padding:13px 15px;cursor:pointer;border-bottom:1px solid var(--border,#EBE5DD);background:{{ loc.rowBg }}">
+                <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="var(--ink-2,#6F6960)" stroke-width="1.7" stroke-linejoin="round" style="flex:none"><path d="M3 7a2 2 0 0 1 2-2h4l2 2.2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/></svg>
+                <div style="min-width:0;flex:1"><div style="font:600 14px 'Hanken Grotesk';color:var(--ink,#29251F)">{{ loc.name }}</div><div style="font:500 12px 'IBM Plex Mono';color:var(--ink-3,#A39A8E);overflow:hidden;text-overflow:ellipsis;white-space:nowrap">{{ loc.path }}</div></div>
+                <span style="font:500 11.5px 'IBM Plex Mono';color:var(--ink-3,#A39A8E)">{{ loc.countLabel }}</span>
+                <button onClick="{{ loc.onStar }}" style="background:transparent;border:none;cursor:pointer;padding:4px;display:flex"><svg width="18" height="18" viewBox="0 0 24 24" fill="{{ loc.starFill }}" stroke="{{ loc.starStroke }}" stroke-width="1.7" stroke-linejoin="round"><path d="M12 3l2.6 5.6 6 .7-4.5 4.1 1.2 6L12 16.9 6.7 19.5l1.2-6L3.4 9.3l6-.7z"/></svg></button>
+                <sc-if value="{{ loc.sel }}" hint-placeholder-val="{{ false }}"><span style="width:20px;height:20px;border-radius:50%;background:var(--accent,#B5543E);display:flex;align-items:center;justify-content:center;flex:none"><svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="#fff" stroke-width="3.4" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12l5 5L20 6"/></svg></span></sc-if>
+              </div>
+            </sc-for>
+          </div>
+
+          <!-- recents -->
+          <div style="font:600 11px 'IBM Plex Mono';color:var(--ink-3,#A39A8E);letter-spacing:.06em;margin:26px 0 8px">RECENT LOCATIONS</div>
+          <div style="background:var(--surface,#fff);border:1px solid var(--border,#EBE5DD);border-radius:12px;overflow:hidden">
+            <sc-for list="{{ recents }}" as="loc" hint-placeholder-count="4">
+              <div onClick="{{ loc.onSelect }}" style="display:flex;align-items:center;gap:13px;padding:13px 15px;cursor:pointer;border-bottom:1px solid var(--border,#EBE5DD);background:{{ loc.rowBg }}">
+                <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="var(--ink-2,#6F6960)" stroke-width="1.7" stroke-linejoin="round" style="flex:none"><path d="M3 7a2 2 0 0 1 2-2h4l2 2.2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/></svg>
+                <div style="min-width:0;flex:1"><div style="font:600 14px 'Hanken Grotesk';color:var(--ink,#29251F)">{{ loc.name }}</div><div style="font:500 12px 'IBM Plex Mono';color:var(--ink-3,#A39A8E);overflow:hidden;text-overflow:ellipsis;white-space:nowrap">{{ loc.path }}</div></div>
+                <span style="font:500 11.5px 'IBM Plex Mono';color:var(--ink-3,#A39A8E)">{{ loc.countLabel }}</span>
+                <button onClick="{{ loc.onStar }}" style="background:transparent;border:none;cursor:pointer;padding:4px;display:flex"><svg width="18" height="18" viewBox="0 0 24 24" fill="{{ loc.starFill }}" stroke="{{ loc.starStroke }}" stroke-width="1.7" stroke-linejoin="round"><path d="M12 3l2.6 5.6 6 .7-4.5 4.1 1.2 6L12 16.9 6.7 19.5l1.2-6L3.4 9.3l6-.7z"/></svg></button>
+                <sc-if value="{{ loc.sel }}" hint-placeholder-val="{{ false }}"><span style="width:20px;height:20px;border-radius:50%;background:var(--accent,#B5543E);display:flex;align-items:center;justify-content:center;flex:none"><svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="#fff" stroke-width="3.4" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12l5 5L20 6"/></svg></span></sc-if>
+              </div>
+            </sc-for>
+          </div>
+        </div>
+      </sc-if>
+
+      <!-- ===== PLACEHOLDER (People / Collections) ===== -->
+      <sc-if value="{{ isStub }}" hint-placeholder-val="{{ false }}">
+        <div style="height:100%;min-height:60vh;display:flex;flex-direction:column;align-items:center;justify-content:center;text-align:center;padding:40px">
+          <div style="width:58px;height:58px;border-radius:15px;background:var(--field,#F4F0EA);display:flex;align-items:center;justify-content:center;margin-bottom:18px;color:var(--ink-3,#A39A8E)"><svg width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"><circle cx="9" cy="8" r="3.2"/><path d="M3.4 19.5a5.6 5.6 0 0 1 11.2 0"/><circle cx="17.4" cy="8.4" r="2.4" opacity=".55"/></svg></div>
+          <div style="font:700 22px 'Hanken Grotesk';color:var(--ink,#29251F)">{{ stubTitle }}</div>
+          <div style="font:500 14px 'Hanken Grotesk';color:var(--ink-3,#A39A8E);margin-top:6px;max-width:340px">{{ stubText }}</div>
+        </div>
+      </sc-if>
+
+    </div>
+  </div>
+</div>
+</x-dc>
+<script type="text/x-dc" data-dc-script data-props="{&quot;$preview&quot;:{&quot;width&quot;:1280,&quot;height&quot;:820}}">
+class Component extends DCLogic {
+  state = {
+    screen: 'library',
+    theme: 'light',
+    aiOn: false,
+    facesOn: false,
+    scanning: false,
+    selectedId: null,
+    locations: [
+      { id: 'f1', name: 'Pictures Library',  path: '~/Pictures',                 count: 2481,  fav: true },
+      { id: 'f2', name: 'Network — Archive', path: 'smb://nas/photo-archive',     count: 18204, fav: true },
+      { id: 'r1', name: 'Fuji X-T5 — SD card', path: '/Volumes/UNTITLED/DCIM',    count: 312,   fav: false },
+      { id: 'r2', name: 'Iceland trip',      path: '~/Pictures/2024/iceland',     count: 1284,  fav: false },
+      { id: 'r3', name: 'Desktop drop',      path: '~/Desktop/to-import',         count: 48,    fav: false },
+      { id: 'r4', name: 'Studio shoot 06-12', path: '/mnt/photos/studio/0612',    count: 96,    fav: false },
+    ],
+  };
+
+  set(p) { this.setState(p); }
+  go(screen) { this.setState({ screen }); }
+  toggleFav(id) {
+    this.setState(st => ({ locations: st.locations.map(l => l.id === id ? { ...l, fav: !l.fav } : l) }));
+  }
+
+  navStyle(active) {
+    return active
+      ? "display:flex;align-items:center;gap:11px;padding:9px 11px;border-radius:9px;background:var(--surface,#fff);box-shadow:var(--shadow);color:var(--accent-text,#8E3E2C);font:600 14px 'Hanken Grotesk';cursor:pointer"
+      : "display:flex;align-items:center;gap:11px;padding:9px 11px;border-radius:9px;background:transparent;color:var(--ink-2,#6F6960);font:500 14px 'Hanken Grotesk';cursor:pointer";
+  }
+
+  togglePill(on) {
+    return on
+      ? "display:flex;align-items:center;gap:8px;background:var(--accent-tint,#F2E2DA);color:var(--accent-text,#8E3E2C);border:1px solid transparent;font:600 13.5px 'Hanken Grotesk';padding:9px 14px;border-radius:9px;cursor:pointer"
+      : "display:flex;align-items:center;gap:7px;background:var(--surface,#fff);color:var(--ink-2,#6F6960);border:1px solid var(--border,#E2DAD0);font:600 13.5px 'Hanken Grotesk';padding:9px 14px;border-radius:9px;cursor:pointer";
+  }
+
+  renderVals() {
+    const s = this.state;
+    const dark = s.theme === 'dark';
+    const lightVars = "--bg:#FAF8F5;--surface:#FFFFFF;--sidebar:#F4F0EA;--border:#EBE5DD;--ink:#29251F;--ink-2:#6F6960;--ink-3:#A39A8E;--accent:#B5543E;--accent-text:#8E3E2C;--accent-tint:#F2E2DA;--field:#F4F0EA;--shadow:0 1px 2px rgba(0,0,0,.06)";
+    const darkVars  = "--bg:#1B1714;--surface:#241F1B;--sidebar:#141110;--border:#322C26;--ink:#F3EEE7;--ink-2:#B0A698;--ink-3:#766E63;--accent:#CB6B52;--accent-text:#E08A72;--accent-tint:#3A2B25;--field:#241F1B;--shadow:0 1px 2px rgba(0,0,0,.30)";
+    const rootStyle = (dark ? darkVars : lightVars) + ";height:100vh;display:flex;overflow:hidden;background:var(--bg);font-family:'Hanken Grotesk',system-ui,sans-serif";
+
+    const P = ['#C9BCA8','#A7B2AE','#BAA99A','#9FB0BD','#CDB6A3','#B6BCA6','#A8A2AE','#C3AF9F','#97A6A8','#BFA9A0','#D0C3B0','#9DAAA0'];
+    const D = ['#3A4A52','#4A4036','#42504A','#534840','#3E4A54','#4C4738','#473F4C','#524034','#39474A','#4E4038','#444C3C','#3D4248'];
+    const g = c => `linear-gradient(150deg,rgba(255,255,255,.15),rgba(0,0,0,.10)),${c}`;
+    const squares = Array.from({ length: 30 }, (_, i) => ({ bg: g((dark ? D : P)[i % 12]) }));
+
+    const mapLoc = loc => ({
+      id: loc.id, name: loc.name, path: loc.path, fav: loc.fav,
+      sel: loc.id === s.selectedId,
+      rowBg: loc.id === s.selectedId ? 'var(--accent-tint,#F2E2DA)' : 'transparent',
+      starFill: loc.fav ? 'var(--accent,#B5543E)' : 'none',
+      starStroke: loc.fav ? 'var(--accent,#B5543E)' : 'var(--ink-3,#A39A8E)',
+      countLabel: loc.count.toLocaleString(),
+      onSelect: () => this.setState({ selectedId: loc.id }),
+      onStar: (e) => { if (e && e.stopPropagation) e.stopPropagation(); this.toggleFav(loc.id); },
+    });
+
+    const sel = s.locations.find(l => l.id === s.selectedId) || null;
+    const stub = s.screen === 'people' || s.screen === 'collections';
+
+    return {
+      rootStyle, squares,
+      isLibrary: s.screen === 'library',
+      isImport: s.screen === 'import',
+      isStub: stub,
+      stubTitle: s.screen === 'collections' ? 'Collections' : 'People',
+      stubText: s.screen === 'collections'
+        ? 'Group and colour-tag your photos. Designed next on the same system.'
+        : 'Face groups and naming. Use “Tag faces” to step through untagged faces.',
+
+      goLibrary: () => this.go('library'),
+      goImport: () => this.go('import'),
+      goPeople: () => this.go('people'),
+      goTagFaces: () => this.go('people'),
+      goCollections: () => this.go('collections'),
+
+      libStyle: this.navStyle(s.screen === 'library'),
+      importStyle: this.navStyle(s.screen === 'import'),
+      peopleStyle: this.navStyle(s.screen === 'people'),
+      collStyle: this.navStyle(s.screen === 'collections'),
+      libIcon: s.screen === 'library' ? 'var(--accent-text,#8E3E2C)' : 'var(--ink-2,#6F6960)',
+      importIcon: s.screen === 'import' ? 'var(--accent-text,#8E3E2C)' : 'var(--ink-2,#6F6960)',
+      peopleIcon: s.screen === 'people' ? 'var(--accent-text,#8E3E2C)' : 'var(--ink-2,#6F6960)',
+      collIcon: s.screen === 'collections' ? 'var(--accent-text,#8E3E2C)' : 'var(--ink-2,#6F6960)',
+
+      tagFacesStyle: "display:flex;align-items:center;gap:11px;padding:7px 11px 7px 30px;border-radius:9px;background:transparent;color:var(--ink-2,#6F6960);font:500 13px 'Hanken Grotesk';cursor:pointer",
+      tagFacesIcon: 'var(--ink-2,#6F6960)',
+
+      toggleTheme: () => this.setState(st => ({ theme: st.theme === 'light' ? 'dark' : 'light' })),
+      sunStyle: "display:flex;align-items:center;justify-content:center;width:26px;height:24px;border-radius:6px;" + (!dark ? "background:var(--surface,#fff);box-shadow:var(--shadow);color:var(--accent-text,#8E3E2C)" : "background:transparent;color:var(--ink-3,#766E63)"),
+      moonStyle: "display:flex;align-items:center;justify-content:center;width:26px;height:24px;border-radius:6px;" + (dark ? "background:var(--surface,#241F1B);box-shadow:var(--shadow);color:var(--accent-text,#E08A72)" : "background:transparent;color:var(--ink-3,#A39A8E)"),
+
+      aiOn: s.aiOn,
+      facesOn: s.facesOn,
+      aiStyle: this.togglePill(s.aiOn),
+      facesStyle: this.togglePill(s.facesOn),
+      toggleAi: () => this.setState(st => ({ aiOn: !st.aiOn })),
+      toggleFaces: () => this.setState(st => ({ facesOn: !st.facesOn })),
+
+      favorites: s.locations.filter(l => l.fav).map(mapLoc),
+      recents: s.locations.filter(l => !l.fav).map(mapLoc),
+      hasSelection: !!sel,
+      noSelection: !sel,
+      selectedName: sel ? sel.name : '',
+      selectedPath: sel ? sel.path : '',
+      selectedCount: sel ? sel.count.toLocaleString() : '',
+      clearSelection: () => this.setState({ selectedId: null, scanning: false }),
+      browse: () => this.setState({ selectedId: 'r1' }),
+      startScan: () => { if (sel) this.setState(st => ({ scanning: !st.scanning })); },
+      startStyle: sel
+        ? "background:var(--accent,#B5543E);color:#fff;border:none;font:600 13.5px 'Hanken Grotesk';padding:9px 18px;border-radius:9px;cursor:pointer;box-shadow:0 1px 2px rgba(164,66,45,.3)"
+        : "background:var(--field,#F4F0EA);color:var(--ink-3,#A39A8E);border:1px solid var(--border,#EBE5DD);font:600 13.5px 'Hanken Grotesk';padding:9px 18px;border-radius:9px;cursor:not-allowed",
+      startLabel: s.scanning ? 'Scanning…' : 'Start Scan',
+    };
+  }
+}
+</script>
+</body>
+</html>

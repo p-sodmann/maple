@@ -1,121 +1,730 @@
-// Maple — main application window (Slint).
+// Maple — AppWindow with persistent sidebar navigation.
 //
-// Replaces the GTK `adw::NavigationView` with a property-driven page switcher:
-// `page` selects which view is instantiated (Slint `if` only builds the active
-// one). Separate OS windows (settings, debug, detail) are opened from Rust via
-// the callbacks below.
+// Layout: 228 px sidebar + flexible main column.
+// The sidebar holds nav items; the main column has a 62 px top-bar and the
+// active view below it.  Navigation state lives entirely in the UI.
 import { Theme } from "theme.slint";
-import { FlatButton } from "widgets.slint";
-import { HomePage } from "home.slint";
-import { LibraryPage, ThumbItem } from "library.slint";
+import { LibraryPage, LibraryGridView, ThumbItem } from "library.slint";
+import { ImportPage, ImportLocation } from "import.slint";
 import { DetailWindow, CollectionChip, FaceBox, FacePersonSuggestion } from "detail.slint";
 import { ImportWindow, ImportItem } from "import.slint";
 import { SettingsWindow } from "settings.slint";
 import { CollectionsWindow, CollectionEntry } from "collections.slint";
 import { FaceTagWindow } from "face_tag.slint";
 
-// Re-export all second-window types so Rust can build & show them.
+// Re-export second-window types so Rust can build & show them.
 export { ThumbItem, DetailWindow, CollectionChip, FaceBox, FacePersonSuggestion,
          ImportWindow, ImportItem, SettingsWindow, CollectionsWindow, CollectionEntry,
-         FaceTagWindow }
+         FaceTagWindow, ImportLocation }
 
-export enum Page { home, library, import }
+export enum Page { library, import, people, collections }
 
-// Temporary stand-in for views not yet ported (Library → Phase 3, Import →
-// Phase 6). Provides a titled header with a Back button.
-component PlaceholderPage inherits Rectangle {
-    in property <string> title;
-    callback back;
-    background: Theme.window-bg;
+// ── Sidebar nav item ───────────────────────────────────────────────
 
-    VerticalLayout {
-        HorizontalLayout {
-            padding: 8px;
-            spacing: 8px;
-            FlatButton {
-                text: "← Back";
-                clicked => { root.back(); }
-            }
-            Text {
-                text: root.title;
-                color: Theme.fg;
-                font-size: 18px;
-                font-weight: 600;
-                vertical-alignment: center;
-            }
-            Rectangle { horizontal-stretch: 1; }
+component NavItem inherits Rectangle {
+    in property <bool> active;
+    in property <string> label;
+    // Icon slot: place any element as @children.
+    callback clicked;
+
+    height: 38px;
+    border-radius: Theme.radius-btn;
+    background: root.active
+        ? Theme.surface
+        : (ta.has-hover ? Theme.border.with-alpha(0.5) : transparent);
+    animate background { duration: 100ms; }
+
+    // Active-item drop shadow (subtle lift).
+    drop-shadow-blur:   root.active ? 2px : 0px;
+    drop-shadow-offset-y: root.active ? 1px : 0px;
+    drop-shadow-color:  #00000010;
+
+    HorizontalLayout {
+        padding-left: 11px;
+        padding-right: 11px;
+        padding-top: 10px;
+        padding-bottom: 10px;
+        spacing: 11px;
+        alignment: start;
+
+        @children
+
+        Text {
+            text: root.label;
+            color: root.active ? Theme.accent-text : Theme.ink-2;
+            font-size: 14px;
+            font-weight: root.active ? 600 : 500;
+            vertical-alignment: center;
+            horizontal-stretch: 1;
         }
+    }
+
+    ta := TouchArea {
+        clicked => { root.clicked(); }
+    }
+}
+
+// ── Four-square grid icon (Library) ───────────────────────────────
+
+component GridIcon inherits Rectangle {
+    in property <color> clr;
+    width: 18px;
+    height: 18px;
+    Rectangle { x: 0;    y: 0;    width: 7.5px; height: 7.5px; border-radius: 1.5px; background: root.clr; }
+    Rectangle { x: 10.5px; y: 0;  width: 7.5px; height: 7.5px; border-radius: 1.5px; background: root.clr; }
+    Rectangle { x: 0;    y: 10.5px; width: 7.5px; height: 7.5px; border-radius: 1.5px; background: root.clr; }
+    Rectangle { x: 10.5px; y: 10.5px; width: 7.5px; height: 7.5px; border-radius: 1.5px; background: root.clr; }
+}
+
+// ── Downward-arrow icon (Import) ───────────────────────────────────
+
+component DownArrowIcon inherits Path {
+    in property <color> clr;
+    width: 18px;
+    height: 18px;
+    viewbox-width: 24;
+    viewbox-height: 24;
+    fill: root.clr;
+    // Filled down-arrow body + head + base bar
+    commands: "M11 3 L11 13 L8.5 13 L12 17.5 L15.5 13 L13 13 L13 3 Z M4 20 L20 20 L20 22 L4 22 Z";
+}
+
+// ── People icon (head circle + shoulders arc) ─────────────────────
+
+component PeopleIcon inherits Rectangle {
+    in property <color> clr;
+    width: 18px;
+    height: 18px;
+    // Head
+    Rectangle {
+        x: 4px; y: 0;
+        width: 10px; height: 10px;
+        border-radius: 5px;
+        background: root.clr;
+    }
+    // Shoulders (rounded rect)
+    Rectangle {
+        x: 0; y: 12px;
+        width: 18px; height: 7px;
+        border-radius: 3.5px;
+        background: root.clr;
+    }
+}
+
+// ── Stacked-pages icon (Collections) ──────────────────────────────
+
+component CollectionsIcon inherits Rectangle {
+    in property <color> clr;
+    width: 18px;
+    height: 18px;
+    // Back page
+    Rectangle {
+        x: 4px; y: 0;
+        width: 14px; height: 11px;
+        border-radius: 2px;
+        border-width: 1.5px;
+        border-color: root.clr;
+        background: transparent;
+    }
+    // Front page
+    Rectangle {
+        x: 0; y: 5px;
+        width: 14px; height: 13px;
+        border-radius: 2px;
+        background: root.clr;
+    }
+}
+
+// ── Collection dot ─────────────────────────────────────────────────
+
+component CollectionDot inherits Rectangle {
+    in property <color> dot-color;
+    in property <string> label;
+    in property <string> count;
+
+    height: 32px;
+    HorizontalLayout {
+        padding-left: 11px;
+        padding-right: 11px;
+        spacing: 10px;
+        alignment: start;
         Rectangle {
-            vertical-stretch: 1;
-            Text {
-                text: root.title + " — not yet ported";
-                color: Theme.dim-fg;
-                horizontal-alignment: center;
-                vertical-alignment: center;
-            }
+            width: 9px; height: 9px;
+            border-radius: 4.5px;
+            background: root.dot-color;
+            y: (parent.height - self.height) / 2;
+        }
+        Text {
+            text: root.label;
+            color: Theme.ink-2;
+            font-size: 13.5px;
+            font-weight: 500;
+            vertical-alignment: center;
+            horizontal-stretch: 1;
+        }
+        Text {
+            text: root.count;
+            color: Theme.ink-3;
+            font-size: 11px;
+            font-weight: 500;
+            vertical-alignment: center;
         }
     }
 }
 
+// ── Top-bar toggle switch ──────────────────────────────────────────
+
+component TopBarToggle inherits Rectangle {
+    in property <string> label;
+    in property <bool>   checked: false;
+    callback toggled;
+
+    height: 38px;
+    border-radius: Theme.radius-btn;
+    background: root.checked ? Theme.accent-tint : transparent;
+    border-width: 1px;
+    border-color: root.checked ? Theme.accent-tint : Theme.border;
+    animate background { duration: 150ms; }
+
+    HorizontalLayout {
+        padding-left: 12px;
+        padding-right: 12px;
+        padding-top: 9px;
+        padding-bottom: 9px;
+        spacing: 8px;
+        alignment: center;
+
+        Text {
+            text: root.label;
+            color: root.checked ? Theme.accent-text : Theme.ink-2;
+            font-size: 13.5px;
+            font-weight: 600;
+            vertical-alignment: center;
+        }
+
+        // Pill track
+        Rectangle {
+            width: 32px; height: 20px;
+            border-radius: 10px;
+            background: root.checked ? Theme.accent : Theme.ink-3.with-alpha(0.35);
+            animate background { duration: 150ms; }
+
+            // Thumb
+            Rectangle {
+                width: 16px; height: 16px;
+                border-radius: 8px;
+                background: #FFFFFF;
+                x: root.checked ? 14px : 2px;
+                y: 2px;
+                animate x { duration: 150ms; easing: ease-in-out; }
+                drop-shadow-blur: 2px;
+                drop-shadow-offset-y: 1px;
+                drop-shadow-color: #00000025;
+            }
+        }
+    }
+
+    TouchArea { clicked => { root.toggled(); } }
+}
+
+// ── Stub view (People / Collections placeholder) ───────────────────
+
+component StubPage inherits Rectangle {
+    in property <string> title;
+    in property <string> body;
+    background: Theme.bg;
+
+    VerticalLayout {
+        alignment: center;
+        spacing: 14px;
+        padding: 40px;
+
+        HorizontalLayout {
+            alignment: center;
+            Rectangle {
+                width: 56px; height: 56px;
+                border-radius: 14px;
+                background: Theme.field;
+                Text {
+                    text: "…";
+                    color: Theme.ink-3;
+                    font-size: 22px;
+                    horizontal-alignment: center;
+                    vertical-alignment: center;
+                }
+            }
+        }
+
+        Text {
+            text: root.title;
+            color: Theme.ink;
+            font-size: 22px;
+            font-weight: 700;
+            horizontal-alignment: center;
+        }
+        Text {
+            text: root.body;
+            color: Theme.ink-3;
+            font-size: 14px;
+            font-weight: 500;
+            horizontal-alignment: center;
+            wrap: word-wrap;
+        }
+    }
+}
+
+// ── Main window ────────────────────────────────────────────────────
+
 export component AppWindow inherits Window {
     title: "Maple";
-    preferred-width: 900px;
-    preferred-height: 600px;
-    min-width: 640px;
-    min-height: 420px;
-    background: Theme.window-bg;
+    preferred-width: 1280px;
+    preferred-height: 820px;
+    min-width: 720px;
+    min-height: 480px;
+    background: Theme.bg;
     default-font-size: 14px;
 
-    // Current page (navigation state lives entirely in the UI).
-    in-out property <Page> page: Page.home;
+    // ── Navigation state ─────────────────────────────────────────
+    in-out property <Page> page: Page.library;
 
-    // Library grid data (owned by the Rust `LibraryGrid` controller).
-    in property <[ThumbItem]> library-items;
-    in property <length> library-cell-size: 160px;
+    // ── Library ──────────────────────────────────────────────────
+    in property <[ThumbItem]>  library-items;
+    in property <length>       library-cell-size: 160px;
 
-    // Wired from Rust:
-    callback settings-clicked;          // open the settings window
-    callback debug-clicked;             // open the debug window
-    callback collections-clicked;       // open the collections manager
-    callback import-requested;          // begin the import flow
-    callback library-shown;             // library page became visible → load grid
+    // ── Import page state ─────────────────────────────────────────
+    in property <string>           import-source-path:  "";
+    in property <string>           import-source-name:  "";
+    in property <int>              import-source-count: 0;
+    in property <[ImportLocation]> import-favorites:    [];
+    in property <[ImportLocation]> import-recents:      [];
+    in-out property <bool>         import-scanning:     false;
+
+    // ── AI / faces toggle state (library top-bar) ─────────────────
+    in-out property <bool> ai-on:    false;
+    in-out property <bool> faces-on: false;
+    in property <string>   ai-progress:    "";   // e.g. "412 / 2 481"
+    in property <string>   faces-progress: "";
+
+    // ── Callbacks ─────────────────────────────────────────────────
+    callback library-shown;
     callback library-search-changed(string);
-    callback library-activated(int);    // grid cell clicked (index)
-    callback detect-faces-clicked;      // start background face detection
-    callback tag-faces-clicked;         // open detail on images with untagged faces
+    callback library-activated(int);
 
-    if root.page == Page.home: HomePage {
-        width: 100%;
-        height: 100%;
-        import-clicked => {
-            root.import-requested();
+    callback import-page-shown;
+    callback import-browse;
+    callback import-clear;
+    callback import-location-selected(string);
+    callback import-star-toggled(string);
+    callback import-start-scan;
+
+    callback toggle-ai;
+    callback toggle-faces;
+    callback detect-faces-clicked;
+    callback tag-faces-clicked;
+
+    callback settings-clicked;
+    callback collections-clicked;
+    callback debug-clicked;
+
+    // ── Shell layout ──────────────────────────────────────────────
+    HorizontalLayout {
+        spacing: 0;
+
+        // ══ SIDEBAR ══════════════════════════════════════════════
+        Rectangle {
+            width: Theme.sidebar-width;
+            background: Theme.sidebar;
+
+            // Right border
+            Rectangle {
+                x: parent.width - 1px;
+                y: 0;
+                width: 1px;
+                height: parent.height;
+                background: Theme.border;
+            }
+
+            VerticalLayout {
+                padding-top: 18px;
+                padding-bottom: 18px;
+                padding-left: 13px;
+                padding-right: 13px;
+                spacing: 2px;
+
+                // Wordmark (logo placeholder)
+                Rectangle {
+                    height: 42px;
+                    HorizontalLayout {
+                        padding-left: 8px;
+                        padding-bottom: 4px;
+                        spacing: 10px;
+                        alignment: start;
+                        Text {
+                            text: "Maple";
+                            color: Theme.ink;
+                            font-size: 17px;
+                            font-weight: 700;
+                            vertical-alignment: center;
+                        }
+                    }
+                }
+
+                // ── Primary nav ───────────────────────────────────
+                NavItem {
+                    active: root.page == Page.library;
+                    label: "Library";
+                    clicked => {
+                        if (root.page != Page.library) {
+                            root.page = Page.library;
+                            root.library-shown();
+                        }
+                    }
+                    GridIcon {
+                        clr: root.page == Page.library ? Theme.accent-text : Theme.ink-2;
+                    }
+                }
+
+                NavItem {
+                    active: root.page == Page.import;
+                    label: "Import";
+                    clicked => {
+                        if (root.page != Page.import) {
+                            root.page = Page.import;
+                            root.import-page-shown();
+                        }
+                    }
+                    DownArrowIcon {
+                        clr: root.page == Page.import ? Theme.accent-text : Theme.ink-2;
+                    }
+                }
+
+                NavItem {
+                    active: root.page == Page.people;
+                    label: "People";
+                    clicked => { root.page = Page.people; }
+                    PeopleIcon {
+                        clr: root.page == Page.people ? Theme.accent-text : Theme.ink-2;
+                    }
+                }
+
+                NavItem {
+                    active: root.page == Page.collections;
+                    label: "Collections";
+                    clicked => { root.page = Page.collections; }
+                    CollectionsIcon {
+                        clr: root.page == Page.collections ? Theme.accent-text : Theme.ink-2;
+                    }
+                }
+
+                // ── Collections list ──────────────────────────────
+                Rectangle { height: 12px; }
+                Text {
+                    text: "COLLECTIONS";
+                    color: Theme.ink-3;
+                    font-size: 11px;
+                    font-weight: 600;
+                    letter-spacing: 0.7px;
+                }
+                CollectionDot { dot-color: #B5543E; label: "Iceland 2024"; count: "128"; }
+                CollectionDot { dot-color: #6E8B6F; label: "Family";       count: "540"; }
+                CollectionDot { dot-color: #C29A3E; label: "Studio work";  count: "76"; }
+
+                // ── Footer ────────────────────────────────────────
+                Rectangle { vertical-stretch: 1; }
+
+                Rectangle {
+                    height: 1px;
+                    background: Theme.border;
+                }
+
+                Rectangle {
+                    height: 48px;
+                    HorizontalLayout {
+                        padding-left: 8px;
+                        padding-right: 4px;
+                        spacing: 0;
+                        alignment: space-between;
+
+                        // Settings
+                        Rectangle {
+                            horizontal-stretch: 1;
+                            border-radius: Theme.radius-btn;
+                            background: settings-ta.has-hover ? Theme.border.with-alpha(0.5) : transparent;
+                            HorizontalLayout {
+                                padding-left: 8px;
+                                padding-top: 15px;
+                                padding-bottom: 15px;
+                                spacing: 8px;
+                                alignment: start;
+                                // Sliders icon (2 lines with circles)
+                                Rectangle {
+                                    width: 18px; height: 18px;
+                                    Rectangle { x: 0; y: 5px; width: 18px; height: 1.5px; border-radius: 1px; background: Theme.ink-2; }
+                                    Rectangle { x: 0; y: 11px; width: 18px; height: 1.5px; border-radius: 1px; background: Theme.ink-2; }
+                                    Rectangle { x: 5px; y: 2.5px; width: 6px; height: 6px; border-radius: 3px; background: Theme.sidebar; border-width: 1.5px; border-color: Theme.ink-2; }
+                                    Rectangle { x: 7px; y: 8.5px; width: 6px; height: 6px; border-radius: 3px; background: Theme.sidebar; border-width: 1.5px; border-color: Theme.ink-2; }
+                                }
+                                Text {
+                                    text: "Settings";
+                                    color: Theme.ink-2;
+                                    font-size: 13.5px;
+                                    font-weight: 500;
+                                    vertical-alignment: center;
+                                }
+                            }
+                            settings-ta := TouchArea {
+                                clicked => { root.settings-clicked(); }
+                            }
+                        }
+
+                        // Light / dark toggle pill
+                        Rectangle {
+                            width: 58px; height: 32px;
+                            border-radius: 8px;
+                            background: Theme.field;
+                            border-width: 1px;
+                            border-color: Theme.border;
+                            y: (parent.height - self.height) / 2;
+
+                            HorizontalLayout {
+                                padding: 3px;
+                                spacing: 0;
+
+                                // Sun tab
+                                Rectangle {
+                                    width: 26px; height: 24px;
+                                    border-radius: 6px;
+                                    background: !Theme.dark ? Theme.surface : transparent;
+                                    drop-shadow-blur: !Theme.dark ? 1px : 0;
+                                    drop-shadow-color: #00000010;
+                                    Text {
+                                        text: "☀";
+                                        color: !Theme.dark ? Theme.accent-text : Theme.ink-3;
+                                        font-size: 12px;
+                                        horizontal-alignment: center;
+                                        vertical-alignment: center;
+                                    }
+                                }
+                                // Moon tab
+                                Rectangle {
+                                    width: 26px; height: 24px;
+                                    border-radius: 6px;
+                                    background: Theme.dark ? Theme.surface : transparent;
+                                    Text {
+                                        text: "☾";
+                                        color: Theme.dark ? Theme.accent-text : Theme.ink-3;
+                                        font-size: 12px;
+                                        horizontal-alignment: center;
+                                        vertical-alignment: center;
+                                    }
+                                }
+                            }
+
+                            theme-ta := TouchArea {
+                                clicked => { Theme.dark = !Theme.dark; }
+                            }
+                        }
+                    }
+                }
+            }
         }
-        library-clicked => {
-            root.page = Page.library;
-            root.library-shown();
+
+        // ══ MAIN COLUMN ══════════════════════════════════════════
+        VerticalLayout {
+            horizontal-stretch: 1;
+            spacing: 0;
+
+            // ── Top bar ──────────────────────────────────────────
+            Rectangle {
+                height: Theme.topbar-height;
+                background: Theme.bg;
+
+                // Bottom border
+                Rectangle {
+                    x: 0; y: parent.height - 1px;
+                    width: parent.width; height: 1px;
+                    background: Theme.border;
+                }
+
+                HorizontalLayout {
+                    padding-left: Theme.content-pad;
+                    padding-right: Theme.content-pad;
+                    spacing: 16px;
+
+                    // Page title — library only
+                    if root.page == Page.library: Rectangle {
+                        height: 38px;
+                        horizontal-stretch: 0;
+                        y: (parent.height - self.height) / 2;
+                        HorizontalLayout {
+                            spacing: 8px;
+                            alignment: start;
+                            Text {
+                                text: "All Photos";
+                                color: Theme.ink;
+                                font-size: 18px;
+                                font-weight: 700;
+                                letter-spacing: -0.2px;
+                                vertical-alignment: center;
+                            }
+                            Text {
+                                text: root.library-items.length + " photos";
+                                color: Theme.ink-3;
+                                font-size: 13px;
+                                font-weight: 500;
+                                vertical-alignment: center;
+                            }
+                        }
+                    }
+
+                    // Spacer — pushes search and actions to the right
+                    Rectangle { horizontal-stretch: 1; }
+
+                    // Search field
+                    Rectangle {
+                        width: 300px;
+                        height: 38px;
+                        horizontal-stretch: 0;
+                        y: (parent.height - self.height) / 2;
+                        border-radius: Theme.radius-field;
+                        background: Theme.field;
+                        border-width: 1px;
+                        border-color: Theme.border;
+
+                        HorizontalLayout {
+                            padding-left: 14px;
+                            padding-right: 14px;
+                            padding-top: 11px;
+                            padding-bottom: 11px;
+                            spacing: 10px;
+                            alignment: start;
+                            // Magnifier icon
+                            Rectangle {
+                                width: 16px; height: 16px;
+                                Path {
+                                    width: 16px; height: 16px;
+                                    viewbox-width: 24; viewbox-height: 24;
+                                    fill: transparent;
+                                    stroke: Theme.ink-3;
+                                    stroke-width: 1.8px;
+                                    commands: "M11 19A8 8 0 1 0 11 3 8 8 0 0 0 11 19Z M21 21L16.65 16.65";
+                                }
+                            }
+                            // Input with inline placeholder overlay
+                            Rectangle {
+                                horizontal-stretch: 1;
+                                clip: true;
+
+                                search-ph := Text {
+                                    visible: search-ti.text == "";
+                                    text: "Search your library…";
+                                    color: Theme.ink-3;
+                                    font-size: 14px;
+                                    font-weight: 500;
+                                    vertical-alignment: center;
+                                    width: 100%;
+                                    height: 100%;
+                                }
+
+                                search-ti := TextInput {
+                                    width: 100%;
+                                    height: 100%;
+                                    font-size: 14px;
+                                    color: Theme.ink;
+                                    selection-background-color: Theme.accent-tint;
+                                    selection-foreground-color: Theme.accent-text;
+                                    vertical-alignment: center;
+                                    edited => { root.library-search-changed(self.text); }
+                                }
+                            }
+                        }
+                    }
+
+                    // Library actions — explicit height prevents stretch so y-centering works
+                    if root.page == Page.library: Rectangle {
+                        height: 38px;
+                        horizontal-stretch: 0;
+                        y: (parent.height - self.height) / 2;
+
+                        HorizontalLayout {
+                            spacing: 8px;
+                            alignment: start;
+
+                            TopBarToggle {
+                                label: root.ai-on && root.ai-progress != "" ? "Tag with AI  " + root.ai-progress : "Tag with AI";
+                                checked: root.ai-on;
+                                toggled => { root.toggle-ai(); }
+                            }
+
+                            TopBarToggle {
+                                label: root.faces-on && root.faces-progress != "" ? "Detect Faces  " + root.faces-progress : "Detect Faces";
+                                checked: root.faces-on;
+                                toggled => { root.toggle-faces(); }
+                            }
+                        }
+                    }
+
+                    // Import action
+                    if root.page == Page.import: Rectangle {
+                        height: 38px;
+                        horizontal-stretch: 0;
+                        border-radius: Theme.radius-btn;
+                        background: root.import-source-path != ""
+                            ? Theme.accent
+                            : Theme.field;
+                        border-width: root.import-source-path != "" ? 0 : 1px;
+                        border-color: Theme.border;
+                        y: (parent.height - self.height) / 2;
+                        HorizontalLayout {
+                            padding-left: 18px; padding-right: 18px;
+                            alignment: center;
+                            Text {
+                                text: root.import-scanning ? "Scanning…" : "Start Scan";
+                                color: root.import-source-path != "" ? #FFFFFF : Theme.ink-3;
+                                font-size: 13.5px; font-weight: 600; vertical-alignment: center;
+                            }
+                        }
+                        TouchArea {
+                            enabled: root.import-source-path != "" && !root.import-scanning;
+                            clicked => { root.import-start-scan(); }
+                        }
+                    }
+                }
+            }
+
+            // ── Content views ────────────────────────────────────
+            if root.page == Page.library: LibraryPage {
+                vertical-stretch: 1;
+                items: root.library-items;
+                cell-size: root.library-cell-size;
+                search-changed(t) => { root.library-search-changed(t); }
+                activated(i)      => { root.library-activated(i); }
+            }
+
+            if root.page == Page.import: ImportPage {
+                vertical-stretch: 1;
+                source-path:   root.import-source-path;
+                source-name:   root.import-source-name;
+                source-count:  root.import-source-count;
+                favorites:     root.import-favorites;
+                recents:       root.import-recents;
+                browse         => { root.import-browse(); }
+                clear          => { root.import-clear(); }
+                location-selected(id) => { root.import-location-selected(id); }
+                star-toggled(id)      => { root.import-star-toggled(id); }
+            }
+
+            if root.page == Page.people: StubPage {
+                vertical-stretch: 1;
+                title: "People";
+                body: "Face groups and naming. Use Detect Faces to start building your people library.";
+            }
+
+            if root.page == Page.collections: StubPage {
+                vertical-stretch: 1;
+                title: "Collections";
+                body: "Group and colour-tag your photos. Collections manager coming soon.";
+            }
         }
-        settings-clicked => { root.settings-clicked(); }
-        debug-clicked => { root.debug-clicked(); }
-    }
-
-    if root.page == Page.library: LibraryPage {
-        width: 100%;
-        height: 100%;
-        items: root.library-items;
-        cell-size: root.library-cell-size;
-        back => { root.page = Page.home; }
-        search-changed(text) => { root.library-search-changed(text); }
-        activated(i) => { root.library-activated(i); }
-        settings-clicked => { root.settings-clicked(); }
-        collections-clicked => { root.collections-clicked(); }
-        detect-faces-clicked => { root.detect-faces-clicked(); }
-        tag-faces-clicked => { root.tag-faces-clicked(); }
-    }
-
-    if root.page == Page.import: PlaceholderPage {
-        width: 100%;
-        height: 100%;
-        title: "Import";
-        back => { root.page = Page.home; }
     }
 }
