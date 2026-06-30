@@ -124,7 +124,7 @@ fn build(db: Arc<Mutex<maple_db::Database>>) -> Result<FaceTagCtx, slint::Platfo
         let known = known.clone();
         let db = db.clone();
         move |face_id, person_id| {
-            let ok = db.lock().ok().map_or(false, |g| {
+            let ok = db.lock().ok().is_some_and(|g| {
                 let r = g.assign_face_to_person(face_id as i64, Some(person_id as i64))
                     .map_err(|e| tracing::warn!("face_tag: assign_to_person: {e}"))
                     .is_ok();

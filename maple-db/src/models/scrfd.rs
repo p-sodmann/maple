@@ -132,7 +132,7 @@ impl DetectionModel for ScrfdDetector {
                 .with_context(|| format!("SCRFD keypoints stride {stride}"))?;
 
             // Flatten batch dim (shape may be [N,1] or [1,N,1]).
-            let scores_flat: Vec<f32> = scores_raw.iter().copied().collect();
+            let scores_flat: Vec<f32> = scores_raw.to_vec();
             let boxes_flat: Vec<f32> = boxes_raw.iter().map(|&v| v * stride as f32).collect();
             let kps_flat: Vec<f32> = kps_raw.iter().map(|&v| v * stride as f32).collect();
 

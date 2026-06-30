@@ -13,6 +13,10 @@ use maple_db::{SearchQuery, ThumbnailCache};
 use crate::thumbnail;
 use crate::{AppWindow, CollectionEntry, ThumbItem};
 
+/// `(rgb_bytes_w_h, filename, image_id)` — Send-safe thumbnail payload
+/// produced off the main thread, consumed by `upgrade_in_event_loop`.
+type RawThumb = (Option<(Vec<u8>, u32, u32)>, String, i32);
+
 // ── Public API ────────────────────────────────────────────────────
 
 /// Reload all collections from DB, push to `collections-list` and
@@ -37,7 +41,7 @@ pub fn reload_keep_sel(window: &AppWindow, db: &Arc<Mutex<maple_db::Database>>) 
 
 /// Push detail properties for one collection (no thumbnail load).
 pub fn push_detail(window: &AppWindow, db: &Arc<Mutex<maple_db::Database>>, id: i32) {
-    if let Some(g) = db.lock().ok() {
+    if let Ok(g) = db.lock() {
         if let Some(c) = g.collection_by_id(id as i64).ok().flatten() {
             window.set_collections_sel_name(SharedString::from(c.name));
             window.set_collections_sel_color(hex_to_color(&c.color));
@@ -88,7 +92,7 @@ pub fn load_thumbs(
 
         // Produce Send-safe raw RGB tuples. slint::Image is built on the
         // main thread inside upgrade_in_event_loop below.
-        let raws: Vec<(Option<(Vec<u8>, u32, u32)>, String, i32)> = images
+        let raws: Vec<RawThumb> = images
             .iter()
             .map(|img| {
                 let rgb = load_thumb_rgb(img, thumb_px, thumb_quality, &cache).ok();

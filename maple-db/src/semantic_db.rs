@@ -391,7 +391,7 @@ mod tests {
         let (img_a, desc_a) = pairs[0];
         db.insert_sentence_embeddings(img_a, desc_a, model, &[("s".into(), vec![1.0, 0.0, 0.0, 0.0])])
             .unwrap();
-        assert_eq!(db.semantic_search(&[1.0, 0.0, 0.0, 0.0], 10).unwrap().len() >= 1, true);
+        assert!(!db.semantic_search(&[1.0, 0.0, 0.0, 0.0], 10).unwrap().is_empty());
 
         // Editing the description text must drop its sentence + vector rows
         // (via the AFTER UPDATE trigger) so it is re-embedded next pass.

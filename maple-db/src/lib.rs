@@ -30,7 +30,7 @@ pub use hasher::spawn_hasher;
 pub use stacker::update_stacks;
 pub use face_detector::{spawn_face_tagger, DetectedFace, FaceDetector, FaceTagger};
 pub use faces::{best_person_match, best_person_matches, cosine_similarity, FaceDetection, Person, PersonWithRep};
-pub use metadata::{extract_metadata, spawn_metadata_filler, ImageMetadata};
+pub use metadata::{extract_all_exif_tags, extract_metadata, spawn_metadata_filler, ImageMetadata};
 pub use query::SearchQuery;
 pub use scanner::LibraryScanner;
 pub use thumb_cache::ThumbnailCache;
@@ -172,6 +172,13 @@ pub struct LibraryImage {
 }
 
 // ── Database ─────────────────────────────────────────────────────
+
+/// `(image_id, path, content_hash)` — returned by [`Database::images_without_hash`].
+type ImageHashCandidate = (i64, PathBuf, Option<[u8; 32]>);
+/// `(image_id, hash_blob, stack_id)` — returned by [`Database::images_with_hash_and_stack`].
+type ImageHashStackRow = (i64, Vec<u8>, Option<i64>);
+/// `(path, status, content_hash)` — returned by [`Database::all_paths`].
+type ImagePathStatusRow = (PathBuf, ImageStatus, Option<[u8; 32]>);
 
 pub struct Database {
     conn: Connection,
@@ -324,7 +331,7 @@ impl Database {
         &self,
         algorithm: &str,
         limit: usize,
-    ) -> anyhow::Result<Vec<(i64, PathBuf, Option<[u8; 32]>)>> {
+    ) -> anyhow::Result<Vec<ImageHashCandidate>> {
         let mut stmt = self.conn.prepare_cached(
             "SELECT id, path, hash FROM images
              WHERE status = 'present'
@@ -375,7 +382,7 @@ impl Database {
     pub fn images_with_hash_and_stack(
         &self,
         algorithm: &str,
-    ) -> anyhow::Result<Vec<(i64, Vec<u8>, Option<i64>)>> {
+    ) -> anyhow::Result<Vec<ImageHashStackRow>> {
         let mut stmt = self.conn.prepare_cached(
             "SELECT ih.image_id, ih.hash_blob, i.stack_id
              FROM image_hashes ih
@@ -517,21 +524,23 @@ impl Database {
         Ok(())
     }
 
-    /// Populate / overwrite EXIF metadata for the record with `id`.
+    /// Populate / overwrite EXIF metadata for the record with `id`, and mark
+    /// it as having had EXIF extraction run (see `records_needing_metadata`).
     pub fn update_metadata(&self, id: i64, meta: &ImageMetadata) -> anyhow::Result<()> {
         self.conn.execute(
             "UPDATE images SET
-                 filename     = ?1,
-                 taken_at     = ?2,
-                 make         = ?3,
-                 model        = ?4,
-                 lens         = ?5,
-                 focal_length = ?6,
-                 aperture     = ?7,
-                 iso          = ?8,
-                 width        = ?9,
-                 height       = ?10,
-                 orientation  = ?11
+                 filename       = ?1,
+                 taken_at       = ?2,
+                 make           = ?3,
+                 model          = ?4,
+                 lens           = ?5,
+                 focal_length   = ?6,
+                 aperture       = ?7,
+                 iso            = ?8,
+                 width          = ?9,
+                 height         = ?10,
+                 orientation    = ?11,
+                 exif_extracted = 1
              WHERE id = ?12",
             params![
                 meta.filename,
@@ -549,6 +558,37 @@ impl Database {
             ],
         )?;
         Ok(())
+    }
+
+    /// Replace the comprehensive EXIF tag set for `image_id` (delete +
+    /// reinsert). Safe to call repeatedly, e.g. after re-extracting metadata.
+    pub fn replace_exif_tags(&self, image_id: i64, tags: &[(String, String)]) -> anyhow::Result<()> {
+        let tx = self.conn.unchecked_transaction()?;
+        tx.execute("DELETE FROM image_exif_tags WHERE image_id = ?1", params![image_id])?;
+        {
+            let mut stmt = tx.prepare(
+                "INSERT INTO image_exif_tags (image_id, tag, value) VALUES (?1, ?2, ?3)",
+            )?;
+            for (tag, value) in tags {
+                stmt.execute(params![image_id, tag, value])?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// All comprehensive EXIF tags for one image, alphabetical by tag name.
+    pub fn exif_tags_for_image(&self, image_id: i64) -> anyhow::Result<Vec<(String, String)>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT tag, value FROM image_exif_tags WHERE image_id = ?1 ORDER BY tag")?;
+        let rows = stmt
+            .query_map(params![image_id], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+            })?
+            .filter_map(|r| r.ok())
+            .collect();
+        Ok(rows)
     }
 
     /// Update the content hash and EXIF orientation for a record after a
@@ -706,7 +746,8 @@ impl Database {
         }
 
         // Each token must match somewhere in the combined EXIF fields OR
-        // in any AI description OR in any assigned person name.
+        // in any AI description OR in any assigned person name OR in any
+        // comprehensive EXIF tag value (shutter speed, GPS, flash, …).
         let exif_expr =
             "LOWER(COALESCE(i.filename,'') || ' ' || \
                    COALESCE(i.make,'')     || ' ' || \
@@ -714,6 +755,8 @@ impl Database {
                    COALESCE(i.lens,''))";
         let ai_expr = "LOWER(COALESCE(ad.description,''))";
         let person_expr = "LOWER(COALESCE(p.name,''))";
+        let exif_tags_expr = "EXISTS (SELECT 1 FROM image_exif_tags t \
+                               WHERE t.image_id = i.id AND LOWER(t.value) LIKE ? ESCAPE '\\')";
 
         let token_conditions: String = like_patterns
             .iter()
@@ -721,7 +764,8 @@ impl Database {
                 format!(
                     "({exif_expr} LIKE ? ESCAPE '\\' \
                       OR {ai_expr} LIKE ? ESCAPE '\\' \
-                      OR {person_expr} LIKE ? ESCAPE '\\')"
+                      OR {person_expr} LIKE ? ESCAPE '\\' \
+                      OR {exif_tags_expr})"
                 )
             })
             .collect::<Vec<_>>()
@@ -768,11 +812,18 @@ impl Database {
              LIMIT ? OFFSET ?"
         );
 
-        // Each token pattern appears three times: EXIF, AI desc, person name.
+        // Each token pattern appears four times: EXIF, AI desc, person name, EXIF tags.
         use rusqlite::types::Value;
         let mut params: Vec<Value> = like_patterns
             .into_iter()
-            .flat_map(|p| [Value::Text(p.clone()), Value::Text(p.clone()), Value::Text(p)])
+            .flat_map(|p| {
+                [
+                    Value::Text(p.clone()),
+                    Value::Text(p.clone()),
+                    Value::Text(p.clone()),
+                    Value::Text(p),
+                ]
+            })
             .collect();
         if let Some(cid) = collection_id {
             params.push(Value::Integer(cid));
@@ -796,7 +847,7 @@ impl Database {
             .filter_map(|r| r.ok())
             .collect();
         for img in &mut rows {
-            let (field, snippet) = if let Some(f) = detect_exif_field(img, &tokens) {
+            let (field, snippet) = if let Some(f) = detect_exif_field(&self.conn, img, &tokens) {
                 (f, None)
             } else {
                 find_description_match(&self.conn, img.id, &tokens)
@@ -900,11 +951,11 @@ impl Database {
     }
 
     /// Return `(id, path)` for all records where EXIF has not been extracted
-    /// yet (`filename IS NULL`).  Used by `spawn_metadata_filler`.
+    /// yet (`exif_extracted = 0`).  Used by `spawn_metadata_filler`.
     pub fn records_needing_metadata(&self) -> anyhow::Result<Vec<(i64, PathBuf)>> {
         let mut stmt = self
             .conn
-            .prepare("SELECT id, path FROM images WHERE filename IS NULL AND status = 'present'")?;
+            .prepare("SELECT id, path FROM images WHERE exif_extracted = 0 AND status = 'present'")?;
         let rows = stmt
             .query_map([], |row| {
                 Ok((
@@ -951,7 +1002,7 @@ impl Database {
 
     /// Return all `(path, status, hash)` triples — used by the scanner for
     /// reconciliation and thumbnail cache eviction.
-    pub fn all_paths(&self) -> anyhow::Result<Vec<(PathBuf, ImageStatus, Option<[u8; 32]>)>> {
+    pub fn all_paths(&self) -> anyhow::Result<Vec<ImagePathStatusRow>> {
         let mut stmt = self.conn.prepare("SELECT path, status, hash FROM images")?;
         let rows = stmt
             .query_map([], |row| {
@@ -1065,8 +1116,26 @@ impl Database {
 
 /// Return the EXIF field name that first satisfies any of `tokens`, or `None`
 /// when the match must have come from an AI description or a person name.
-pub(crate) fn detect_exif_field(img: &LibraryImage, tokens: &[String]) -> Option<String> {
+///
+/// Checks the curated fields (filename, camera, lens) plus every
+/// comprehensive EXIF tag stored for the image; for the latter, the
+/// returned "field" is the tag's own name (e.g. `"ExposureTime"`).
+pub(crate) fn detect_exif_field(
+    conn: &Connection,
+    img: &LibraryImage,
+    tokens: &[String],
+) -> Option<String> {
     let meta = &img.meta;
+    let extra_tags: Vec<(String, String)> = conn
+        .prepare("SELECT tag, value FROM image_exif_tags WHERE image_id = ?1")
+        .and_then(|mut stmt| {
+            stmt.query_map(params![img.id], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+            })
+            .map(|rows| rows.filter_map(|r| r.ok()).collect())
+        })
+        .unwrap_or_default();
+
     for token in tokens {
         if meta
             .filename
@@ -1092,6 +1161,9 @@ pub(crate) fn detect_exif_field(img: &LibraryImage, tokens: &[String]) -> Option
             .unwrap_or(false)
         {
             return Some("lens".to_owned());
+        }
+        if let Some((tag, _)) = extra_tags.iter().find(|(_, v)| v.to_lowercase().contains(token.as_str())) {
+            return Some(tag.clone());
         }
     }
     None
@@ -1251,6 +1323,59 @@ mod tests {
     }
 
     #[test]
+    fn exif_tags_round_trip_and_replace() {
+        let (_dir, db) = tmp_db();
+        db.insert_image(&PathBuf::from("/photos/e.jpg"), &fake_hash(20), 1024).unwrap();
+        let id = db.search_images(&SearchQuery::default()).unwrap()[0].id;
+
+        db.replace_exif_tags(
+            id,
+            &[
+                ("ExposureTime".to_owned(), "1/250 sec.".to_owned()),
+                ("Flash".to_owned(), "Flash did not fire".to_owned()),
+            ],
+        )
+        .unwrap();
+        let tags = db.exif_tags_for_image(id).unwrap();
+        assert_eq!(
+            tags,
+            vec![
+                ("ExposureTime".to_owned(), "1/250 sec.".to_owned()),
+                ("Flash".to_owned(), "Flash did not fire".to_owned()),
+            ]
+        );
+
+        // Replacing with a smaller set drops the old rows, not just appends.
+        db.replace_exif_tags(id, &[("WhiteBalance".to_owned(), "Auto".to_owned())]).unwrap();
+        let tags = db.exif_tags_for_image(id).unwrap();
+        assert_eq!(tags, vec![("WhiteBalance".to_owned(), "Auto".to_owned())]);
+    }
+
+    #[test]
+    fn search_matches_comprehensive_exif_tag() {
+        let (_dir, db) = tmp_db();
+        db.insert_image(&PathBuf::from("/photos/f.jpg"), &fake_hash(21), 1024).unwrap();
+        db.insert_image(&PathBuf::from("/photos/g.jpg"), &fake_hash(22), 1024).unwrap();
+        let ids: Vec<i64> = db
+            .search_images(&SearchQuery::default())
+            .unwrap()
+            .iter()
+            .map(|i| i.id)
+            .collect();
+
+        db.replace_exif_tags(ids[0], &[("WhiteBalance".to_owned(), "Manual".to_owned())]).unwrap();
+
+        let q = SearchQuery::default().with_text("Manual");
+        let results = db.search_images(&q).unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].id, ids[0]);
+        match &results[0].search_hit {
+            Some(SearchHit::Direct { field, .. }) => assert_eq!(field, "WhiteBalance"),
+            other => panic!("expected Direct hit, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn update_metadata_round_trip() {
         let (_dir, db) = tmp_db();
         let path = PathBuf::from("/photos/d.jpg");
@@ -1285,22 +1410,19 @@ mod tests {
         let present = PathBuf::from("/photos/present.jpg");
         let missing = PathBuf::from("/photos/missing.jpg");
 
+        // Freshly inserted images start with exif_extracted = 0 — no need to
+        // simulate a "pre-EXIF" state separately.
         db.insert_image(&present, &fake_hash(10), 1024).unwrap();
         db.insert_image(&missing, &fake_hash(11), 1024).unwrap();
         db.mark_missing(&missing).unwrap();
 
-        // Grab IDs before clearing filenames.
-        let all = db.all_images().unwrap();
-        let present_id = all.iter().find(|r| r.path == present).unwrap().id;
-        let missing_id = all.iter().find(|r| r.path == missing).unwrap().id;
-
-        // Simulate pre-EXIF state: both records have filename IS NULL.
-        db.update_metadata(present_id, &ImageMetadata::default()).unwrap();
-        db.update_metadata(missing_id, &ImageMetadata::default()).unwrap();
-
         let needing = db.records_needing_metadata().unwrap();
         assert_eq!(needing.len(), 1, "missing records should not be returned");
         assert_eq!(needing[0].1, present);
+
+        // update_metadata marks the record as extracted, so it drops out.
+        db.update_metadata(needing[0].0, &ImageMetadata::default()).unwrap();
+        assert!(db.records_needing_metadata().unwrap().is_empty());
     }
 
     // ── Stack cover / stack_size tests (exercises B5 fix) ─────────

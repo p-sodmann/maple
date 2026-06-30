@@ -141,14 +141,14 @@ pub fn update_stacks(
 
 // ── Union-Find ────────────────────────────────────────────────────────────────
 
-fn uf_find(parent: &mut Vec<usize>, x: usize) -> usize {
+fn uf_find(parent: &mut [usize], x: usize) -> usize {
     if parent[x] != x {
         parent[x] = uf_find(parent, parent[x]);
     }
     parent[x]
 }
 
-fn uf_union(parent: &mut Vec<usize>, rank: &mut Vec<u8>, a: usize, b: usize) {
+fn uf_union(parent: &mut [usize], rank: &mut [u8], a: usize, b: usize) {
     let ra = uf_find(parent, a);
     let rb = uf_find(parent, b);
     if ra == rb {

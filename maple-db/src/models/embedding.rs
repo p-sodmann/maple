@@ -97,9 +97,9 @@ impl OnnxFaceEmbedder {
         // ArcFace preprocessing: BGR→RGB, HWC→CHW, add batch.
         // Input from atksh detector is BGR [0,255]; model expects RGB CHW [0,255].
         let preprocessor = Preprocessor::new()
-            .add(PreprocessStep::SwapChannels)
-            .add(PreprocessStep::HwcToChw)
-            .add(PreprocessStep::AddBatchDim);
+            .with_step(PreprocessStep::SwapChannels)
+            .with_step(PreprocessStep::HwcToChw)
+            .with_step(PreprocessStep::AddBatchDim);
 
         Ok(Self { session, preprocessor, embedding_dim })
     }
@@ -129,7 +129,7 @@ impl EmbeddingModel for OnnxFaceEmbedder {
         let (_, raw_data) = outputs[output_name.as_str()]
             .try_extract_tensor::<f32>()
             .context("extracting embedding tensor")?;
-        let raw: Vec<f32> = raw_data.iter().copied().collect();
+        let raw: Vec<f32> = raw_data.to_vec();
 
         Ok(l2_normalize(raw))
     }

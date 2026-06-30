@@ -60,6 +60,11 @@ pub fn run() -> anyhow::Result<()> {
     maple_db::LibraryScanner::new(db.clone(), settings.library_dir.clone(), Some(cache.clone()))
         .spawn();
 
+    // Backfill EXIF metadata (curated fields + comprehensive tags) for any
+    // records inserted since the last run. Safe to call repeatedly — it only
+    // touches records where `exif_extracted = 0`.
+    maple_db::spawn_metadata_filler(db.clone());
+
     if settings.stacks.enabled {
         maple_db::spawn_hasher(db.clone(), settings.stacks.clone(), Some(cache.clone()));
     }
@@ -367,9 +372,7 @@ pub fn run() -> anyhow::Result<()> {
                 let path = loc.path.as_str();
                 if starred.contains(path) {
                     if let Ok(g) = db.lock() { let _ = g.remove_starred_path(path); }
-                } else {
-                    if let Ok(g) = db.lock() { let _ = g.add_starred_path(path); }
-                }
+                } else if let Ok(g) = db.lock() { let _ = g.add_starred_path(path); }
             }
             let starred = starred_paths(&db);
             let locs = build_import_locations(&settings, &home, &starred);
@@ -497,7 +500,7 @@ fn starred_paths(db: &std::sync::Arc<std::sync::Mutex<maple_db::Database>>) -> s
 
 fn build_import_locations(
     settings: &maple_state::Settings,
-    home: &std::path::PathBuf,
+    home: &std::path::Path,
     starred: &std::collections::HashSet<String>,
 ) -> Vec<LocData> {
     let mut locs: Vec<LocData> = Vec::new();

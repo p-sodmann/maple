@@ -5,6 +5,12 @@
 /// Placeholder: will hold the ONNX session and preprocessing pipeline.
 pub struct EmbedEngine;
 
+impl Default for EmbedEngine {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl EmbedEngine {
     pub fn new() -> Self {
         tracing::info!("EmbedEngine stub created (phase 0)");

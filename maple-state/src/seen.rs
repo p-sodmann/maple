@@ -42,7 +42,7 @@ impl SeenSet {
 
     fn with_capacity(expected: usize) -> Self {
         let num_bits = optimal_bits(expected).max(MIN_BITS);
-        let words = (num_bits + 63) / 64;
+        let words = num_bits.div_ceil(64);
         Self {
             bits: vec![0u64; words],
             num_bits: words * 64,
@@ -142,7 +142,7 @@ impl SeenSet {
 
     fn rebuild_bloom(&mut self) {
         let num_bits = optimal_bits(self.hashes.len()).max(MIN_BITS);
-        let words = (num_bits + 63) / 64;
+        let words = num_bits.div_ceil(64);
         self.bits = vec![0u64; words];
         self.num_bits = words * 64;
         for i in 0..self.hashes.len() {

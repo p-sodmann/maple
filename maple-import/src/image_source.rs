@@ -81,7 +81,7 @@ pub fn raw_preview_supported(path: &Path) -> bool {
         HANDLERS
             .iter()
             .find(|h| h.matches(e))
-            .map_or(true, |h| h.preview_supported())
+            .is_none_or(|h| h.preview_supported())
     })
 }
 
@@ -111,7 +111,7 @@ fn ext_str(path: &Path) -> Option<String> {
 }
 
 fn with_ext(path: &Path, f: impl FnOnce(&str) -> bool) -> bool {
-    ext_str(path).as_deref().map_or(false, f)
+    ext_str(path).as_deref().is_some_and(f)
 }
 
 #[cfg(test)]

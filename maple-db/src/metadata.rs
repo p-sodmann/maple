@@ -1,12 +1,15 @@
 //! EXIF metadata extraction and background population worker.
 //!
-//! `extract_metadata` reads a single image file and returns whatever EXIF
-//! fields are present.  It never panics — on any I/O or parse failure it
-//! returns a struct with only `filename` populated.
+//! `extract_metadata` reads a single image file and returns the curated
+//! subset of EXIF fields with dedicated `images` columns. It never panics —
+//! on any I/O or parse failure it returns a struct with only `filename`
+//! populated. `extract_all_exif_tags` reads every other standard EXIF tag
+//! present (comprehensive capture, for the Detail window and search) as
+//! human-readable name/value pairs, stored in `image_exif_tags`.
 //!
-//! `spawn_metadata_filler` runs once at library-open time to populate
-//! metadata for any records that were inserted before EXIF extraction
-//! existed (i.e. `filename IS NULL` in the DB).
+//! `spawn_metadata_filler` is called (a) once at library-open time and (b)
+//! after each scan/import batch that inserts new rows. It is safe to call
+//! repeatedly — it only processes records where `exif_extracted = 0`.
 
 use std::fs::File;
 use std::io::{BufReader, Cursor};
@@ -41,6 +44,21 @@ pub struct ImageMetadata {
 
 // ── Extraction ───────────────────────────────────────────────────
 
+/// Read and parse the EXIF block for `path`.  For raw files, reads from the
+/// embedded JPEG preview (raw containers are not parsed directly).  Returns
+/// `None` on any I/O or parse failure.
+fn read_exif(path: &Path) -> Option<exif::Exif> {
+    if is_raw_format(path) {
+        let bytes = loadable_image_bytes(path).ok()?;
+        let mut cursor = Cursor::new(bytes);
+        exif::Reader::new().read_from_container(&mut cursor).ok()
+    } else {
+        let file = File::open(path).ok()?;
+        let mut reader = BufReader::new(file);
+        exif::Reader::new().read_from_container(&mut reader).ok()
+    }
+}
+
 /// Extract metadata from `path`.  Returns a best-effort struct — fields
 /// that cannot be read are left as `None`.
 pub fn extract_metadata(path: &Path) -> ImageMetadata {
@@ -49,25 +67,8 @@ pub fn extract_metadata(path: &Path) -> ImageMetadata {
         .and_then(|n| n.to_str())
         .map(ToOwned::to_owned);
 
-    // For raw files, read EXIF from the embedded JPEG preview.
-    let exif = if is_raw_format(path) {
-        let Ok(bytes) = loadable_image_bytes(path) else {
-            return ImageMetadata { filename, ..Default::default() };
-        };
-        let mut cursor = Cursor::new(bytes);
-        match exif::Reader::new().read_from_container(&mut cursor) {
-            Ok(e) => e,
-            Err(_) => return ImageMetadata { filename, ..Default::default() },
-        }
-    } else {
-        let Ok(file) = File::open(path) else {
-            return ImageMetadata { filename, ..Default::default() };
-        };
-        let mut reader = BufReader::new(file);
-        match exif::Reader::new().read_from_container(&mut reader) {
-            Ok(e) => e,
-            Err(_) => return ImageMetadata { filename, ..Default::default() },
-        }
+    let Some(exif) = read_exif(path) else {
+        return ImageMetadata { filename, ..Default::default() };
     };
 
     // ── Helper closures that search all IFDs ─────────────────────
@@ -139,6 +140,120 @@ fn parse_exif_datetime(s: &str) -> Option<i64> {
     maple_import::ExifDateTime::parse(s).map(|dt| dt.to_unix_timestamp())
 }
 
+// ── Comprehensive EXIF tag capture ─────────────────────────────────
+
+/// Tags whose values are file-internal byte offsets/lengths, or large
+/// opaque vendor binary blobs — not meaningful to show or search.
+const SKIP_TAGS: &[Tag] = &[
+    Tag::StripOffsets,
+    Tag::StripByteCounts,
+    Tag::TileOffsets,
+    Tag::TileByteCounts,
+    Tag::JPEGInterchangeFormat,
+    Tag::JPEGInterchangeFormatLength,
+    Tag::MakerNote,
+];
+
+/// Tags already surfaced as dedicated [`ImageMetadata`] fields / `images`
+/// columns — excluded here so the Detail window doesn't show the same
+/// value twice.
+const CURATED_TAGS: &[Tag] = &[
+    Tag::Make,
+    Tag::Model,
+    Tag::LensModel,
+    Tag::FocalLength,
+    Tag::FNumber,
+    Tag::PhotographicSensitivity,
+    Tag::Orientation,
+    Tag::DateTimeOriginal,
+    Tag::PixelXDimension,
+    Tag::PixelYDimension,
+    Tag::ImageWidth,
+    Tag::ImageLength,
+];
+
+/// Defensive cap on stored tag value length (some vendor text fields can be
+/// surprisingly long; this just bounds DB/UI blowup, not a real limit).
+const MAX_TAG_VALUE_LEN: usize = 500;
+
+/// Extract every standard EXIF tag from `path` as human-readable
+/// `(tag_name, value)` pairs, for comprehensive Detail-window display and
+/// search. Excludes tags already covered by [`extract_metadata`] and tags
+/// that hold file-internal offsets or large opaque binary blobs.
+///
+/// Only the primary image's IFD tree is read — the embedded thumbnail (IFD1)
+/// repeats several of the same tag *names* (resolution, compression, …) with
+/// its own values, which would otherwise collide on `(image_id, tag)`.
+///
+/// GPS latitude/longitude (including the "destination" variants) are
+/// converted from degrees/minutes/seconds to signed decimal degrees, which
+/// is both more readable and lets the value match a plain numeric search.
+pub fn extract_all_exif_tags(path: &Path) -> Vec<(String, String)> {
+    let Some(exif) = read_exif(path) else { return Vec::new() };
+
+    let mut seen = std::collections::HashSet::new();
+    exif.fields()
+        .filter(|f| {
+            f.ifd_num == exif::In::PRIMARY
+                && !SKIP_TAGS.contains(&f.tag)
+                && !CURATED_TAGS.contains(&f.tag)
+        })
+        .filter_map(|f| {
+            let value = match f.tag {
+                Tag::GPSLatitude => gps_decimal_degrees(&exif, Tag::GPSLatitude, Tag::GPSLatitudeRef),
+                Tag::GPSLongitude => gps_decimal_degrees(&exif, Tag::GPSLongitude, Tag::GPSLongitudeRef),
+                Tag::GPSDestLatitude => {
+                    gps_decimal_degrees(&exif, Tag::GPSDestLatitude, Tag::GPSDestLatitudeRef)
+                }
+                Tag::GPSDestLongitude => {
+                    gps_decimal_degrees(&exif, Tag::GPSDestLongitude, Tag::GPSDestLongitudeRef)
+                }
+                _ => Some(f.display_value().with_unit(&exif).to_string()),
+            }?;
+
+            let value = value.trim();
+            if value.is_empty() {
+                return None;
+            }
+            let value = if value.chars().count() > MAX_TAG_VALUE_LEN {
+                value.chars().take(MAX_TAG_VALUE_LEN).collect::<String>() + "…"
+            } else {
+                value.to_owned()
+            };
+            let name = f.tag.to_string();
+            // Tags the library can't name fall back to a `Tag(Context, N)`
+            // debug form — these are vendor-private numbers (e.g. Adobe
+            // PrintIM) whose value is an opaque binary blob, not useful here.
+            if name.starts_with("Tag(") {
+                return None;
+            }
+            // Defensive: `(image_id, tag)` is unique in the DB, so guard
+            // against any other unforeseen same-name collision too.
+            seen.insert(name.clone()).then_some((name, value))
+        })
+        .collect()
+}
+
+/// Convert a GPS DMS rational triplet (`val_tag`) to signed decimal degrees
+/// using its hemisphere reference tag (`ref_tag`; "S"/"W" negate).
+fn gps_decimal_degrees(exif: &exif::Exif, val_tag: Tag, ref_tag: Tag) -> Option<String> {
+    let field = exif.fields().find(|f| f.tag == val_tag)?;
+    let Value::Rational(ref v) = field.value else { return None };
+    if v.len() < 3 {
+        return None;
+    }
+    let mut degrees = v[0].to_f64() + v[1].to_f64() / 60.0 + v[2].to_f64() / 3600.0;
+
+    if let Some(r) = exif.fields().find(|f| f.tag == ref_tag) {
+        if let Value::Ascii(ref rv) = r.value {
+            if matches!(rv.first().and_then(|b| b.first()), Some(b'S') | Some(b'W')) {
+                degrees = -degrees;
+            }
+        }
+    }
+    Some(format!("{degrees:.6}"))
+}
+
 // ── Background worker ────────────────────────────────────────────
 
 /// Spawn a one-shot background thread that fills EXIF metadata for all
@@ -159,8 +274,16 @@ pub fn spawn_metadata_filler(db: Arc<Mutex<Database>>) {
 
             for (id, path) in to_fill {
                 let meta = extract_metadata(&path);
-                if let Err(e) = crate::lock_db(&db).update_metadata(id, &meta) {
+                let tags = extract_all_exif_tags(&path);
+                let guard = crate::lock_db(&db);
+                if let Err(e) = guard.update_metadata(id, &meta) {
                     tracing::warn!("Metadata filler: failed for {}: {e}", path.display());
+                }
+                if let Err(e) = guard.replace_exif_tags(id, &tags) {
+                    tracing::warn!(
+                        "Metadata filler: failed to store EXIF tags for {}: {e}",
+                        path.display()
+                    );
                 }
             }
 
@@ -350,5 +473,10 @@ mod tests {
         let meta = extract_metadata(Path::new("/nonexistent/photo.jpg"));
         assert_eq!(meta.filename.as_deref(), Some("photo.jpg"));
         assert!(meta.make.is_none());
+    }
+
+    #[test]
+    fn extract_all_exif_tags_missing_file_returns_empty() {
+        assert!(extract_all_exif_tags(Path::new("/nonexistent/photo.jpg")).is_empty());
     }
 }

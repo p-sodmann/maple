@@ -29,10 +29,13 @@ import { LineEdit, ScrollView } from "std-widgets.slint";
 
 // One row in the image-info popup.
 // is-section = true → renders as a section heading; value is ignored.
+// is-toggle = true (only meaningful when is-section is also true) → the
+// heading is clickable and fires toggle-all-exif().
 export struct ImageInfoRow {
     label: string,
     value: string,
     is-section: bool,
+    is-toggle: bool,
 }
 
 // One collection membership chip.
@@ -79,7 +82,6 @@ export component DetailWindow inherits Window {
     in property <int> img-w;
     in property <int> img-h;
     in property <string> filename;
-    in property <string> info-text;
     in property <bool> loading;
     in property <string> error-text;
     in property <bool> is-fullscreen;
@@ -102,7 +104,6 @@ export component DetailWindow inherits Window {
 
     // ── View state ────────────────────────────────────────────────
     property <float> zoom: 1.0;
-    property <bool> show-info: true;
     property <float> prev-zoom: 1.0;
     property <length> prev-ox: 0;
     property <length> prev-oy: 0;
@@ -133,6 +134,8 @@ export component DetailWindow inherits Window {
     callback add-to-collection;
     // add-to-collection-confirm(id): user chose a collection from the picker.
     callback add-to-collection-confirm(int);
+    // User clicked the "ALL EXIF METADATA" heading in the info panel.
+    callback toggle-all-exif;
 
     // Face overlay callbacks
     callback toggle-faces;
@@ -251,10 +254,6 @@ export component DetailWindow inherits Window {
                         }
                     }
                     FlatButton {
-                        text: root.show-info ? "Hide Info" : "Info";
-                        clicked => { root.show-info = !root.show-info; }
-                    }
-                    FlatButton {
                         text: root.show-faces ? "Faces ●" : "Faces";
                         clicked => { root.toggle-faces(); }
                     }
@@ -273,20 +272,6 @@ export component DetailWindow inherits Window {
                         clicked => { root.toggle-fullscreen(); }
                     }
                     FlatButton { text: "✕ Close"; clicked => { root.close-requested(); } }
-                }
-            }
-
-            // ── EXIF strip ────────────────────────────────────────
-            if root.show-info && root.info-text != "": Rectangle {
-                height: 26px;
-                background: Theme.card-bg;
-                Text {
-                    text: root.info-text;
-                    color: Theme.dim-fg;
-                    font-size: 12px;
-                    overflow: elide;
-                    horizontal-alignment: center;
-                    vertical-alignment: center;
                 }
             }
 
@@ -820,6 +805,13 @@ export component DetailWindow inherits Window {
                                         font-weight: 700;
                                         vertical-alignment: center;
                                     }
+                                }
+
+                                // Clickable section heading (currently only "ALL EXIF METADATA").
+                                if row.is-toggle: TouchArea {
+                                    width: 100%;
+                                    height: 100%;
+                                    clicked => { root.toggle-all-exif(); }
                                 }
 
                                 // Regular row: dim label on the left, value on the right.

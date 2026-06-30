@@ -9,27 +9,27 @@
 //! **atksh face detector** (BGR [0, 255], dynamic HWC):
 //! ```ignore
 //! Preprocessor::new()
-//!     .add(PreprocessStep::SwapChannels)   // RGB → BGR
+//!     .with_step(PreprocessStep::SwapChannels)   // RGB → BGR
 //! ```
 //!
 //! **ArcFace embedder** (BGR [-1, 1], fixed NCHW 1×3×112×112):
 //! ```ignore
 //! Preprocessor::new()
-//!     .add(PreprocessStep::LinearScale { scale: 1.0 / 127.5, offset: -1.0 })
-//!     .add(PreprocessStep::HwcToChw)
-//!     .add(PreprocessStep::AddBatchDim)
+//!     .with_step(PreprocessStep::LinearScale { scale: 1.0 / 127.5, offset: -1.0 })
+//!     .with_step(PreprocessStep::HwcToChw)
+//!     .with_step(PreprocessStep::AddBatchDim)
 //! ```
 //!
 //! **ImageNet models** (RGB [0, 1] normalised, NCHW):
 //! ```ignore
 //! Preprocessor::new()
-//!     .add(PreprocessStep::LinearScale { scale: 1.0 / 255.0, offset: 0.0 })
-//!     .add(PreprocessStep::Normalize {
+//!     .with_step(PreprocessStep::LinearScale { scale: 1.0 / 255.0, offset: 0.0 })
+//!     .with_step(PreprocessStep::Normalize {
 //!         mean: [0.485, 0.456, 0.406],
 //!         std:  [0.229, 0.224, 0.225],
 //!     })
-//!     .add(PreprocessStep::HwcToChw)
-//!     .add(PreprocessStep::AddBatchDim)
+//!     .with_step(PreprocessStep::HwcToChw)
+//!     .with_step(PreprocessStep::AddBatchDim)
 //! ```
 
 use anyhow::{bail, Result};
@@ -72,7 +72,7 @@ pub enum PreprocessStep {
 
 /// An ordered preprocessing pipeline.
 ///
-/// Build it with [`new`](Preprocessor::new) + [`add`](Preprocessor::add), then
+/// Build it with [`new`](Preprocessor::new) + [`with_step`](Preprocessor::with_step), then
 /// call [`run`](Preprocessor::run) to transform an image array.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Preprocessor {
@@ -85,7 +85,7 @@ impl Preprocessor {
     }
 
     /// Append a step and return `self` for chaining.
-    pub fn add(mut self, step: PreprocessStep) -> Self {
+    pub fn with_step(mut self, step: PreprocessStep) -> Self {
         self.steps.push(step);
         self
     }

@@ -222,7 +222,7 @@ pub fn build_suggestions(
 pub fn assign_to_person(
     face_id: i64,
     person_id: i64,
-    faces: &mut Vec<FaceDetection>,
+    faces: &mut [FaceDetection],
     db: &Arc<Mutex<maple_db::Database>>,
 ) -> bool {
     let Ok(guard) = db.lock() else { return false };
@@ -242,7 +242,7 @@ pub fn assign_to_person(
 pub fn assign_to_name(
     face_id: i64,
     name: &str,
-    faces: &mut Vec<FaceDetection>,
+    faces: &mut [FaceDetection],
     known: &mut EmbeddingMatrix,
     db: &Arc<Mutex<maple_db::Database>>,
 ) -> Option<i64> {

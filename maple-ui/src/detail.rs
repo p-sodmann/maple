@@ -30,6 +30,21 @@ thread_local! {
     static DETAIL: RefCell<Option<Detail>> = const { RefCell::new(None) };
 }
 
+/// Record list + face overlay state shared between [`navigate`] and
+/// [`show_record`]. Cloning is cheap — every field is an `Rc`/`Arc`.
+#[derive(Clone)]
+struct NavState {
+    records: Rc<RefCell<Vec<LibraryImage>>>,
+    index: Rc<Cell<usize>>,
+    db: Arc<Mutex<maple_db::Database>>,
+    faces: Rc<RefCell<Vec<FaceDetection>>>,
+    known_embeddings: Rc<RefCell<EmbeddingMatrix>>,
+    current_image_id: Rc<Cell<i64>>,
+    /// Whether the "ALL EXIF METADATA" section in the info panel is expanded.
+    /// Reset to collapsed whenever a different image is shown.
+    show_all_exif: Rc<Cell<bool>>,
+}
+
 /// The detail window and its shared state.
 ///
 /// Not `Clone` — the generated `DetailWindow` handle isn't, and there should
@@ -38,13 +53,7 @@ thread_local! {
 /// fields, so no reference cycle forms through Slint.
 struct Detail {
     window: DetailWindow,
-    records: Rc<RefCell<Vec<LibraryImage>>>,
-    index: Rc<Cell<usize>>,
-    db: Arc<Mutex<maple_db::Database>>,
-    // Face overlay state
-    faces: Rc<RefCell<Vec<FaceDetection>>>,
-    known_embeddings: Rc<RefCell<EmbeddingMatrix>>,
-    current_image_id: Rc<Cell<i64>>,
+    nav: NavState,
 }
 
 /// Open (or reuse) the detail window for `records[index]`, syncing dark-mode state.
@@ -69,8 +78,8 @@ pub fn open(
         let Some(detail) = guard.as_ref() else { return };
         detail.window.set_dark(is_dark);
         let len = records.len();
-        *detail.records.borrow_mut() = records;
-        detail.index.set(index.min(len.saturating_sub(1)));
+        *detail.nav.records.borrow_mut() = records;
+        detail.nav.index.set(index.min(len.saturating_sub(1)));
 
         show_current(detail);
 
@@ -99,27 +108,27 @@ fn build(db: Arc<Mutex<maple_db::Database>>) -> Result<Detail, slint::PlatformEr
     let known_embeddings: Rc<RefCell<EmbeddingMatrix>> =
         Rc::new(RefCell::new(EmbeddingMatrix::empty()));
     let current_image_id: Rc<Cell<i64>> = Rc::new(Cell::new(0));
+    let show_all_exif: Rc<Cell<bool>> = Rc::new(Cell::new(false));
+    let nav = NavState {
+        records: records.clone(),
+        index: index.clone(),
+        db: db.clone(),
+        faces: faces.clone(),
+        known_embeddings: known_embeddings.clone(),
+        current_image_id: current_image_id.clone(),
+        show_all_exif: show_all_exif.clone(),
+    };
 
     // ── Navigation ────────────────────────────────────────────────
     window.on_prev({
         let w = window.as_weak();
-        let records = records.clone();
-        let index = index.clone();
-        let db = db.clone();
-        let faces = faces.clone();
-        let known_embeddings = known_embeddings.clone();
-        let cid = current_image_id.clone();
-        move || navigate(&w, &records, &index, &db, &faces, &known_embeddings, &cid, -1)
+        let nav = nav.clone();
+        move || navigate(&w, &nav, -1)
     });
     window.on_next({
         let w = window.as_weak();
-        let records = records.clone();
-        let index = index.clone();
-        let db = db.clone();
-        let faces = faces.clone();
-        let known_embeddings = known_embeddings.clone();
-        let cid = current_image_id.clone();
-        move || navigate(&w, &records, &index, &db, &faces, &known_embeddings, &cid, 1)
+        let nav = nav.clone();
+        move || navigate(&w, &nav, 1)
     });
 
     window.on_close_requested({
@@ -208,6 +217,17 @@ fn build(db: Arc<Mutex<maple_db::Database>>) -> Result<Detail, slint::PlatformEr
             }
             if let Some(w) = w.upgrade() {
                 w.set_collection_chips(load_chips(&db, image_id));
+            }
+        }
+    });
+
+    window.on_toggle_all_exif({
+        let w = window.as_weak();
+        let nav = nav.clone();
+        move || {
+            nav.show_all_exif.set(!nav.show_all_exif.get());
+            if let Some(window) = w.upgrade() {
+                refresh_info_rows(&window, &nav);
             }
         }
     });
@@ -404,55 +424,30 @@ fn build(db: Arc<Mutex<maple_db::Database>>) -> Result<Detail, slint::PlatformEr
         }
     });
 
-    Ok(Detail {
-        window,
-        records,
-        index,
-        db,
-        faces,
-        known_embeddings,
-        current_image_id,
-    })
+    Ok(Detail { window, nav })
 }
 
 /// Move `delta` steps through the record list (+1 next, -1 prev).
-fn navigate(
-    w: &slint::Weak<DetailWindow>,
-    records: &Rc<RefCell<Vec<LibraryImage>>>,
-    index: &Rc<Cell<usize>>,
-    db: &Arc<Mutex<maple_db::Database>>,
-    faces: &Rc<RefCell<Vec<FaceDetection>>>,
-    known_embeddings: &Rc<RefCell<EmbeddingMatrix>>,
-    current_image_id: &Rc<Cell<i64>>,
-    delta: i32,
-) {
+fn navigate(w: &slint::Weak<DetailWindow>, nav: &NavState, delta: i32) {
     let Some(window) = w.upgrade() else { return };
     if window.get_loading() {
         return;
     }
-    let len = records.borrow().len();
+    let len = nav.records.borrow().len();
     if len == 0 {
         return;
     }
-    let cur = index.get();
+    let cur = nav.index.get();
     let new = (cur as i64 + delta as i64).clamp(0, len as i64 - 1) as usize;
     if new == cur {
         return;
     }
-    index.set(new);
-    show_record(&window, records, index, db, faces, known_embeddings, current_image_id);
+    nav.index.set(new);
+    show_record(&window, nav);
 }
 
 fn show_current(detail: &Detail) {
-    show_record(
-        &detail.window,
-        &detail.records,
-        &detail.index,
-        &detail.db,
-        &detail.faces,
-        &detail.known_embeddings,
-        &detail.current_image_id,
-    );
+    show_record(&detail.window, &detail.nav);
 }
 
 /// Format a Unix timestamp (seconds) as `YYYY-MM-DD HH:MM UTC`.
@@ -495,10 +490,14 @@ fn truncate_value(s: &str) -> String {
 }
 
 /// Build the flat list of key-value rows for the info popup.
+///
+/// `show_all_exif` controls whether the comprehensive "ALL EXIF METADATA"
+/// section (every captured tag beyond the curated rows above) is expanded.
 fn build_info_rows(
     rec: &LibraryImage,
     db: &Arc<Mutex<maple_db::Database>>,
     face_count: usize,
+    show_all_exif: bool,
 ) -> ModelRc<ImageInfoRow> {
     let mut rows: Vec<ImageInfoRow> = Vec::new();
 
@@ -506,11 +505,13 @@ fn build_info_rows(
         label: label.into(),
         value: SharedString::new(),
         is_section: true,
+        is_toggle: false,
     };
     let row = |label: &str, value: String| ImageInfoRow {
         label: label.into(),
         value: truncate_value(&value).into(),
         is_section: false,
+        is_toggle: false,
     };
 
     // ── File ────────────────────────────────────────────────────────
@@ -601,27 +602,44 @@ fn build_info_rows(
         ));
     }
 
+    // ── All EXIF (comprehensive, collapsible) ─────────────────────────
+    let exif_tags = db
+        .lock()
+        .ok()
+        .and_then(|g| g.exif_tags_for_image(rec.id).ok())
+        .unwrap_or_default();
+    if !exif_tags.is_empty() {
+        rows.push(ImageInfoRow {
+            label: format!(
+                "ALL EXIF METADATA ({}) — {}",
+                exif_tags.len(),
+                if show_all_exif { "HIDE" } else { "SHOW" }
+            )
+            .into(),
+            value: SharedString::new(),
+            is_section: true,
+            is_toggle: true,
+        });
+        if show_all_exif {
+            for (tag, value) in &exif_tags {
+                rows.push(row(tag, value.clone()));
+            }
+        }
+    }
+
     ModelRc::from(Rc::new(VecModel::from(rows)))
 }
 
 /// Update window chrome for the current record and kick off the async decode.
-fn show_record(
-    window: &DetailWindow,
-    records: &Rc<RefCell<Vec<LibraryImage>>>,
-    index: &Rc<Cell<usize>>,
-    db: &Arc<Mutex<maple_db::Database>>,
-    faces: &Rc<RefCell<Vec<FaceDetection>>>,
-    known_embeddings: &Rc<RefCell<EmbeddingMatrix>>,
-    current_image_id: &Rc<Cell<i64>>,
-) {
-    let rec = match records.borrow().get(index.get()) {
+fn show_record(window: &DetailWindow, nav: &NavState) {
+    let rec = match nav.records.borrow().get(nav.index.get()) {
         Some(r) => r.clone(),
         None => return,
     };
+    let db = &nav.db;
 
     let filename = rec.meta.filename.clone().unwrap_or_else(|| "Image".to_owned());
     window.set_filename(filename.into());
-    window.set_info_text(info_text(&rec).into());
     window.set_collection_chips(load_chips(db, rec.id));
     window.set_error_text(SharedString::new());
     window.set_loading(true);
@@ -629,48 +647,34 @@ fn show_record(
     window.invoke_reset_view();
 
     // Load face detections for this image.
-    current_image_id.set(rec.id);
+    nav.current_image_id.set(rec.id);
     let new_faces = db
         .lock()
         .ok()
         .and_then(|g| g.faces_for_image(rec.id).ok())
         .unwrap_or_default();
-    *faces.borrow_mut() = new_faces;
-    *known_embeddings.borrow_mut() = EmbeddingMatrix::build(db);
-    let boxes = build_face_boxes(&faces.borrow(), db, &known_embeddings.borrow());
+    *nav.faces.borrow_mut() = new_faces;
+    *nav.known_embeddings.borrow_mut() = EmbeddingMatrix::build(db);
+    let boxes = build_face_boxes(&nav.faces.borrow(), db, &nav.known_embeddings.borrow());
     window.set_face_boxes(boxes);
 
     // Populate the info popup rows (works whether the panel is open or closed).
-    let face_count = faces.borrow().len();
-    window.set_image_info_rows(build_info_rows(&rec, db, face_count));
+    // The "all EXIF" section collapses again whenever a different image loads.
+    nav.show_all_exif.set(false);
+    let face_count = nav.faces.borrow().len();
+    window.set_image_info_rows(build_info_rows(&rec, db, face_count, false));
 
     image_loader::load_full_image(rec.path.clone(), window.as_weak());
 }
 
-/// Build the one-line EXIF summary (port of `info_bar.rs::fill_info_bar`).
-fn info_text(image: &LibraryImage) -> String {
-    let m = &image.meta;
-    let mut fields: Vec<String> = Vec::new();
-
-    match (&m.make, &m.model) {
-        (Some(make), Some(model)) => fields.push(format!("{make} {model}")),
-        (Some(make), None) => fields.push(make.clone()),
-        _ => {}
-    }
-    if let Some(lens) = &m.lens {
-        fields.push(lens.clone());
-    }
-    if let (Some(fl), Some(ap)) = (m.focal_length, m.aperture) {
-        fields.push(format!("{fl:.0} mm  f/{ap:.1}"));
-    }
-    if let Some(iso) = m.iso {
-        fields.push(format!("ISO {iso}"));
-    }
-    if let (Some(w), Some(h)) = (m.width, m.height) {
-        fields.push(format!("{w} × {h}"));
-    }
-
-    fields.join("  ·  ")
+/// Rebuild just the info-panel rows for the currently shown record, e.g.
+/// after toggling the "all EXIF" section — no image reload needed.
+fn refresh_info_rows(window: &DetailWindow, nav: &NavState) {
+    let Some(rec) = nav.records.borrow().get(nav.index.get()).cloned() else {
+        return;
+    };
+    let face_count = nav.faces.borrow().len();
+    window.set_image_info_rows(build_info_rows(&rec, &nav.db, face_count, nav.show_all_exif.get()));
 }
 
 /// Load the current image's collection memberships as chip data.

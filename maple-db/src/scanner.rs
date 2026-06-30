@@ -158,6 +158,10 @@ impl LibraryScanner {
             found_map.len(),
             inserted,
         );
+
+        if inserted > 0 {
+            crate::metadata::spawn_metadata_filler(self.db.clone());
+        }
     }
 }
 

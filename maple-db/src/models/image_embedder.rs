@@ -62,13 +62,13 @@ impl OnnxImageEmbedder {
 
         // ImageNet preprocessing: scale to [0,1], normalise, HWC→CHW, batch.
         let preprocessor = Preprocessor::new()
-            .add(PreprocessStep::LinearScale {
+            .with_step(PreprocessStep::LinearScale {
                 scale: 1.0 / 255.0,
                 offset: 0.0,
             })
-            .add(PreprocessStep::Normalize { mean, std })
-            .add(PreprocessStep::HwcToChw)
-            .add(PreprocessStep::AddBatchDim);
+            .with_step(PreprocessStep::Normalize { mean, std })
+            .with_step(PreprocessStep::HwcToChw)
+            .with_step(PreprocessStep::AddBatchDim);
 
         Ok(Self {
             session,
@@ -102,7 +102,7 @@ impl OnnxImageEmbedder {
         let (_, raw_data) = outputs[output_name.as_str()]
             .try_extract_tensor::<f32>()
             .context("extracting image embedding tensor")?;
-        let raw: Vec<f32> = raw_data.iter().copied().collect();
+        let raw: Vec<f32> = raw_data.to_vec();
 
         Ok(l2_normalize(raw))
     }

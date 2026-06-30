@@ -588,6 +588,8 @@ fn build(db: Arc<Mutex<maple_db::Database>>) -> Result<Import, slint::PlatformEr
                                         }
                                     }
                                 }
+                                // Backfill EXIF for the records just inserted.
+                                maple_db::spawn_metadata_filler(db2.clone());
                                 selected2.borrow_mut().clear();
                                 w.set_selected_count(0);
                                 w.set_copying(false);

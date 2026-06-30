@@ -12,6 +12,8 @@
 //!   8 → 9 : stacks table + stack_id column on images (burst/similar grouping)
 //!   9 → 10: image_hashes table (algorithm-keyed perceptual/embedding hashes)
 //!   13 → 14: parent_id column on collections (hierarchy)
+//!   14 → 15: image_exif_tags table (comprehensive per-image EXIF tag/value
+//!            pairs) + exif_extracted column (explicit extraction-state gate)
 
 use rusqlite::Connection;
 
@@ -329,6 +331,35 @@ const V13_REP: &str =
     "ALTER TABLE persons ADD COLUMN representative_face_id INTEGER \
      REFERENCES face_detections(id) ON DELETE SET NULL";
 
+// ── V15: comprehensive EXIF tags ──────────────────────────────────
+//
+// `images` only has dedicated columns for a curated subset of EXIF fields
+// (make, model, lens, focal length, aperture, ISO, …). `image_exif_tags`
+// stores every other standard EXIF tag the extractor can read — shutter
+// speed, exposure program, flash, white balance, GPS coordinates, etc. —
+// as human-readable name/value pairs, one row per (image, tag).
+//
+// `exif_extracted` replaces the old `filename IS NULL` gate that
+// `records_needing_metadata` used to find rows the background metadata
+// filler hadn't processed yet. That gate stopped working once
+// `insert_image_with_raw` started setting `filename` immediately at insert
+// time (so filename search works before EXIF is read) — it made the gate
+// permanently false. This column tracks extraction state explicitly and is
+// set by `update_metadata`.
+
+const V15: &str = "
+    CREATE TABLE IF NOT EXISTS image_exif_tags (
+        id       INTEGER PRIMARY KEY,
+        image_id INTEGER NOT NULL REFERENCES images(id) ON DELETE CASCADE,
+        tag      TEXT    NOT NULL,
+        value    TEXT    NOT NULL
+    );
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_exif_tags_image_tag ON image_exif_tags(image_id, tag);
+";
+
+const V15_COLUMN: &str =
+    "ALTER TABLE images ADD COLUMN exif_extracted INTEGER NOT NULL DEFAULT 0";
+
 // ── Migration runner ─────────────────────────────────────────────
 
 /// Apply all pending schema migrations to `conn`.
@@ -453,6 +484,16 @@ pub fn ensure_schema(conn: &Connection) -> anyhow::Result<()> {
             }
         }
         conn.execute_batch("PRAGMA user_version = 14")?;
+    }
+
+    if version < 15 {
+        conn.execute_batch(V15)?;
+        if let Err(e) = conn.execute_batch(V15_COLUMN) {
+            if !e.to_string().to_lowercase().contains("duplicate column") {
+                return Err(e.into());
+            }
+        }
+        conn.execute_batch("PRAGMA user_version = 15")?;
     }
 
     Ok(())
