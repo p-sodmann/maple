@@ -10,6 +10,7 @@ import { ScrollView } from "std-widgets.slint";
 
 // One grid cell. `image` is empty until `loaded` flips true.
 export struct ThumbItem {
+    id: int,
     image: image,
     name: string,
     loaded: bool,

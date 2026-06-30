@@ -27,6 +27,14 @@ import { LineEdit, ScrollView } from "std-widgets.slint";
 
 // ── Exported structs ──────────────────────────────────────────────
 
+// One row in the image-info popup.
+// is-section = true → renders as a section heading; value is ignored.
+export struct ImageInfoRow {
+    label: string,
+    value: string,
+    is-section: bool,
+}
+
 // One collection membership chip.
 export struct CollectionChip {
     id: int,
@@ -79,6 +87,9 @@ export component DetailWindow inherits Window {
     // All collections (loaded when the add-picker opens).
     in property <[CollectionChip]> available-collections;
     in-out property <bool> add-coll-panel-open: false;
+
+    in property <[ImageInfoRow]> image-info-rows;
+    in-out property <bool> image-info-open: false;
 
     in property <[FaceBox]> face-boxes;
     in property <bool> show-faces: false;
@@ -185,7 +196,9 @@ export component DetailWindow inherits Window {
 
         key-pressed(event) => {
             if event.text == Key.Escape {
-                if root.add-coll-panel-open {
+                if root.image-info-open {
+                    root.image-info-open = false;
+                } else if root.add-coll-panel-open {
                     root.add-coll-panel-open = false;
                 } else if root.face-panel-open {
                     root.face-panel-close();
@@ -212,7 +225,7 @@ export component DetailWindow inherits Window {
             width: 100%;
             height: 100%;
 
-            // ── Header ────────────────────────────────────────────
+            // ── Header ───────────────────────────────────────────
             Rectangle {
                 height: 46px;
                 background: Theme.sidebar-bg;
@@ -251,6 +264,10 @@ export component DetailWindow inherits Window {
                         clicked => { root.toggle-face-draw(); }
                     }
                     FlatButton { text: "Open"; clicked => { root.open-external(); } }
+                    FlatButton {
+                        text: root.image-info-open ? "Details ●" : "Details";
+                        clicked => { root.image-info-open = !root.image-info-open; }
+                    }
                     FlatButton {
                         text: root.is-fullscreen ? "Windowed" : "Fullscreen";
                         clicked => { root.toggle-fullscreen(); }
@@ -628,6 +645,10 @@ export component DetailWindow inherits Window {
                 }
             }
 
+            // ── Image info popup (shown inline above chips/panels when open) ──
+            // Handled as an absolute overlay below; placeholder keeps VerticalLayout
+            // unaffected — actual popup is a sibling of this VerticalLayout.
+
             // ── Collection chips bar ──────────────────────────────
             Rectangle {
                 height: 40px;
@@ -645,39 +666,42 @@ export component DetailWindow inherits Window {
                         vertical-alignment: center;
                     }
 
-                    for chip[i] in root.collection-chips: Rectangle {
-                        height: 24px;
-                        border-radius: 12px;
-                        background: Theme.card-bg;
-                        HorizontalLayout {
-                            spacing: 5px;
-                            padding-left: 8px;
-                            padding-right: 6px;
-                            VerticalLayout {
-                                alignment: center;
-                                Rectangle {
-                                    width: 10px;
-                                    height: 10px;
-                                    border-radius: 5px;
-                                    background: chip.color;
+                    for chip[i] in root.collection-chips: VerticalLayout {
+                        alignment: center;
+                        Rectangle {
+                            height: 24px;
+                            border-radius: 12px;
+                            background: Theme.card-bg;
+                            HorizontalLayout {
+                                spacing: 5px;
+                                padding-left: 8px;
+                                padding-right: 6px;
+                                VerticalLayout {
+                                    alignment: center;
+                                    Rectangle {
+                                        width: 10px;
+                                        height: 10px;
+                                        border-radius: 5px;
+                                        background: chip.color;
+                                    }
                                 }
-                            }
-                            Text {
-                                text: chip.name;
-                                color: Theme.fg;
-                                font-size: 12px;
-                                vertical-alignment: center;
-                            }
-                            rmv := TouchArea {
-                                width: 16px;
                                 Text {
-                                    text: "✕";
-                                    font-size: 11px;
-                                    color: rmv.has-hover ? #ff6b6b : Theme.dim-fg;
-                                    horizontal-alignment: center;
+                                    text: chip.name;
+                                    color: Theme.fg;
+                                    font-size: 12px;
                                     vertical-alignment: center;
                                 }
-                                clicked => { root.remove-collection(chip.id); }
+                                rmv := TouchArea {
+                                    width: 16px;
+                                    Text {
+                                        text: "✕";
+                                        font-size: 11px;
+                                        color: rmv.has-hover ? #ff6b6b : Theme.dim-fg;
+                                        horizontal-alignment: center;
+                                        vertical-alignment: center;
+                                    }
+                                    clicked => { root.remove-collection(chip.id); }
+                                }
                             }
                         }
                     }
@@ -702,6 +726,127 @@ export component DetailWindow inherits Window {
                     }
 
                     Rectangle { horizontal-stretch: 1; }
+                }
+            }
+        }
+
+        // ── Image info popup overlay ──────────────────────────────────────
+        // Sibling of VerticalLayout; later in document order → rendered on top.
+        // Semi-transparent backdrop dims the photo; a rounded card holds the rows.
+        if root.image-info-open: Rectangle {
+            x: 0; y: 0;
+            width: 100%;
+            height: 100%;
+            background: #000000.with-alpha(0.55);
+
+            // Clicking the backdrop closes the popup.
+            TouchArea {
+                width: 100%;
+                height: 100%;
+                clicked => { root.image-info-open = false; }
+            }
+
+            // Centred card.
+            info-card := Rectangle {
+                x: (parent.width - self.width) / 2;
+                y: (parent.height - self.height) / 2;
+                width: min(600px, parent.width - 48px);
+                height: min(580px, parent.height - 64px);
+                background: Theme.card-bg;
+                border-radius: Theme.card-radius;
+                drop-shadow-blur: 28px;
+                drop-shadow-color: Theme.dark ? #00000088 : #00000044;
+                clip: true;
+
+                // Absorb pointer events so they don't reach the backdrop.
+                TouchArea { width: 100%; height: 100%; }
+
+                VerticalLayout {
+                    spacing: 0;
+
+                    // ── Card header ─────────────────────────────
+                    Rectangle {
+                        height: 50px;
+                        background: Theme.sidebar-bg;
+                        HorizontalLayout {
+                            padding-left: 18px;
+                            padding-right: 10px;
+                            spacing: 0;
+                            Text {
+                                text: "Image Details";
+                                color: Theme.fg;
+                                font-size: 15px;
+                                font-weight: 600;
+                                vertical-alignment: center;
+                                horizontal-stretch: 1;
+                            }
+                            close-info := TouchArea {
+                                width: 40px;
+                                Text {
+                                    text: "✕";
+                                    color: close-info.has-hover ? Theme.fg : Theme.dim-fg;
+                                    font-size: 16px;
+                                    horizontal-alignment: center;
+                                    vertical-alignment: center;
+                                }
+                                clicked => { root.image-info-open = false; }
+                            }
+                        }
+                    }
+                    // Divider
+                    Rectangle { height: 1px; background: Theme.border; }
+
+                    // ── Scrollable key-value rows ────────────────
+                    ScrollView {
+                        vertical-stretch: 1;
+                        VerticalLayout {
+                            padding-left: 18px;
+                            padding-right: 18px;
+                            padding-top: 6px;
+                            padding-bottom: 16px;
+                            spacing: 0;
+                            for row in root.image-info-rows: Rectangle {
+                                height: row.is-section ? 36px : 26px;
+
+                                // Section heading: accent label + underline at bottom.
+                                if row.is-section: Rectangle {
+                                    y: parent.height - 22px;
+                                    width: 100%;
+                                    height: 22px;
+                                    Text {
+                                        text: row.label;
+                                        color: Theme.accent-text;
+                                        font-size: 10px;
+                                        font-weight: 700;
+                                        vertical-alignment: center;
+                                    }
+                                }
+
+                                // Regular row: dim label on the left, value on the right.
+                                if !row.is-section: HorizontalLayout {
+                                    height: parent.height;
+                                    spacing: 12px;
+                                    alignment: start;
+                                    Text {
+                                        text: row.label;
+                                        color: Theme.dim-fg;
+                                        font-size: 12px;
+                                        width: 116px;
+                                        vertical-alignment: center;
+                                        overflow: elide;
+                                    }
+                                    Text {
+                                        text: row.value;
+                                        color: Theme.fg;
+                                        font-size: 12px;
+                                        vertical-alignment: center;
+                                        horizontal-stretch: 1;
+                                        overflow: elide;
+                                    }
+                                }
+                            }
+                        }
+                    }
                 }
             }
         }

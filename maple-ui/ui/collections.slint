@@ -1,19 +1,23 @@
-// Collections manager window (Slint port of views/library/collection_manager.rs).
+// Collections manager window + inline page component (Slint).
 //
-// A separate top-level Window (thread_local singleton in
-// src/collections_window.rs). Lists all collections, allows creating new ones
-// (name + colour) and deleting existing ones.
+// CollectionsWindow — separate pop-up for the detail-window "add" flow.
+// CollectionsPage   — inline two-pane view embedded in AppWindow.
 
 import { Theme } from "theme.slint";
 import { FlatButton } from "widgets.slint";
 import { LineEdit, ScrollView } from "std-widgets.slint";
+import { ThumbItem } from "library.slint";
 
 export struct CollectionEntry {
     id: int,
     name: string,
     color: color,
     image-count: int,
+    parent-id: int,   // -1 = top-level
+    depth: int,       // indentation level in the tree
 }
+
+// ── Pop-up window (used by the detail window's add-to-collection flow) ──────
 
 export component CollectionsWindow inherits Window {
     title: "Maple — Collections";
@@ -26,16 +30,13 @@ export component CollectionsWindow inherits Window {
 
     in property <[CollectionEntry]> collections;
     in-out property <string> new-name: "";
-    // Selected colour for a new collection; Rust reads this via get_new_color().
     in-out property <color> new-color: #e8590c;
     in-out property <string> status-text: "";
 
     callback close-requested;
-    // Rust receives (name, color) and formats color as "#rrggbb".
     callback create-collection(string, color);
     callback delete-collection(int);
 
-    // Fixed palette for new-collection colour picker.
     property <[color]> palette: [
         #e8590c, #3388ff, #33d770, #ffa500, #ff6b6b,
         #9b59b6, #1abc9c, #f39c12, #e74c3c, #2c3e50,
@@ -56,7 +57,6 @@ export component CollectionsWindow inherits Window {
         }
 
         VerticalLayout {
-            // Header
             Rectangle {
                 height: 46px;
                 background: Theme.sidebar-bg;
@@ -78,7 +78,6 @@ export component CollectionsWindow inherits Window {
                 }
             }
 
-            // Collection list
             ScrollView {
                 vertical-stretch: 1;
 
@@ -157,7 +156,6 @@ export component CollectionsWindow inherits Window {
                 }
             }
 
-            // Create new collection
             Rectangle {
                 height: 100px;
                 background: Theme.sidebar-bg;
@@ -179,7 +177,6 @@ export component CollectionsWindow inherits Window {
                     HorizontalLayout {
                         spacing: 6px;
 
-                        // Colour swatches (fixed palette).
                         for col in root.palette: swatch-ta := TouchArea {
                             width: 22px;
                             height: 22px;
@@ -211,6 +208,755 @@ export component CollectionsWindow inherits Window {
                         color: Theme.accent;
                         font-size: 12px;
                         height: 18px;
+                    }
+                }
+            }
+        }
+    }
+}
+
+// ── Inline page (embedded in AppWindow) ──────────────────────────────────────
+
+export component CollectionsPage inherits Rectangle {
+    background: Theme.bg;
+
+    // ── Data pushed from Rust ──────────────────────────────────────
+    in property <[CollectionEntry]> collections;
+    in property <string>  sel-name;
+    in property <color>   sel-color: #B5543E;
+    in property <int>     sel-count;
+    in property <[ThumbItem]> thumbs;
+
+    // ── Local UI state ─────────────────────────────────────────────
+    in-out property <int>    selected-id:          -1;
+    in-out property <bool>   creating:             false;
+    in-out property <string> new-name:             "";
+    in-out property <color>  new-color:            #B5543E;
+    in-out property <bool>   renaming:             false;
+    in-out property <string> rename-val:           "";
+    in-out property <int>    creating-parent-id:   -1;
+    in-out property <string> creating-parent-name: "";
+
+    in property <string> sel-parent-name: "";
+
+    // ── Callbacks → Rust ───────────────────────────────────────────
+    callback create-collection(string, color, int);  // name, color, parent-id (-1 = top-level)
+    callback delete-collection(int);
+    callback rename-collection(int, string);
+    callback collection-selected(int);
+    callback open-image(int);  // fires with DB image id when a thumbnail is clicked
+
+    // Thumbnail grid constants (root-level so for loop can reference them).
+    property <float>  tcols: 4;
+    property <length> tcell: 100px;
+    property <length> tgap:  12px;
+    property <float>  trows: Math.ceil(root.thumbs.length / root.tcols);
+
+    // Six-colour brand palette.
+    property <[color]> palette: [
+        #B5543E, #6E8B6F, #C29A3E, #5B7C99, #8A6BA8, #A05C5C,
+    ];
+
+    HorizontalLayout {
+        spacing: 0;
+
+        // ══ LEFT PANE (392 px) ════════════════════════════════════
+
+        Rectangle {
+            width: 392px;
+            background: Theme.bg;
+
+            // Right separator
+            Rectangle {
+                x: parent.width - 1px;
+                y: 0;
+                width: 1px;
+                height: parent.height;
+                background: Theme.border;
+            }
+
+            VerticalLayout {
+                spacing: 0;
+
+                // ── Header row ─────────────────────────────────────
+                Rectangle {
+                    height: 72px;
+                    HorizontalLayout {
+                        padding-left: 18px;
+                        padding-right: 18px;
+                        padding-top: 22px;
+                        padding-bottom: 12px;
+                        spacing: 12px;
+
+                        VerticalLayout {
+                            spacing: 4px;
+                            alignment: center;
+                            horizontal-stretch: 1;
+                            Text {
+                                text: "Collections";
+                                color: Theme.ink;
+                                font-size: 22px;
+                                font-weight: 700;
+                                letter-spacing: -0.2px;
+                            }
+                            Text {
+                                text: root.collections.length == 1
+                                    ? "1 collection"
+                                    : root.collections.length + " collections";
+                                color: Theme.ink-3;
+                                font-size: 12px;
+                                font-weight: 500;
+                            }
+                        }
+
+                        // "New" button
+                        Rectangle {
+                            width: 72px;
+                            height: 34px;
+                            y: (parent.height - self.height) / 2;
+                            border-radius: Theme.radius-btn;
+                            background: new-ta.has-hover
+                                ? Theme.accent.brighter(0.08)
+                                : Theme.accent;
+                            animate background { duration: 100ms; }
+                            HorizontalLayout {
+                                padding-left: 10px;
+                                padding-right: 12px;
+                                spacing: 6px;
+                                alignment: center;
+                                // Plus icon — wrapped in VerticalLayout to
+                                // prevent HorizontalLayout from stretching it.
+                                VerticalLayout {
+                                    alignment: center;
+                                    Rectangle {
+                                        width: 14px; height: 14px;
+                                        Rectangle {
+                                            x: 6px; y: 0;
+                                            width: 2px; height: 14px;
+                                            border-radius: 1px;
+                                            background: #FFFFFF;
+                                        }
+                                        Rectangle {
+                                            x: 0; y: 6px;
+                                            width: 14px; height: 2px;
+                                            border-radius: 1px;
+                                            background: #FFFFFF;
+                                        }
+                                    }
+                                }
+                                Text {
+                                    text: "New";
+                                    color: #FFFFFF;
+                                    font-size: 13px;
+                                    font-weight: 600;
+                                    vertical-alignment: center;
+                                }
+                            }
+                            new-ta := TouchArea {
+                                clicked => {
+                                    root.creating = true;
+                                    root.renaming = false;
+                                    root.new-name = "";
+                                    root.new-color = #B5543E;
+                                    root.creating-parent-id = -1;
+                                    root.creating-parent-name = "";
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // ── Collection list ────────────────────────────────
+                list-sv := ScrollView {
+                    vertical-stretch: 1;
+                    viewport-width: list-sv.visible-width;
+
+                    VerticalLayout {
+                        padding-left: 10px;
+                        padding-right: 10px;
+                        padding-top: 4px;
+                        padding-bottom: 18px;
+                        spacing: 2px;
+
+                        for coll in root.collections: row-ta := TouchArea {
+                            height: 40px;
+                            Rectangle {
+                                border-radius: Theme.radius-btn;
+                                background: root.selected-id == coll.id
+                                    ? Theme.accent-tint
+                                    : (row-ta.has-hover
+                                        ? Theme.border.with-alpha(0.4)
+                                        : transparent);
+                                animate background { duration: 80ms; }
+                                HorizontalLayout {
+                                    padding-left: 10px + coll.depth * 16px;
+                                    padding-right: 6px;
+                                    spacing: 8px;
+                                    VerticalLayout {
+                                        alignment: center;
+                                        Rectangle {
+                                            width: 9px; height: 9px;
+                                            border-radius: 4.5px;
+                                            background: coll.color;
+                                        }
+                                    }
+                                    Text {
+                                        text: coll.name;
+                                        color: root.selected-id == coll.id
+                                            ? Theme.accent-text
+                                            : Theme.ink;
+                                        font-size: 13.5px;
+                                        font-weight: root.selected-id == coll.id ? 600 : 500;
+                                        vertical-alignment: center;
+                                        horizontal-stretch: 1;
+                                        overflow: elide;
+                                    }
+
+                                    // Sub-collection button — always reserves space, fades in on hover
+                                    VerticalLayout {
+                                        alignment: center;
+                                        sub-ta := TouchArea {
+                                            width: 24px; height: 24px;
+                                            enabled: row-ta.has-hover;
+                                            opacity: row-ta.has-hover ? 1.0 : 0.0;
+                                            animate opacity { duration: 80ms; }
+                                            Rectangle {
+                                                border-radius: 4px;
+                                                background: sub-ta.has-hover
+                                                    ? Theme.border.with-alpha(0.7)
+                                                    : transparent;
+                                                // Small + icon
+                                                Rectangle {
+                                                    x: 11px; y: 6px;
+                                                    width: 2px; height: 12px;
+                                                    border-radius: 1px;
+                                                    background: Theme.ink-3;
+                                                }
+                                                Rectangle {
+                                                    x: 6px; y: 11px;
+                                                    width: 12px; height: 2px;
+                                                    border-radius: 1px;
+                                                    background: Theme.ink-3;
+                                                }
+                                            }
+                                            clicked => {
+                                                root.creating-parent-id   = coll.id;
+                                                root.creating-parent-name = coll.name;
+                                                root.creating  = true;
+                                                root.new-name  = "";
+                                                root.new-color = #B5543E;
+                                            }
+                                        }
+                                    }
+
+                                    Text {
+                                        text: coll.image-count + "";
+                                        color: Theme.ink-3;
+                                        font-size: 11px;
+                                        font-weight: 500;
+                                        vertical-alignment: center;
+                                    }
+                                }
+                            }
+                            clicked => {
+                                root.selected-id = coll.id;
+                                root.renaming = false;
+                                root.collection-selected(coll.id);
+                            }
+                        }
+
+                        if root.collections.length == 0: Rectangle {
+                            height: 60px;
+                            Text {
+                                text: "No collections yet";
+                                color: Theme.ink-3;
+                                font-size: 14px;
+                                horizontal-alignment: center;
+                                vertical-alignment: center;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // ══ RIGHT DETAIL PANE ═════════════════════════════════════
+
+        Rectangle {
+            horizontal-stretch: 1;
+            background: Theme.bg;
+
+            // ── Detail content (when a collection is selected) ─────
+            if root.selected-id >= 0 && root.sel-name != "": Rectangle {
+                width: 100%;
+                height: 100%;
+
+                detail-sv := ScrollView {
+                    width: 100%;
+                    height: 100%;
+                    viewport-width: detail-sv.visible-width;
+
+                    VerticalLayout {
+                        padding-left: 30px;
+                        padding-right: 30px;
+                        padding-top: 26px;
+                        padding-bottom: 36px;
+                        spacing: 0;
+
+                        // Breadcrumb
+                        Text {
+                            text: root.sel-parent-name != "" ? root.sel-parent-name : "Top level";
+                            color: Theme.ink-3;
+                            font-size: 12px;
+                            font-weight: 500;
+                            height: 20px;
+                            overflow: elide;
+                        }
+
+                        // Dot + name row
+                        HorizontalLayout {
+                            spacing: 12px;
+                            padding-top: 10px;
+                            padding-bottom: 6px;
+                            alignment: start;
+
+                            VerticalLayout {
+                                alignment: center;
+                                Rectangle {
+                                    width: 14px; height: 14px;
+                                    border-radius: 7px;
+                                    background: root.sel-color;
+                                }
+                            }
+
+                            // Rename input (shown when editing)
+                            if root.renaming: LineEdit {
+                                text <=> root.rename-val;
+                                horizontal-stretch: 1;
+                                accepted(t) => {
+                                    if t != "" {
+                                        root.rename-collection(root.selected-id, t);
+                                    }
+                                    root.renaming = false;
+                                }
+                            }
+
+                            // Name text (click to edit)
+                            if !root.renaming: Rectangle {
+                                horizontal-stretch: 1;
+                                height: 40px;
+                                Text {
+                                    text: root.sel-name;
+                                    color: Theme.ink;
+                                    font-size: 26px;
+                                    font-weight: 700;
+                                    letter-spacing: -0.2px;
+                                    vertical-alignment: center;
+                                    overflow: elide;
+                                    width: 100%;
+                                }
+                                rename-ta := TouchArea {
+                                    clicked => {
+                                        root.rename-val = root.sel-name;
+                                        root.renaming = true;
+                                    }
+                                }
+                            }
+                        }
+
+                        // Count
+                        Text {
+                            text: root.sel-count + " photos";
+                            color: Theme.ink-3;
+                            font-size: 13px;
+                            font-weight: 500;
+                            height: 22px;
+                        }
+
+                        // ── Actions ────────────────────────────────
+                        HorizontalLayout {
+                            spacing: 10px;
+                            padding-top: 18px;
+                            padding-bottom: 28px;
+                            alignment: start;
+
+                            // Delete button
+                            Rectangle {
+                                height: 36px;
+                                border-radius: Theme.radius-btn;
+                                border-width: 1px;
+                                border-color: Theme.border;
+                                background: del-btn-ta.has-hover
+                                    ? Theme.border.with-alpha(0.5)
+                                    : transparent;
+                                HorizontalLayout {
+                                    padding-left: 14px; padding-right: 14px;
+                                    spacing: 7px;
+                                    alignment: center;
+                                    // Trash icon — wrapped to prevent HorizontalLayout stretching it
+                                    VerticalLayout {
+                                        alignment: center;
+                                        Rectangle {
+                                            width: 14px; height: 14px;
+                                            // Bin body
+                                            Rectangle {
+                                                x: 2px; y: 3px;
+                                                width: 10px; height: 8px;
+                                                border-width: 1.5px;
+                                                border-color: Theme.ink-2;
+                                                background: transparent;
+                                            }
+                                            // Lid
+                                            Rectangle {
+                                                x: 0; y: 2px;
+                                                width: 14px; height: 1.5px;
+                                                background: Theme.ink-2;
+                                            }
+                                            // Handle
+                                            Rectangle {
+                                                x: 4px; y: 0;
+                                                width: 6px; height: 2.5px;
+                                                border-radius: 1px;
+                                                background: Theme.ink-2;
+                                            }
+                                        }
+                                    }
+                                    Text {
+                                        text: "Delete";
+                                        color: Theme.ink-2;
+                                        font-size: 13px;
+                                        font-weight: 600;
+                                        vertical-alignment: center;
+                                    }
+                                }
+                                del-btn-ta := TouchArea {
+                                    clicked => { root.delete-collection(root.selected-id); }
+                                }
+                            }
+                        }
+
+                        // ── Thumbnail grid ─────────────────────────
+                        if root.thumbs.length > 0: VerticalLayout {
+                            spacing: 12px;
+
+                            Text {
+                                text: "PHOTOS";
+                                color: Theme.ink-3;
+                                font-size: 11px;
+                                font-weight: 600;
+                                letter-spacing: 0.7px;
+                                height: 20px;
+                            }
+
+                            // Absolute-positioned 4-column grid.
+                            Rectangle {
+                                height: root.trows * (root.tcell + root.tgap);
+
+                                for item[idx] in root.thumbs: t-rect := Rectangle {
+                                    property <float> gc: Math.mod(idx, root.tcols);
+                                    property <float> gr: Math.floor(idx / root.tcols);
+                                    x: gc * (root.tcell + root.tgap);
+                                    y: gr * (root.tcell + root.tgap);
+                                    width: root.tcell;
+                                    height: root.tcell;
+                                    border-radius: Theme.radius-thumb;
+                                    clip: true;
+                                    background: Theme.placeholder-bg;
+
+                                    if item.loaded: Image {
+                                        source: item.image;
+                                        width: 100%;
+                                        height: 100%;
+                                        image-fit: cover;
+                                    }
+
+                                    if !item.loaded: Text {
+                                        text: "…";
+                                        color: Theme.dim-fg;
+                                        font-size: 16px;
+                                        horizontal-alignment: center;
+                                        vertical-alignment: center;
+                                    }
+
+                                    t-ta := TouchArea {
+                                        clicked => { root.open-image(item.id); }
+                                    }
+
+                                    // Hover highlight
+                                    if t-ta.has-hover: Rectangle {
+                                        border-radius: Theme.radius-thumb;
+                                        border-width: 2px;
+                                        border-color: #FFFFFF.with-alpha(0.6);
+                                        background: transparent;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            // ── Empty / no-selection state ─────────────────────────
+            if root.selected-id < 0 || root.sel-name == "": Rectangle {
+                width: 100%;
+                height: 100%;
+                VerticalLayout {
+                    alignment: center;
+                    spacing: 8px;
+                    padding: 40px;
+
+                    HorizontalLayout {
+                        alignment: center;
+                        Rectangle {
+                            width: 58px; height: 58px;
+                            border-radius: 15px;
+                            background: Theme.field;
+                            // Stacked-pages icon
+                            Rectangle {
+                                x: 16px; y: 11px;
+                                width: 26px; height: 18px;
+                                border-radius: 2.5px;
+                                border-width: 1.5px;
+                                border-color: Theme.ink-3;
+                                background: transparent;
+                            }
+                            Rectangle {
+                                x: 10px; y: 27px;
+                                width: 26px; height: 18px;
+                                border-radius: 2.5px;
+                                background: Theme.ink-3.with-alpha(0.35);
+                            }
+                        }
+                    }
+
+                    Text {
+                        text: root.collections.length == 0
+                            ? "No collections yet"
+                            : "Select a collection";
+                        color: Theme.ink;
+                        font-size: 15px;
+                        font-weight: 600;
+                        horizontal-alignment: center;
+                    }
+                    Text {
+                        text: root.collections.length == 0
+                            ? "Create one to start organising your photos."
+                            : "Choose a collection from the list.";
+                        color: Theme.ink-3;
+                        font-size: 13px;
+                        font-weight: 500;
+                        horizontal-alignment: center;
+                        wrap: word-wrap;
+                    }
+                }
+            }
+        }
+    }
+
+    // ── New-collection modal ──────────────────────────────────────
+    // Sibling of the main HorizontalLayout — rendered on top.
+    // Backdrop click cancels; card absorbs clicks so they don't fall through.
+    if root.creating: Rectangle {
+        x: 0; y: 0;
+        width: 100%; height: 100%;
+        background: #000000.with-alpha(0.45);
+
+        backdrop-ta := TouchArea {
+            width: 100%; height: 100%;
+            clicked => {
+                root.creating = false;
+                root.new-name = "";
+                root.creating-parent-id = -1;
+                root.creating-parent-name = "";
+            }
+        }
+
+        modal-card := Rectangle {
+            x: (parent.width  - self.width)  / 2;
+            y: (parent.height - self.height) / 2;
+            width: 360px;
+            height: root.creating-parent-id >= 0 ? 258px : 214px;
+            animate height { duration: 120ms; easing: ease-out; }
+            background: Theme.surface;
+            border-radius: Theme.radius-card;
+            border-width: 1px;
+            border-color: Theme.border;
+            drop-shadow-blur: 32px;
+            drop-shadow-offset-y: 8px;
+            drop-shadow-color: Theme.dark ? #00000070 : #00000028;
+            clip: true;
+
+            // Absorb pointer events — prevents backdrop-ta from firing.
+            TouchArea { width: 100%; height: 100%; }
+
+            VerticalLayout {
+                padding-left: 20px;
+                padding-right: 20px;
+                padding-top: 20px;
+                padding-bottom: 20px;
+                spacing: 14px;
+
+                // Header
+                HorizontalLayout {
+                    spacing: 0;
+                    Text {
+                        text: "New Collection";
+                        color: Theme.ink;
+                        font-size: 15px;
+                        font-weight: 700;
+                        vertical-alignment: center;
+                        horizontal-stretch: 1;
+                    }
+                    modal-close-ta := TouchArea {
+                        width: 28px; height: 28px;
+                        Text {
+                            text: "✕";
+                            color: modal-close-ta.has-hover ? Theme.ink : Theme.ink-3;
+                            font-size: 14px;
+                            horizontal-alignment: center;
+                            vertical-alignment: center;
+                        }
+                        clicked => {
+                            root.creating = false;
+                            root.new-name = "";
+                            root.creating-parent-id = -1;
+                            root.creating-parent-name = "";
+                        }
+                    }
+                }
+
+                // Parent badge (shown when creating a sub-collection)
+                if root.creating-parent-id >= 0: HorizontalLayout {
+                    spacing: 0;
+                    alignment: start;
+                    Rectangle {
+                        border-radius: 6px;
+                        background: Theme.field;
+                        border-width: 1px;
+                        border-color: Theme.border;
+                        height: 28px;
+                        HorizontalLayout {
+                            padding-left: 8px;
+                            padding-right: 4px;
+                            spacing: 4px;
+                            alignment: center;
+                            Text {
+                                text: "↳ " + root.creating-parent-name;
+                                color: Theme.ink-2;
+                                font-size: 12px;
+                                font-weight: 500;
+                                vertical-alignment: center;
+                                overflow: elide;
+                            }
+                            parent-clear-ta := TouchArea {
+                                width: 20px; height: 20px;
+                                Text {
+                                    text: "✕";
+                                    color: parent-clear-ta.has-hover ? Theme.ink : Theme.ink-3;
+                                    font-size: 11px;
+                                    horizontal-alignment: center;
+                                    vertical-alignment: center;
+                                }
+                                clicked => {
+                                    root.creating-parent-id = -1;
+                                    root.creating-parent-name = "";
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // Name field
+                LineEdit {
+                    placeholder-text: "Collection name";
+                    text <=> root.new-name;
+                    accepted(t) => {
+                        if t != "" {
+                            root.create-collection(t, root.new-color, root.creating-parent-id);
+                            root.creating = false;
+                            root.new-name = "";
+                            root.creating-parent-id = -1;
+                            root.creating-parent-name = "";
+                        }
+                    }
+                }
+
+                // Colour swatches
+                HorizontalLayout {
+                    spacing: 8px;
+                    for col in root.palette: modal-swatch-ta := TouchArea {
+                        width: 26px; height: 26px;
+                        Rectangle {
+                            border-radius: 7px;
+                            background: col;
+                            border-width: 2px;
+                            border-color: col == root.new-color
+                                ? #FFFFFF.with-alpha(0.85)
+                                : transparent;
+                        }
+                        clicked => { root.new-color = col; }
+                    }
+                }
+
+                // Cancel / Create
+                HorizontalLayout {
+                    spacing: 8px;
+                    alignment: end;
+
+                    Rectangle {
+                        height: 34px;
+                        border-radius: Theme.radius-btn;
+                        border-width: 1px;
+                        border-color: Theme.border;
+                        background: modal-cancel-ta.has-hover
+                            ? Theme.border.with-alpha(0.5)
+                            : transparent;
+                        HorizontalLayout {
+                            padding-left: 16px; padding-right: 16px;
+                            alignment: center;
+                            Text {
+                                text: "Cancel";
+                                color: Theme.ink-2;
+                                font-size: 13px; font-weight: 600;
+                                vertical-alignment: center;
+                            }
+                        }
+                        modal-cancel-ta := TouchArea {
+                            clicked => {
+                                root.creating = false;
+                                root.new-name = "";
+                                root.creating-parent-id = -1;
+                                root.creating-parent-name = "";
+                            }
+                        }
+                    }
+
+                    Rectangle {
+                        height: 34px;
+                        border-radius: Theme.radius-btn;
+                        background: root.new-name != "" ? Theme.accent : Theme.field;
+                        border-width: root.new-name != "" ? 0 : 1px;
+                        border-color: Theme.border;
+                        HorizontalLayout {
+                            padding-left: 18px; padding-right: 18px;
+                            alignment: center;
+                            Text {
+                                text: "Create";
+                                color: root.new-name != "" ? #FFFFFF : Theme.ink-3;
+                                font-size: 13px; font-weight: 600;
+                                vertical-alignment: center;
+                            }
+                        }
+                        modal-create-ta := TouchArea {
+                            enabled: root.new-name != "";
+                            clicked => {
+                                root.create-collection(root.new-name, root.new-color, root.creating-parent-id);
+                                root.creating = false;
+                                root.new-name = "";
+                                root.creating-parent-id = -1;
+                                root.creating-parent-name = "";
+                            }
+                        }
                     }
                 }
             }

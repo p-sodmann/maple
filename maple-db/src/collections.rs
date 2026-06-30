@@ -20,6 +20,8 @@ pub struct Collection {
     pub created_at: i64,
     /// Number of images in this collection (populated by list queries).
     pub image_count: u64,
+    /// Optional parent collection id (`None` = top-level).
+    pub parent_id: Option<i64>,
 }
 
 // ── Database methods ────────────────────────────────────────────
@@ -28,11 +30,11 @@ impl Database {
     // ── Write ────────────────────────────────────────────────────
 
     /// Create a new collection.  Returns the new row id.
-    pub fn create_collection(&self, name: &str, color: &str) -> anyhow::Result<i64> {
+    pub fn create_collection(&self, name: &str, color: &str, parent_id: Option<i64>) -> anyhow::Result<i64> {
         let now = now_secs();
         self.conn.execute(
-            "INSERT INTO collections (name, color, created_at) VALUES (?1, ?2, ?3)",
-            params![name, color, now],
+            "INSERT INTO collections (name, color, created_at, parent_id) VALUES (?1, ?2, ?3, ?4)",
+            params![name, color, now, parent_id],
         )?;
         Ok(self.conn.last_insert_rowid())
     }
@@ -98,7 +100,8 @@ impl Database {
         let mut stmt = self.conn.prepare(
             "SELECT c.id, c.name, c.color, c.created_at,
                     (SELECT COUNT(*) FROM collection_images ci
-                     WHERE ci.collection_id = c.id) AS cnt
+                     WHERE ci.collection_id = c.id) AS cnt,
+                    c.parent_id
              FROM collections c
              ORDER BY c.name",
         )?;
@@ -110,6 +113,7 @@ impl Database {
                     color: row.get(2)?,
                     created_at: row.get(3)?,
                     image_count: row.get::<_, i64>(4)? as u64,
+                    parent_id: row.get(5)?,
                 })
             })?
             .filter_map(|r| r.ok())
@@ -122,7 +126,8 @@ impl Database {
         let mut stmt = self.conn.prepare(
             "SELECT c.id, c.name, c.color, c.created_at,
                     (SELECT COUNT(*) FROM collection_images ci
-                     WHERE ci.collection_id = c.id) AS cnt
+                     WHERE ci.collection_id = c.id) AS cnt,
+                    c.parent_id
              FROM collections c
              WHERE c.id = ?1",
         )?;
@@ -133,6 +138,7 @@ impl Database {
                 color: row.get(2)?,
                 created_at: row.get(3)?,
                 image_count: row.get::<_, i64>(4)? as u64,
+                parent_id: row.get(5)?,
             })
         })?;
         Ok(rows.next().transpose()?)
@@ -143,7 +149,8 @@ impl Database {
         let mut stmt = self.conn.prepare(
             "SELECT c.id, c.name, c.color, c.created_at,
                     (SELECT COUNT(*) FROM collection_images ci2
-                     WHERE ci2.collection_id = c.id) AS cnt
+                     WHERE ci2.collection_id = c.id) AS cnt,
+                    c.parent_id
              FROM collections c
              INNER JOIN collection_images ci ON ci.collection_id = c.id
              WHERE ci.image_id = ?1
@@ -157,6 +164,7 @@ impl Database {
                     color: row.get(2)?,
                     created_at: row.get(3)?,
                     image_count: row.get::<_, i64>(4)? as u64,
+                    parent_id: row.get(5)?,
                 })
             })?
             .filter_map(|r| r.ok())
@@ -201,7 +209,7 @@ mod tests {
     #[test]
     fn create_and_list() {
         let (_dir, db) = tmp_db();
-        let id = db.create_collection("Favourites", "#e01b24").unwrap();
+        let id = db.create_collection("Favourites", "#e01b24", None).unwrap();
         let all = db.all_collections().unwrap();
         assert_eq!(all.len(), 1);
         assert_eq!(all[0].id, id);
@@ -213,7 +221,7 @@ mod tests {
     #[test]
     fn rename_and_recolor() {
         let (_dir, db) = tmp_db();
-        let id = db.create_collection("Old", "#000000").unwrap();
+        let id = db.create_collection("Old", "#000000", None).unwrap();
         db.rename_collection(id, "New").unwrap();
         db.set_collection_color(id, "#ffffff").unwrap();
         let c = db.collection_by_id(id).unwrap().unwrap();
@@ -224,7 +232,7 @@ mod tests {
     #[test]
     fn add_remove_image() {
         let (_dir, db) = tmp_db();
-        let cid = db.create_collection("Test", "#3584e4").unwrap();
+        let cid = db.create_collection("Test", "#3584e4", None).unwrap();
         let img = insert_image(&db, "a.jpg");
 
         db.add_image_to_collection(cid, img).unwrap();
@@ -241,7 +249,7 @@ mod tests {
     #[test]
     fn image_count_updates() {
         let (_dir, db) = tmp_db();
-        let cid = db.create_collection("Count", "#3584e4").unwrap();
+        let cid = db.create_collection("Count", "#3584e4", None).unwrap();
         let img1 = insert_image(&db, "x.jpg");
         let img2 = insert_image(&db, "y.jpg");
 
@@ -254,7 +262,7 @@ mod tests {
     #[test]
     fn delete_collection_cascades() {
         let (_dir, db) = tmp_db();
-        let cid = db.create_collection("Gone", "#3584e4").unwrap();
+        let cid = db.create_collection("Gone", "#3584e4", None).unwrap();
         let img = insert_image(&db, "z.jpg");
         db.add_image_to_collection(cid, img).unwrap();
         db.delete_collection(cid).unwrap();

@@ -15,6 +15,7 @@ use maple_db::SearchQuery;
 
 slint::include_modules!();
 
+mod collections_page;
 mod collections_window;
 mod detail;
 mod face_overlay;
@@ -78,6 +79,111 @@ pub fn run() -> anyhow::Result<()> {
 
     // Library is the default page — load immediately.
     grid.load(SearchQuery::default());
+
+    // ── Collections page ───────────────────────────────────────────
+    // Capture thumb settings for background thumbnail loads.
+    let coll_thumb_px = settings.thumbnails.size;
+    let coll_thumb_quality = settings.thumbnails.quality;
+
+    // Shared record list — populated by load_thumbs, read by on_collections_open_image.
+    let coll_records: Arc<Mutex<Vec<maple_db::LibraryImage>>> =
+        Arc::new(Mutex::new(Vec::new()));
+
+    // Populate sidebar immediately (so dots show even before navigating).
+    collections_page::reload(&window, &db);
+
+    window.on_collections_page_shown({
+        let db = db.clone();
+        let w = window.as_weak();
+        move || {
+            if let Some(win) = w.upgrade() {
+                collections_page::reload(&win, &db);
+            }
+        }
+    });
+
+    window.on_collections_select({
+        let db = db.clone();
+        let cache = cache.clone();
+        let coll_records = coll_records.clone();
+        let w = window.as_weak();
+        move |id| {
+            if let Some(win) = w.upgrade() {
+                // Clear old thumbs immediately; push fresh detail.
+                win.set_collections_thumbs(slint::ModelRc::default());
+                collections_page::push_detail(&win, &db, id);
+            }
+            collections_page::load_thumbs(
+                id,
+                db.clone(),
+                cache.clone(),
+                coll_thumb_px,
+                coll_thumb_quality,
+                w.clone(),
+                coll_records.clone(),
+            );
+        }
+    });
+
+    window.on_collections_open_image({
+        let coll_records = coll_records.clone();
+        let db = db.clone();
+        let w = window.as_weak();
+        move |image_id| {
+            let records = coll_records.lock().ok().map(|g| g.clone()).unwrap_or_default();
+            // Find the index of the clicked image within the loaded records.
+            let idx = records.iter().position(|r| r.id == image_id as i64).unwrap_or(0);
+            if !records.is_empty() {
+                let is_dark = w.upgrade().map(|w| w.get_dark()).unwrap_or(false);
+                detail::open(records, idx, db.clone(), is_dark);
+            }
+        }
+    });
+
+    window.on_collections_create({
+        let db = db.clone();
+        let w = window.as_weak();
+        move |name, color, parent_id| {
+            let name = name.trim().to_string();
+            if name.is_empty() { return; }
+            let hex = format!(
+                "#{:02x}{:02x}{:02x}",
+                color.red(),
+                color.green(),
+                color.blue(),
+            );
+            let pid = if parent_id >= 0 { Some(parent_id as i64) } else { None };
+            let _ = db.lock().ok().and_then(|g| g.create_collection(&name, &hex, pid).ok());
+            if let Some(win) = w.upgrade() {
+                collections_page::reload(&win, &db);
+            }
+        }
+    });
+
+    window.on_collections_delete({
+        let db = db.clone();
+        let w = window.as_weak();
+        move |id| {
+            let _ = db.lock().ok().and_then(|g| g.delete_collection(id as i64).ok());
+            if let Some(win) = w.upgrade() {
+                collections_page::reload(&win, &db);
+                collections_page::clear_detail(&win);
+            }
+        }
+    });
+
+    window.on_collections_rename({
+        let db = db.clone();
+        let w = window.as_weak();
+        move |id, name| {
+            let name = name.trim().to_string();
+            if name.is_empty() { return; }
+            let _ = db.lock().ok().and_then(|g| g.rename_collection(id as i64, &name).ok());
+            if let Some(win) = w.upgrade() {
+                collections_page::reload_keep_sel(&win, &db);
+            }
+        }
+    });
 
     // ── People page ────────────────────────────────────────────────
     let people = people_page::PeoplePage::new(db.clone());
@@ -347,10 +453,6 @@ pub fn run() -> anyhow::Result<()> {
             let is_dark = w.upgrade().map(|w| w.get_dark()).unwrap_or(false);
             settings_window::open(db.clone(), is_dark);
         }
-    });
-    window.on_collections_clicked({
-        let db = db.clone();
-        move || collections_window::open(db.clone())
     });
     window.on_tag_faces_clicked({
         let db = db.clone();

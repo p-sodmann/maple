@@ -9,7 +9,7 @@ import { ImportPage, ImportLocation } from "import.slint";
 import { DetailWindow, CollectionChip, FaceBox, FacePersonSuggestion } from "detail.slint";
 import { ImportWindow, ImportItem } from "import.slint";
 import { SettingsWindow } from "settings.slint";
-import { CollectionsWindow, CollectionEntry } from "collections.slint";
+import { CollectionsWindow, CollectionEntry, CollectionsPage } from "collections.slint";
 import { FaceTagWindow } from "face_tag.slint";
 import { PeoplePage, PersonItem } from "people.slint";
 
@@ -139,11 +139,19 @@ component CollectionsIcon inherits Rectangle {
 // ── Collection dot ─────────────────────────────────────────────────
 
 component CollectionDot inherits Rectangle {
-    in property <color> dot-color;
+    in property <color>  dot-color;
     in property <string> label;
     in property <string> count;
+    in property <bool>   active: false;
+    callback clicked;
 
     height: 32px;
+    border-radius: 8px;
+    background: root.active
+        ? Theme.accent-tint
+        : (dot-ta.has-hover ? Theme.border.with-alpha(0.4) : transparent);
+    animate background { duration: 80ms; }
+
     HorizontalLayout {
         padding-left: 11px;
         padding-right: 11px;
@@ -157,9 +165,9 @@ component CollectionDot inherits Rectangle {
         }
         Text {
             text: root.label;
-            color: Theme.ink-2;
+            color: root.active ? Theme.accent-text : Theme.ink-2;
             font-size: 13.5px;
-            font-weight: 500;
+            font-weight: root.active ? 600 : 500;
             vertical-alignment: center;
             horizontal-stretch: 1;
         }
@@ -171,6 +179,8 @@ component CollectionDot inherits Rectangle {
             vertical-alignment: center;
         }
     }
+
+    dot-ta := TouchArea { clicked => { root.clicked(); } }
 }
 
 // ── Top-bar toggle switch ──────────────────────────────────────────
@@ -228,52 +238,6 @@ component TopBarToggle inherits Rectangle {
     TouchArea { clicked => { root.toggled(); } }
 }
 
-// ── Stub view (People / Collections placeholder) ───────────────────
-
-component StubPage inherits Rectangle {
-    in property <string> title;
-    in property <string> body;
-    background: Theme.bg;
-
-    VerticalLayout {
-        alignment: center;
-        spacing: 14px;
-        padding: 40px;
-
-        HorizontalLayout {
-            alignment: center;
-            Rectangle {
-                width: 56px; height: 56px;
-                border-radius: 14px;
-                background: Theme.field;
-                Text {
-                    text: "…";
-                    color: Theme.ink-3;
-                    font-size: 22px;
-                    horizontal-alignment: center;
-                    vertical-alignment: center;
-                }
-            }
-        }
-
-        Text {
-            text: root.title;
-            color: Theme.ink;
-            font-size: 22px;
-            font-weight: 700;
-            horizontal-alignment: center;
-        }
-        Text {
-            text: root.body;
-            color: Theme.ink-3;
-            font-size: 14px;
-            font-weight: 500;
-            horizontal-alignment: center;
-            wrap: word-wrap;
-        }
-    }
-}
-
 // ── Main window ────────────────────────────────────────────────────
 
 export component AppWindow inherits Window {
@@ -307,6 +271,18 @@ export component AppWindow inherits Window {
     in property <[PersonItem]> people-items;
     in property <int>          people-untagged-count: 0;
 
+    // ── Collections page ──────────────────────────────────────────
+    in property <[CollectionEntry]> collections-list:        [];
+    in-out property <int>           collections-selected-id: -1;
+    in property <string>            collections-sel-name:        "";
+    in property <color>             collections-sel-color:       #B5543E;
+    in property <int>               collections-sel-count:       0;
+    in property <string>            collections-sel-parent-name: "";
+    in property <[ThumbItem]>       collections-thumbs:      [];
+
+    // Sidebar dots (top-level collections, shown below nav).
+    in property <[CollectionEntry]> sidebar-collections: [];
+
     // ── AI / faces toggle state (library top-bar) ─────────────────
     in-out property <bool> ai-on:    false;
     in-out property <bool> faces-on: false;
@@ -329,13 +305,19 @@ export component AppWindow inherits Window {
     callback people-person-activated(int);  // person_id → filter library
     callback people-tag-faces;
 
+    callback collections-page-shown;
+    callback collections-select(int);
+    callback collections-create(string, color, int);
+    callback collections-delete(int);
+    callback collections-rename(int, string);
+    callback collections-open-image(int);
+
     callback toggle-ai;
     callback toggle-faces;
     callback detect-faces-clicked;
     callback tag-faces-clicked;
 
     callback settings-clicked;
-    callback collections-clicked;
     callback debug-clicked;
     callback theme-toggled(bool);  // fires with new dark value so Rust can sync secondary windows
 
@@ -428,24 +410,40 @@ export component AppWindow inherits Window {
                 NavItem {
                     active: root.page == Page.collections;
                     label: "Collections";
-                    clicked => { root.page = Page.collections; }
+                    clicked => {
+                        if (root.page != Page.collections) {
+                            root.page = Page.collections;
+                            root.collections-page-shown();
+                        }
+                    }
                     CollectionsIcon {
                         clr: root.page == Page.collections ? Theme.accent-text : Theme.ink-2;
                     }
                 }
 
                 // ── Collections list ──────────────────────────────
-                Rectangle { height: 12px; }
-                Text {
+                if root.sidebar-collections.length > 0: Rectangle { height: 12px; }
+                if root.sidebar-collections.length > 0: Text {
                     text: "COLLECTIONS";
                     color: Theme.ink-3;
                     font-size: 11px;
                     font-weight: 600;
                     letter-spacing: 0.7px;
+                    height: 18px;
                 }
-                CollectionDot { dot-color: #B5543E; label: "Iceland 2024"; count: "128"; }
-                CollectionDot { dot-color: #6E8B6F; label: "Family";       count: "540"; }
-                CollectionDot { dot-color: #C29A3E; label: "Studio work";  count: "76"; }
+                for coll in root.sidebar-collections: CollectionDot {
+                    dot-color: coll.color;
+                    label: coll.name;
+                    count: coll.image-count + "";
+                    active: root.page == Page.collections
+                        && root.collections-selected-id == coll.id;
+                    clicked => {
+                        root.page = Page.collections;
+                        root.collections-selected-id = coll.id;
+                        root.collections-page-shown();
+                        root.collections-select(coll.id);
+                    }
+                }
 
                 // ── Footer ────────────────────────────────────────
                 Rectangle { vertical-stretch: 1; }
@@ -818,10 +816,20 @@ export component AppWindow inherits Window {
                 tag-faces-clicked    => { root.people-tag-faces(); }
             }
 
-            if root.page == Page.collections: StubPage {
+            if root.page == Page.collections: CollectionsPage {
                 vertical-stretch: 1;
-                title: "Collections";
-                body: "Group and colour-tag your photos. Collections manager coming soon.";
+                collections: root.collections-list;
+                selected-id <=> root.collections-selected-id;
+                sel-name: root.collections-sel-name;
+                sel-color: root.collections-sel-color;
+                sel-count: root.collections-sel-count;
+                sel-parent-name: root.collections-sel-parent-name;
+                thumbs: root.collections-thumbs;
+                collection-selected(id) => { root.collections-select(id); }
+                create-collection(name, color, pid) => { root.collections-create(name, color, pid); }
+                delete-collection(id) => { root.collections-delete(id); }
+                rename-collection(id, name) => { root.collections-rename(id, name); }
+                open-image(id) => { root.collections-open-image(id); }
             }
         }
     }

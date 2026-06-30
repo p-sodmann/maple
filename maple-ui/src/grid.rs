@@ -220,6 +220,7 @@ impl LibraryGrid {
 /// Build the initial placeholder tile for a record (image filled in later).
 fn placeholder_item(rec: &LibraryImage) -> ThumbItem {
     ThumbItem {
+        id: rec.id as i32,
         image: Image::default(),
         name: SharedString::from(rec.meta.filename.as_deref().unwrap_or("…")),
         loaded: false,

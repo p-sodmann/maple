@@ -11,6 +11,7 @@
 //!   7 → 8 : skipped column on face_detections (remember skipped faces)
 //!   8 → 9 : stacks table + stack_id column on images (burst/similar grouping)
 //!   9 → 10: image_hashes table (algorithm-keyed perceptual/embedding hashes)
+//!   13 → 14: parent_id column on collections (hierarchy)
 
 use rusqlite::Connection;
 
@@ -441,6 +442,17 @@ pub fn ensure_schema(conn: &Connection) -> anyhow::Result<()> {
             }
         }
         conn.execute_batch("PRAGMA user_version = 13")?;
+    }
+
+    if version < 14 {
+        if let Err(e) = conn.execute_batch(
+            "ALTER TABLE collections ADD COLUMN parent_id INTEGER REFERENCES collections(id) ON DELETE SET NULL"
+        ) {
+            if !e.to_string().to_lowercase().contains("duplicate column") {
+                return Err(e.into());
+            }
+        }
+        conn.execute_batch("PRAGMA user_version = 14")?;
     }
 
     Ok(())

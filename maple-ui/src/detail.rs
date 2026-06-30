@@ -23,7 +23,7 @@ use crate::face_overlay::{
     insert_new_face, EmbeddingMatrix,
 };
 use crate::image_loader;
-use crate::{CollectionChip, DetailWindow};
+use crate::{CollectionChip, DetailWindow, ImageInfoRow};
 
 thread_local! {
     /// The single live detail window (mirrors the old `DETAIL_CTX` singleton).
@@ -455,6 +455,155 @@ fn show_current(detail: &Detail) {
     );
 }
 
+/// Format a Unix timestamp (seconds) as `YYYY-MM-DD HH:MM UTC`.
+fn format_unix_ts(ts: i64) -> String {
+    if ts <= 0 {
+        return "—".to_owned();
+    }
+    let s = ts as u64;
+    let days = s / 86400;
+    let rem = s % 86400;
+    let h = rem / 3600;
+    let m = (rem % 3600) / 60;
+    let (y, mo, d) = days_to_ymd(days);
+    format!("{y:04}-{mo:02}-{d:02}  {h:02}:{m:02} UTC")
+}
+
+fn days_to_ymd(days: u64) -> (u32, u32, u32) {
+    let z = days + 719468;
+    let era = z / 146097;
+    let doe = z % 146097;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let mo = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if mo <= 2 { y + 1 } else { y };
+    (y as u32, mo as u32, d as u32)
+}
+
+fn truncate_value(s: &str) -> String {
+    const MAX: usize = 90;
+    let count = s.chars().count();
+    if count > MAX {
+        let t: String = s.chars().take(MAX - 1).collect();
+        format!("{t}…")
+    } else {
+        s.to_owned()
+    }
+}
+
+/// Build the flat list of key-value rows for the info popup.
+fn build_info_rows(
+    rec: &LibraryImage,
+    db: &Arc<Mutex<maple_db::Database>>,
+    face_count: usize,
+) -> ModelRc<ImageInfoRow> {
+    let mut rows: Vec<ImageInfoRow> = Vec::new();
+
+    let section = |label: &str| ImageInfoRow {
+        label: label.into(),
+        value: SharedString::new(),
+        is_section: true,
+    };
+    let row = |label: &str, value: String| ImageInfoRow {
+        label: label.into(),
+        value: truncate_value(&value).into(),
+        is_section: false,
+    };
+
+    // ── File ────────────────────────────────────────────────────────
+    rows.push(section("FILE"));
+    if let Some(ref name) = rec.meta.filename {
+        rows.push(row("Filename", name.clone()));
+    }
+    rows.push(row("Path", rec.path.to_string_lossy().into_owned()));
+    if let Some(ref raw) = rec.raw_path {
+        rows.push(row("RAW companion", raw.to_string_lossy().into_owned()));
+    }
+    rows.push(row(
+        "Status",
+        match rec.status {
+            maple_db::ImageStatus::Present => "Present".into(),
+            maple_db::ImageStatus::Missing => "Missing".into(),
+        },
+    ));
+    rows.push(row("Added", format_unix_ts(rec.added_at)));
+    if let Some(hash) = rec.hash {
+        let hex: String = hash.iter().map(|b| format!("{b:02x}")).collect::<String>()[..16].to_owned();
+        rows.push(row("Hash (BLAKE3)", format!("{hex}…")));
+    }
+    if let Some(stack_id) = rec.stack_id {
+        let size = rec.stack_size.unwrap_or(0);
+        rows.push(row("Stack", format!("#{stack_id}  ({size} images)")));
+    }
+
+    // ── Camera ──────────────────────────────────────────────────────
+    rows.push(section("CAMERA"));
+    match (&rec.meta.make, &rec.meta.model) {
+        (Some(make), Some(model)) => rows.push(row("Camera", format!("{make} {model}"))),
+        (Some(make), None) => rows.push(row("Camera", make.clone())),
+        (None, Some(model)) => rows.push(row("Camera", model.clone())),
+        _ => {}
+    }
+    if let Some(ref lens) = rec.meta.lens {
+        rows.push(row("Lens", lens.clone()));
+    }
+    if let Some(fl) = rec.meta.focal_length {
+        rows.push(row("Focal length", format!("{fl:.0} mm")));
+    }
+    if let Some(ap) = rec.meta.aperture {
+        rows.push(row("Aperture", format!("f/{ap:.1}")));
+    }
+    if let Some(iso) = rec.meta.iso {
+        rows.push(row("ISO", format!("{iso}")));
+    }
+
+    // ── Image ───────────────────────────────────────────────────────
+    rows.push(section("IMAGE"));
+    if let (Some(w), Some(h)) = (rec.meta.width, rec.meta.height) {
+        rows.push(row("Dimensions", format!("{w} × {h} px")));
+    }
+    if let Some(ts) = rec.meta.taken_at {
+        rows.push(row("Taken", format_unix_ts(ts)));
+    }
+    if let Some(ori) = rec.meta.orientation {
+        let label = match ori {
+            1 => "1 (Normal)".into(),
+            3 => "3 (180°)".into(),
+            6 => "6 (90° CW)".into(),
+            8 => "8 (90° CCW)".into(),
+            n => format!("{n}"),
+        };
+        rows.push(row("Orientation", label));
+    }
+
+    // ── AI descriptions ─────────────────────────────────────────────
+    let ai_descs = db
+        .lock()
+        .ok()
+        .and_then(|g| g.ai_descriptions_for_image(rec.id).ok())
+        .unwrap_or_default();
+    if !ai_descs.is_empty() {
+        rows.push(section("AI DESCRIPTION"));
+        for (model_id, desc) in ai_descs {
+            rows.push(row(&model_id, desc));
+        }
+    }
+
+    // ── Faces ───────────────────────────────────────────────────────
+    if face_count > 0 {
+        rows.push(section("FACES"));
+        rows.push(row(
+            "Detected",
+            format!("{face_count} face{}", if face_count == 1 { "" } else { "s" }),
+        ));
+    }
+
+    ModelRc::from(Rc::new(VecModel::from(rows)))
+}
+
 /// Update window chrome for the current record and kick off the async decode.
 fn show_record(
     window: &DetailWindow,
@@ -490,6 +639,10 @@ fn show_record(
     *known_embeddings.borrow_mut() = EmbeddingMatrix::build(db);
     let boxes = build_face_boxes(&faces.borrow(), db, &known_embeddings.borrow());
     window.set_face_boxes(boxes);
+
+    // Populate the info popup rows (works whether the panel is open or closed).
+    let face_count = faces.borrow().len();
+    window.set_image_info_rows(build_info_rows(&rec, db, face_count));
 
     image_loader::load_full_image(rec.path.clone(), window.as_weak());
 }
