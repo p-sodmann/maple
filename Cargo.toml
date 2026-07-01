@@ -31,11 +31,12 @@ open = "5"
 # Async
 tokio = { version = "1", features = ["rt-multi-thread", "fs", "sync", "macros"] }
 
-# ONNX Runtime (ort 2.x — supports CPU, CUDA, TensorRT via execution providers)
-# With load-dynamic, the onnxruntime shared library is loaded at runtime from
-# ORT_DYLIB_PATH or standard system library paths.  Install a CUDA-enabled
-# onnxruntime release to unlock GPU inference.
-ort = { version = "=2.0.0-rc.12", features = ["ndarray", "tracing"] }
+# ONNX Runtime (ort 2.x — supports CPU, CUDA, TensorRT via execution providers).
+# Backend is chosen via maple-db's `cpu` (default) / `gpu` Cargo features, not
+# here — see maple-db/Cargo.toml for the two feature sets and CLAUDE.md for how
+# to build each variant. default-features = false so neither backend leaks in
+# by accident.
+ort = { version = "=2.0.0-rc.12", default-features = false }
 
 # Image
 image = "0.25"

@@ -174,7 +174,10 @@ pub struct FaceSettings {
     /// Execution device for ONNX inference.
     /// Accepts: `"cpu"` (default), `"cuda:N"` (NVIDIA GPU index N),
     /// `"tensorrt:N"` (TensorRT, fastest for fixed-shape models).
-    /// Requires a CUDA-enabled ONNX Runtime on `ORT_DYLIB_PATH` for GPU.
+    /// GPU devices only take effect on a binary built with the `gpu` Cargo
+    /// feature (see `maple-db/Cargo.toml`) and a CUDA-enabled ONNX Runtime on
+    /// `ORT_DYLIB_PATH`; on the default `cpu` build this always falls back to
+    /// CPU regardless of this setting.
     #[serde(default = "FaceSettings::default_device")]
     pub device: String,
 }

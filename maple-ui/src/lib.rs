@@ -283,11 +283,11 @@ pub fn run() -> anyhow::Result<()> {
         let w = window.as_weak();
         let db = db.clone();
         let settings = maple_state::Settings::load();
-        let home = home_dir();
+        let dirs = KnownDirs::from_os();
         move || {
             let Some(w) = w.upgrade() else { return };
             let starred = starred_paths(&db);
-            let locs = build_import_locations(&settings, &home, &starred);
+            let locs = build_import_locations(&settings, &dirs, &starred);
             let (favs, recents) = partition_locations(locs);
             w.set_import_favorites(favs);
             w.set_import_recents(recents);
@@ -335,11 +335,11 @@ pub fn run() -> anyhow::Result<()> {
         let db = db.clone();
         let source = import_source.clone();
         let settings = maple_state::Settings::load();
-        let home = home_dir();
+        let dirs = KnownDirs::from_os();
         move |id| {
             let Some(w) = w.upgrade() else { return };
             let starred = starred_paths(&db);
-            let mut locs = build_import_locations(&settings, &home, &starred);
+            let mut locs = build_import_locations(&settings, &dirs, &starred);
 
             // Mark selected, deselect others.
             for loc in &mut locs {
@@ -363,11 +363,11 @@ pub fn run() -> anyhow::Result<()> {
         let w = window.as_weak();
         let db = db.clone();
         let settings = maple_state::Settings::load();
-        let home = home_dir();
+        let dirs = KnownDirs::from_os();
         move |id| {
             let Some(w) = w.upgrade() else { return };
             let starred = starred_paths(&db);
-            let locs = build_import_locations(&settings, &home, &starred);
+            let locs = build_import_locations(&settings, &dirs, &starred);
             if let Some(loc) = locs.iter().find(|l| l.id == id.as_str()) {
                 let path = loc.path.as_str();
                 if starred.contains(path) {
@@ -375,7 +375,7 @@ pub fn run() -> anyhow::Result<()> {
                 } else if let Ok(g) = db.lock() { let _ = g.add_starred_path(path); }
             }
             let starred = starred_paths(&db);
-            let locs = build_import_locations(&settings, &home, &starred);
+            let locs = build_import_locations(&settings, &dirs, &starred);
             let (favs, recents) = partition_locations(locs);
             w.set_import_favorites(favs);
             w.set_import_recents(recents);
@@ -471,14 +471,28 @@ pub fn run() -> anyhow::Result<()> {
     Ok(())
 }
 
-fn home_dir() -> std::path::PathBuf {
-    std::env::var_os("HOME")
-        .or_else(|| std::env::var_os("USERPROFILE"))
-        .map(std::path::PathBuf::from)
-        .unwrap_or_default()
+// ── Import location helpers ────────────────────────────────────────
+
+/// Well-known user folders, resolved via OS "known folder" APIs
+/// (`directories::UserDirs`) rather than manual home-dir joins, so
+/// relocated folders (e.g. OneDrive-redirected Pictures on Windows)
+/// are still found.
+struct KnownDirs {
+    pictures: Option<std::path::PathBuf>,
+    desktop: Option<std::path::PathBuf>,
+    downloads: Option<std::path::PathBuf>,
 }
 
-// ── Import location helpers ────────────────────────────────────────
+impl KnownDirs {
+    fn from_os() -> Self {
+        let user_dirs = directories::UserDirs::new();
+        Self {
+            pictures: user_dirs.as_ref().and_then(|u| u.picture_dir()).map(Into::into),
+            desktop: user_dirs.as_ref().and_then(|u| u.desktop_dir()).map(Into::into),
+            downloads: user_dirs.as_ref().and_then(|u| u.download_dir()).map(Into::into),
+        }
+    }
+}
 
 struct LocData {
     id:          String,
@@ -500,56 +514,59 @@ fn starred_paths(db: &std::sync::Arc<std::sync::Mutex<maple_db::Database>>) -> s
 
 fn build_import_locations(
     settings: &maple_state::Settings,
-    home: &std::path::Path,
+    dirs: &KnownDirs,
     starred: &std::collections::HashSet<String>,
 ) -> Vec<LocData> {
     let mut locs: Vec<LocData> = Vec::new();
 
     // Pictures directory
-    let pictures = home.join("Pictures");
-    if pictures.is_dir() {
-        let path = pictures.to_string_lossy().into_owned();
-        locs.push(LocData {
-            id: "pictures".into(),
-            name: "Pictures Library".into(),
-            is_starred: starred.contains(&path),
-            path,
-            count: 0,
-            is_selected: false,
-        });
+    if let Some(pictures) = &dirs.pictures {
+        if pictures.is_dir() {
+            let path = pictures.to_string_lossy().into_owned();
+            locs.push(LocData {
+                id: "pictures".into(),
+                name: "Pictures Library".into(),
+                is_starred: starred.contains(&path),
+                path,
+                count: 0,
+                is_selected: false,
+            });
+        }
     }
 
     // Desktop
-    let desktop = home.join("Desktop");
-    if desktop.is_dir() {
-        let path = desktop.to_string_lossy().into_owned();
-        locs.push(LocData {
-            id: "desktop".into(),
-            name: "Desktop".into(),
-            is_starred: starred.contains(&path),
-            path,
-            count: 0,
-            is_selected: false,
-        });
+    if let Some(desktop) = &dirs.desktop {
+        if desktop.is_dir() {
+            let path = desktop.to_string_lossy().into_owned();
+            locs.push(LocData {
+                id: "desktop".into(),
+                name: "Desktop".into(),
+                is_starred: starred.contains(&path),
+                path,
+                count: 0,
+                is_selected: false,
+            });
+        }
     }
 
     // Downloads
-    let downloads = home.join("Downloads");
-    if downloads.is_dir() {
-        let path = downloads.to_string_lossy().into_owned();
-        locs.push(LocData {
-            id: "downloads".into(),
-            name: "Downloads".into(),
-            is_starred: starred.contains(&path),
-            path,
-            count: 0,
-            is_selected: false,
-        });
+    if let Some(downloads) = &dirs.downloads {
+        if downloads.is_dir() {
+            let path = downloads.to_string_lossy().into_owned();
+            locs.push(LocData {
+                id: "downloads".into(),
+                name: "Downloads".into(),
+                is_starred: starred.contains(&path),
+                path,
+                count: 0,
+                is_selected: false,
+            });
+        }
     }
 
     // Library directory (from settings) if different from Pictures
     let lib = settings.library_dir.clone();
-    if lib.is_dir() && lib != home.join("Pictures") {
+    if lib.is_dir() && dirs.pictures.as_deref() != Some(lib.as_path()) {
         let path = lib.to_string_lossy().into_owned();
         locs.push(LocData {
             id: "library".into(),
@@ -586,4 +603,37 @@ fn partition_locations(locs: Vec<LocData>) -> (ModelRc<ImportLocation>, ModelRc<
         ModelRc::from(Rc::new(VecModel::from(favs))),
         ModelRc::from(Rc::new(VecModel::from(recents))),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashSet;
+
+    #[test]
+    fn build_import_locations_finds_pictures_desktop_and_dedupes_library() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path();
+        std::fs::create_dir(home.join("Pictures")).unwrap();
+        std::fs::create_dir(home.join("Desktop")).unwrap();
+        // No Downloads dir created — should be skipped.
+
+        let mut settings = maple_state::Settings::default();
+        settings.library_dir = home.join("Pictures"); // same as Pictures -> should not duplicate
+
+        let dirs = KnownDirs {
+            pictures: Some(home.join("Pictures")),
+            desktop: Some(home.join("Desktop")),
+            downloads: Some(home.join("Downloads")),
+        };
+
+        let starred = HashSet::new();
+        let locs = build_import_locations(&settings, &dirs, &starred);
+
+        let ids: Vec<&str> = locs.iter().map(|l| l.id.as_str()).collect();
+        assert!(ids.contains(&"pictures"));
+        assert!(ids.contains(&"desktop"));
+        assert!(!ids.contains(&"downloads"));
+        assert!(!ids.contains(&"library"));
+    }
 }

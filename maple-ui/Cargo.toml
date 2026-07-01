@@ -6,7 +6,7 @@ edition.workspace = true
 [dependencies]
 maple-state = { path = "../maple-state" }
 maple-import = { path = "../maple-import" }
-maple-db = { path = "../maple-db" }
+maple-db = { path = "../maple-db", default-features = false }
 slint = { workspace = true }
 rfd = { workspace = true }
 open = { workspace = true }
@@ -16,6 +16,7 @@ webp = { workspace = true }
 kamadak-exif = { workspace = true }
 tracing = { workspace = true }
 anyhow = { workspace = true }
+directories = { workspace = true }
 
 [build-dependencies]
 slint-build = { workspace = true }
@@ -27,3 +28,8 @@ criterion = { workspace = true }
 [[bench]]
 name = "image_pipeline"
 harness = false
+
+[features]
+default = ["cpu"]
+cpu = ["maple-db/cpu"]
+gpu = ["maple-db/gpu"]

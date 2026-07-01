@@ -9,7 +9,7 @@ maple-state = { path = "../maple-state" }
 rusqlite = { workspace = true }
 blake3 = { workspace = true }
 serde = { workspace = true }
-ort = { workspace = true }
+ort = { workspace = true, default-features = false }
 ndarray = { workspace = true }
 image = { workspace = true }
 anyhow = { workspace = true }
@@ -27,3 +27,21 @@ path-slash = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
+
+[features]
+default = ["cpu"]
+# CPU-only (default): ort links a prebuilt onnxruntime binary at build time
+# (downloaded from pyke's CDN — needs network during `cargo build`) and bundles
+# it next to the output binary. No GPU execution providers; `device = "cuda:0"`
+# / `"tensorrt:0"` in settings.toml silently fall back to CPU (ort's normal
+# EP-unavailable behavior).
+cpu = ["ort/std", "ort/ndarray", "ort/tracing", "ort/download-binaries", "ort/copy-dylibs", "ort/tls-native", "ort/api-24"]
+# GPU-capable: ort loads onnxruntime dynamically at runtime instead of linking
+# it at build time. No network needed to build, but the resulting binary needs
+# a real onnxruntime shared library to run at all (even for CPU-only
+# inference) — supply one via the `ORT_DYLIB_PATH` env var, pointing at a
+# CUDA/TensorRT-enabled onnxruntime release (e.g. Microsoft's official
+# onnxruntime-gpu build), or place it where the OS's dynamic loader will find
+# it by default. Build with:
+#   cargo build --release -p maple --no-default-features --features gpu
+gpu = ["ort/std", "ort/ndarray", "ort/tracing", "ort/load-dynamic", "ort/api-24"]

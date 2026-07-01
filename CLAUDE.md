@@ -11,9 +11,40 @@ cargo test --workspace
 cargo clippy --workspace
 ```
 
-No system GTK headers needed — Slint ships its own renderer.
+No system GTK headers needed — Slint ships its own renderer. A C toolchain is
+still required (MSVC Build Tools on Windows, Xcode CLT on macOS,
+`build-essential` on Linux): `rusqlite` (`bundled`), `sqlite-vec`, and `webp`
+all compile vendored C sources via the `cc` crate.
 
-ONNX Runtime (`ort`) is loaded dynamically — face detection/embedding features need `ORT_DYLIB_PATH` or a system-installed `libonnxruntime.so`.
+ONNX Runtime (`ort`) backend is selected via a Cargo feature on `maple-db`,
+forwarded through `maple-ui` and `maple` — **two separate build variants**:
+
+```sh
+# CPU build (default) — no flags needed:
+cargo build --workspace
+
+# GPU build — opt in explicitly, one package at a time:
+cargo build --release -p maple --no-default-features --features gpu
+```
+
+- **`cpu` (default)**: `ort` downloads a platform-matched prebuilt onnxruntime
+  binary at build time (`download-binaries` + `copy-dylibs`) and links it in.
+  Needs network access the first time you build; CPU-only (no CUDA/TensorRT).
+  `device = "cuda:0"` / `"tensorrt:0"` in settings.toml silently fall back to
+  CPU (ort's normal EP-unavailable behavior) — this is expected on a `cpu`
+  build.
+- **`gpu`**: `ort` uses `load-dynamic` — no network needed to build, but the
+  resulting binary loads onnxruntime *at runtime* instead, and needs a real
+  shared library to even start (not just for GPU: CPU inference on a `gpu`
+  build still requires this). Point `ORT_DYLIB_PATH` at a CUDA/TensorRT-
+  enabled onnxruntime release (e.g. Microsoft's official `onnxruntime-gpu`
+  build), or place the library where the OS's dynamic loader finds it by
+  default (next to the `.exe` on Windows; `LD_LIBRARY_PATH`/rpath on Linux;
+  `DYLD_*` paths on macOS).
+
+Ship both variants as separate release artifacts per platform if you want to
+offer GPU acceleration — there's no runtime fallback between the two within a
+single binary; the backend is fixed at compile time.
 
 ## Workspace Crates
 

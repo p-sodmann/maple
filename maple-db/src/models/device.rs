@@ -9,8 +9,12 @@
 //! device = "tensorrt:0"  # TensorRT (fastest, falls back to CUDA→CPU)
 //! ```
 //!
-//! GPU execution requires an ONNX Runtime binary with the relevant execution
-//! providers compiled in.  Point `ORT_DYLIB_PATH` at it before launching.
+//! GPU execution only takes effect when this crate is built with the `gpu`
+//! Cargo feature (`cargo build --features gpu` — see `maple-db/Cargo.toml`),
+//! which switches `ort` to dynamic loading. Point `ORT_DYLIB_PATH` at an
+//! ONNX Runtime build with the relevant execution providers compiled in
+//! before launching. On the default `cpu` feature build, CUDA/TensorRT
+//! devices always fall back to CPU.
 
 use std::fmt;
 use std::str::FromStr;
