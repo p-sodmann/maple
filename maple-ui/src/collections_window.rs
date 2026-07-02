@@ -15,7 +15,7 @@ pub fn all_chips(db: &Arc<Mutex<maple_db::Database>>) -> Vec<crate::CollectionCh
         .map(|c| crate::CollectionChip {
             id: c.id as i32,
             name: c.name.clone().into(),
-            color: crate::collections_page::hex_to_color(&c.color),
+            color: crate::transforms::hex_to_color(&c.color),
         })
         .collect()
 }

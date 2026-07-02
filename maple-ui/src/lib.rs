@@ -19,14 +19,17 @@ mod collections_page;
 mod collections_window;
 mod date;
 mod detail;
+mod face_crop;
 mod face_overlay;
 mod face_tag;
 mod grid;
 mod image_loader;
 mod import;
 mod people_page;
+mod services;
 mod settings_window;
 pub mod thumbnail;
+mod transforms;
 
 use grid::LibraryGrid;
 

@@ -10,7 +10,9 @@ use slint::{Image, ModelRc, Rgb8Pixel, SharedPixelBuffer, SharedString, VecModel
 
 use maple_db::{SearchQuery, ThumbnailCache};
 
+use crate::services::collections::flatten_tree;
 use crate::thumbnail;
+use crate::transforms::hex_to_color;
 use crate::{AppWindow, CollectionEntry, ThumbItem};
 
 /// `(rgb_bytes_w_h, filename, image_id)` — Send-safe thumbnail payload
@@ -144,50 +146,6 @@ fn load_entries(db: &Arc<Mutex<maple_db::Database>>) -> Vec<CollectionEntry> {
     flatten_tree(&colls)
 }
 
-/// DFS-flatten the collection tree into a display list with depth info.
-///
-/// `all_collections` returns rows sorted by name, so siblings within each
-/// parent level already arrive in alphabetical order.
-fn flatten_tree(colls: &[maple_db::Collection]) -> Vec<CollectionEntry> {
-    use std::collections::HashMap;
-
-    // Map parent_id → indices of children (in the `colls` slice)
-    let mut children: HashMap<i64, Vec<usize>> = HashMap::new();
-    let mut root_indices: Vec<usize> = Vec::new();
-
-    for (idx, c) in colls.iter().enumerate() {
-        match c.parent_id {
-            Some(pid) => children.entry(pid).or_default().push(idx),
-            None => root_indices.push(idx),
-        }
-    }
-
-    // Iterative DFS using a stack of (index, depth).
-    // Roots are pushed in reverse order so the first root pops first.
-    let mut result: Vec<CollectionEntry> = Vec::with_capacity(colls.len());
-    let mut stack: Vec<(usize, i32)> = root_indices.into_iter().rev().map(|i| (i, 0)).collect();
-
-    while let Some((idx, depth)) = stack.pop() {
-        let c = &colls[idx];
-        result.push(CollectionEntry {
-            id: c.id as i32,
-            name: SharedString::from(c.name.as_str()),
-            color: hex_to_color(&c.color),
-            image_count: c.image_count as i32,
-            parent_id: c.parent_id.map(|id| id as i32).unwrap_or(-1),
-            depth,
-        });
-        // Push children in reverse sorted order so they pop in sorted order.
-        if let Some(kids) = children.get(&c.id) {
-            for &kid_idx in kids.iter().rev() {
-                stack.push((kid_idx, depth + 1));
-            }
-        }
-    }
-
-    result
-}
-
 fn make_model(entries: Vec<CollectionEntry>) -> ModelRc<CollectionEntry> {
     ModelRc::from(Rc::new(VecModel::from(entries)))
 }
@@ -220,18 +178,4 @@ fn rgb_to_image(rgb: &[u8], width: u32, height: u32) -> Image {
     let mut buf = SharedPixelBuffer::<Rgb8Pixel>::new(width, height);
     buf.make_mut_bytes().copy_from_slice(rgb);
     Image::from_rgb8(buf)
-}
-
-pub fn hex_to_color(hex: &str) -> slint::Color {
-    let s = hex.trim_start_matches('#');
-    if s.len() == 6 {
-        if let (Ok(r), Ok(g), Ok(b)) = (
-            u8::from_str_radix(&s[0..2], 16),
-            u8::from_str_radix(&s[2..4], 16),
-            u8::from_str_radix(&s[4..6], 16),
-        ) {
-            return slint::Color::from_rgb_u8(r, g, b);
-        }
-    }
-    slint::Color::from_rgb_u8(0xa0, 0x9a, 0x8e)
 }

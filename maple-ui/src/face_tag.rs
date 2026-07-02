@@ -17,6 +17,7 @@ use std::sync::{Arc, Mutex};
 
 use slint::{ComponentHandle, Image, Rgb8Pixel, SharedPixelBuffer, SharedString};
 
+use crate::face_crop::extract_crop;
 use crate::face_overlay::{build_suggestions, is_real_detection, EmbeddingMatrix};
 use crate::FaceTagWindow;
 
@@ -279,71 +280,4 @@ fn collect_untagged_faces(db: &Arc<Mutex<maple_db::Database>>) -> Vec<FaceEntry>
         }
     }
     out
-}
-
-// ── Crop extraction ────────────────────────────────────────────────
-
-/// Decode `path`, extract a square face crop padded by one bbox-diameter, and
-/// resize to `out_px × out_px` RGB pixels.
-///
-/// The crop is centred on the face centre.  Padding outside the image is filled
-/// with mid-grey so the face is always at a visually consistent size.
-pub fn extract_crop(path: &std::path::Path, bbox: [f32; 4], out_px: u32) -> anyhow::Result<Vec<u8>> {
-    let rgb = maple_import::decode_image(path)?.into_rgb8();
-    let (iw, ih) = rgb.dimensions();
-    let [x1, y1, x2, y2] = bbox;
-
-    // Face centre and size in source pixels.
-    let fx1 = x1 * iw as f32;
-    let fy1 = y1 * ih as f32;
-    let fx2 = x2 * iw as f32;
-    let fy2 = y2 * ih as f32;
-    let fw = (fx2 - fx1).max(1.0);
-    let fh = (fy2 - fy1).max(1.0);
-    let cx = (fx1 + fx2) * 0.5;
-    let cy = (fy1 + fy2) * 0.5;
-
-    // Pad = one bbox-diameter (largest axis) on every side.
-    let d = fw.max(fh);
-    let half = d * 1.5; // d/2 face half + d padding
-
-    let side = ((half * 2.0).round() as u32).max(4);
-
-    // Desired crop window top-left in image-space (may be negative near edge).
-    let desired_x0 = (cx - half).round() as i32;
-    let desired_y0 = (cy - half).round() as i32;
-
-    // Clamp to image bounds.
-    let actual_x0 = desired_x0.clamp(0, iw as i32 - 1) as u32;
-    let actual_y0 = desired_y0.clamp(0, ih as i32 - 1) as u32;
-    let actual_x1 = (desired_x0 + side as i32).clamp(0, iw as i32) as u32;
-    let actual_y1 = (desired_y0 + side as i32).clamp(0, ih as i32) as u32;
-    let crop_w = actual_x1.saturating_sub(actual_x0).max(1);
-    let crop_h = actual_y1.saturating_sub(actual_y0).max(1);
-
-    // Where inside the output square the cropped pixels begin.
-    let paste_x = (actual_x0 as i32 - desired_x0) as u32;
-    let paste_y = (actual_y0 as i32 - desired_y0) as u32;
-
-    let cropped =
-        image::imageops::crop_imm(&rgb, actual_x0, actual_y0, crop_w, crop_h).to_image();
-
-    // Build the square output, grey-filling any border that fell outside the image.
-    let square: image::RgbImage =
-        if paste_x == 0 && paste_y == 0 && crop_w >= side && crop_h >= side {
-            cropped
-        } else {
-            let mut bg =
-                image::RgbImage::from_pixel(side, side, image::Rgb([64u8, 64, 64]));
-            image::imageops::overlay(&mut bg, &cropped, paste_x as i64, paste_y as i64);
-            bg
-        };
-
-    let final_img = image::imageops::resize(
-        &square,
-        out_px,
-        out_px,
-        image::imageops::FilterType::Lanczos3,
-    );
-    Ok(final_img.into_raw())
 }

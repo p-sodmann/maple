@@ -23,6 +23,7 @@ use crate::face_overlay::{
     insert_new_face, EmbeddingMatrix,
 };
 use crate::image_loader;
+use crate::transforms::{format_unix_ts, hex_to_color, truncate_value};
 use crate::{CollectionChip, DetailWindow, ImageInfoRow};
 
 thread_local! {
@@ -450,31 +451,6 @@ fn show_current(detail: &Detail) {
     show_record(&detail.window, &detail.nav);
 }
 
-/// Format a Unix timestamp (seconds) as `YYYY-MM-DD HH:MM UTC`.
-fn format_unix_ts(ts: i64) -> String {
-    if ts <= 0 {
-        return "—".to_owned();
-    }
-    let s = ts as u64;
-    let days = s / 86400;
-    let rem = s % 86400;
-    let h = rem / 3600;
-    let m = (rem % 3600) / 60;
-    let (y, mo, d) = crate::date::days_to_ymd(days);
-    format!("{y:04}-{mo:02}-{d:02}  {h:02}:{m:02} UTC")
-}
-
-fn truncate_value(s: &str) -> String {
-    const MAX: usize = 90;
-    let count = s.chars().count();
-    if count > MAX {
-        let t: String = s.chars().take(MAX - 1).collect();
-        format!("{t}…")
-    } else {
-        s.to_owned()
-    }
-}
-
 /// Build the flat list of key-value rows for the info popup.
 ///
 /// `show_all_exif` controls whether the comprehensive "ALL EXIF METADATA"
@@ -676,24 +652,9 @@ fn load_chips(db: &Arc<Mutex<maple_db::Database>>, image_id: i64) -> ModelRc<Col
         .map(|c| CollectionChip {
             id: c.id as i32,
             name: c.name.clone().into(),
-            color: parse_hex_color(&c.color),
+            color: hex_to_color(&c.color),
         })
         .collect();
 
     ModelRc::from(Rc::new(VecModel::from(chips)))
-}
-
-/// Parse a `#rrggbb` hex string into a Slint colour. Falls back to neutral grey.
-fn parse_hex_color(hex: &str) -> slint::Color {
-    let s = hex.trim_start_matches('#');
-    if s.len() == 6 {
-        if let (Ok(r), Ok(g), Ok(b)) = (
-            u8::from_str_radix(&s[0..2], 16),
-            u8::from_str_radix(&s[2..4], 16),
-            u8::from_str_radix(&s[4..6], 16),
-        ) {
-            return slint::Color::from_rgb_u8(r, g, b);
-        }
-    }
-    slint::Color::from_rgb_u8(0x9a, 0x9a, 0x9a)
 }

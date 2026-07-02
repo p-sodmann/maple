@@ -22,11 +22,11 @@ use slint::{
     Image, Model, ModelRc, Rgb8Pixel, SharedPixelBuffer, SharedString, Timer, TimerMode, VecModel,
 };
 
-use maple_db::{LibraryImage, SearchHit, SearchQuery, ThumbnailCache};
+use maple_db::{LibraryImage, SearchQuery, ThumbnailCache};
 use maple_import::raw_preview_supported;
 
-use crate::date;
 use crate::thumbnail;
+use crate::transforms::{build_date_groups, score_caption};
 use crate::{DateGroup, ThumbItem};
 
 const POLL_MS: u64 = 32;
@@ -255,45 +255,6 @@ fn placeholder_item(rec: &LibraryImage) -> ThumbItem {
         unsupported: false,
         stack_size: rec.stack_size.unwrap_or(0) as i32,
         score: SharedString::from(score_caption(rec.search_hit.as_ref())),
-    }
-}
-
-/// Group `records` into contiguous same-day runs for the date-grouped view.
-/// Assumes `records` is already sorted so that same-day images are adjacent
-/// (see the `date_view` sort in `load()`); otherwise the same day may appear
-/// as multiple separate groups.
-fn build_date_groups(records: &[LibraryImage]) -> Vec<DateGroup> {
-    let mut groups: Vec<DateGroup> = Vec::new();
-    let mut current_day: Option<i64> = None;
-
-    for (i, rec) in records.iter().enumerate() {
-        let ts = rec.meta.taken_at.unwrap_or(rec.added_at);
-        let day = date::day_number(ts);
-        if current_day != Some(day) {
-            groups.push(DateGroup {
-                label: SharedString::from(date::day_label(ts)),
-                start: i as i32,
-                count: 0,
-            });
-            current_day = Some(day);
-        }
-        if let Some(g) = groups.last_mut() {
-            g.count += 1;
-        }
-    }
-
-    groups
-}
-
-/// Caption shown under a tile during search (empty when not a search hit).
-fn score_caption(hit: Option<&SearchHit>) -> String {
-    match hit {
-        Some(SearchHit::Direct { .. }) => "direct".to_owned(),
-        Some(SearchHit::Semantic { similarity, .. }) => {
-            let pct = (similarity * 100.0).clamp(0.0, 100.0);
-            format!("{pct:.0}% match")
-        }
-        None => String::new(),
     }
 }
 

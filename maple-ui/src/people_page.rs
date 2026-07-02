@@ -17,7 +17,7 @@ use std::sync::{Arc, Mutex};
 use slint::{Image, Model, ModelRc, Rgb8Pixel, SharedPixelBuffer, VecModel};
 use std::rc::Rc;
 
-use crate::face_tag::extract_crop;
+use crate::face_crop::extract_crop;
 use crate::{AppWindow, PersonItem};
 
 const CROP_PX: u32 = 240;
