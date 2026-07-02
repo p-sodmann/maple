@@ -4,7 +4,7 @@
 // The sidebar holds nav items; the main column has a 62 px top-bar and the
 // active view below it.  Navigation state lives entirely in the UI.
 import { Theme } from "theme.slint";
-import { LibraryPage, LibraryGridView, ThumbItem } from "library.slint";
+import { LibraryPage, LibraryGridView, ThumbItem, DateGroup } from "library.slint";
 import { ImportPage, ImportLocation } from "import.slint";
 import { DetailWindow, CollectionChip, FaceBox, FacePersonSuggestion } from "detail.slint";
 import { ImportWindow, ImportItem } from "import.slint";
@@ -14,7 +14,7 @@ import { FaceTagWindow } from "face_tag.slint";
 import { PeoplePage, PersonItem } from "people.slint";
 
 // Re-export second-window types so Rust can build & show them.
-export { ThumbItem, DetailWindow, CollectionChip, FaceBox, FacePersonSuggestion,
+export { ThumbItem, DateGroup, DetailWindow, CollectionChip, FaceBox, FacePersonSuggestion,
          ImportWindow, ImportItem, SettingsWindow, CollectionsWindow, CollectionEntry,
          FaceTagWindow, ImportLocation, PersonItem }
 
@@ -257,6 +257,8 @@ export component AppWindow inherits Window {
 
     // ── Library ──────────────────────────────────────────────────
     in property <[ThumbItem]>  library-items;
+    in property <[DateGroup]>  library-date-groups;
+    in-out property <bool>     date-view-on: false;
     in property <length>       library-cell-size: 160px;
 
     // ── Import page state ─────────────────────────────────────────
@@ -314,6 +316,7 @@ export component AppWindow inherits Window {
 
     callback toggle-ai;
     callback toggle-faces;
+    callback toggle-date-view;
     callback detect-faces-clicked;
     callback tag-faces-clicked;
 
@@ -730,6 +733,12 @@ export component AppWindow inherits Window {
                                 checked: root.faces-on;
                                 toggled => { root.toggle-faces(); }
                             }
+
+                            TopBarToggle {
+                                label: "By Date";
+                                checked: root.date-view-on;
+                                toggled => { root.toggle-date-view(); }
+                            }
                         }
                     }
 
@@ -790,6 +799,8 @@ export component AppWindow inherits Window {
             if root.page == Page.library: LibraryPage {
                 vertical-stretch: 1;
                 items: root.library-items;
+                date-groups: root.library-date-groups;
+                date-view: root.date-view-on;
                 cell-size: root.library-cell-size;
                 search-changed(t) => { root.library-search-changed(t); }
                 activated(i)      => { root.library-activated(i); }

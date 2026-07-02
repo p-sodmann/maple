@@ -17,6 +17,7 @@ slint::include_modules!();
 
 mod collections_page;
 mod collections_window;
+mod date;
 mod detail;
 mod face_overlay;
 mod face_tag;
@@ -80,7 +81,12 @@ pub fn run() -> anyhow::Result<()> {
         settings.thumbnails.size,
     );
     window.set_library_items(grid.model());
+    window.set_library_date_groups(grid.date_groups_model());
     window.set_library_cell_size(settings.thumbnails.size as f32);
+
+    // Tracks the query last passed to `grid.load()` (search text / person
+    // filter / …) so the date-view toggle can reload with it unchanged.
+    let current_query: Rc<RefCell<SearchQuery>> = Rc::new(RefCell::new(SearchQuery::default()));
 
     // Library is the default page — load immediately.
     grid.load(SearchQuery::default());
@@ -209,8 +215,11 @@ pub fn run() -> anyhow::Result<()> {
     window.on_people_person_activated({
         let grid = grid.clone();
         let w = window.as_weak();
+        let current_query = current_query.clone();
         move |person_id| {
-            grid.load(SearchQuery::default().with_person(person_id as i64));
+            let q = SearchQuery::default().with_person(person_id as i64);
+            *current_query.borrow_mut() = q.clone();
+            grid.load(q);
             if let Some(win) = w.upgrade() {
                 win.set_page(crate::Page::Library);
             }
@@ -234,15 +243,22 @@ pub fn run() -> anyhow::Result<()> {
 
     window.on_library_shown({
         let grid = grid.clone();
-        move || grid.load(SearchQuery::default())
+        let current_query = current_query.clone();
+        move || {
+            let q = SearchQuery::default();
+            *current_query.borrow_mut() = q.clone();
+            grid.load(q);
+        }
     });
 
     let search_debounce: Rc<RefCell<Option<Timer>>> = Rc::new(RefCell::new(None));
     window.on_library_search_changed({
         let grid = grid.clone();
         let search_debounce = search_debounce.clone();
+        let current_query = current_query.clone();
         move |text| {
             let grid = grid.clone();
+            let current_query = current_query.clone();
             let text = text.to_string();
             let timer = Timer::default();
             timer.start(
@@ -253,6 +269,7 @@ pub fn run() -> anyhow::Result<()> {
                     if !text.trim().is_empty() {
                         q = q.with_text(&text);
                     }
+                    *current_query.borrow_mut() = q.clone();
                     grid.load(q);
                 },
             );
@@ -399,6 +416,19 @@ pub fn run() -> anyhow::Result<()> {
 
     window.on_toggle_ai(|| {
         tracing::info!("AI tagging toggle — wiring for phase 2");
+    });
+
+    window.on_toggle_date_view({
+        let w = window.as_weak();
+        let grid = grid.clone();
+        let current_query = current_query.clone();
+        move || {
+            let Some(w) = w.upgrade() else { return };
+            let on = !w.get_date_view_on();
+            w.set_date_view_on(on);
+            grid.set_date_view(on);
+            grid.load(current_query.borrow().clone());
+        }
     });
 
     window.on_toggle_faces({

@@ -19,6 +19,97 @@ export struct ThumbItem {
     score: string,
 }
 
+// One day's worth of tiles within the date-grouped view: `start`/`count`
+// index into the (day-sorted) `items` array owned by the parent view.
+export struct DateGroup {
+    label: string,
+    start: int,
+    count: int,
+}
+
+// A single thumbnail tile — shared by the flat grid and the date-grouped
+// view so both stay visually identical. Callers position it via x/y.
+component LibraryTile inherits Rectangle {
+    in property <ThumbItem> item;
+    in property <length> cell-size: 160px;
+    callback clicked;
+
+    property <length> label-h: 28px;
+    width: root.cell-size;
+    height: root.cell-size + root.label-h;
+
+    VerticalLayout {
+        spacing: 4px;
+
+        frame := Rectangle {
+            height: root.cell-size;
+            border-radius: Theme.thumb-radius;
+            clip: true;
+            background: Theme.placeholder-bg;
+
+            if root.item.loaded: Image {
+                source: root.item.image;
+                width: 100%;
+                height: 100%;
+                image-fit: cover;
+            }
+
+            if !root.item.loaded && !root.item.unsupported: Text {
+                text: "…";
+                color: Theme.dim-fg;
+                font-size: 22px;
+                horizontal-alignment: center;
+                vertical-alignment: center;
+            }
+
+            if root.item.unsupported: Text {
+                text: "Format not\nyet supported";
+                color: Theme.dim-fg;
+                font-size: 12px;
+                horizontal-alignment: center;
+                vertical-alignment: center;
+            }
+
+            // Hover ring.
+            if ta.has-hover: Rectangle {
+                border-radius: Theme.thumb-radius;
+                border-width: 2px;
+                border-color: Theme.accent;
+            }
+        }
+
+        HorizontalLayout {
+            padding-left: 6px;
+            padding-right: 6px;
+            spacing: 4px;
+
+            if root.item.stack-size >= 2: Text {
+                text: "⊞ \{root.item.stack-size}";
+                color: Theme.dim-fg;
+                font-size: 11px;
+                font-weight: 700;
+                vertical-alignment: center;
+            }
+
+            Text {
+                text: root.item.score == "" ? root.item.name : root.item.name + "  ·  " + root.item.score;
+                color: root.item.score == "" ? Theme.dim-fg : Theme.accent;
+                font-size: 12px;
+                overflow: elide;
+                horizontal-alignment: right;
+                horizontal-stretch: 1;
+                vertical-alignment: center;
+            }
+        }
+    }
+
+    ta := TouchArea {
+        clicked => {
+            root.clicked();
+        }
+    }
+}
+
 export component LibraryGridView {
     in property <[ThumbItem]> items;
     in property <length> cell-size: 160px;
@@ -26,8 +117,7 @@ export component LibraryGridView {
 
     property <length> gap: Theme.gap;
     property <length> pad: Theme.pad;
-    property <length> label-h: 28px;
-    property <length> tile-h: root.cell-size + root.label-h;
+    property <length> tile-h: root.cell-size + 28px;
     property <length> pitch-x: root.cell-size + root.gap;
     property <length> pitch-y: root.tile-h + root.gap;
     // Columns that fit the viewport (mirrors FlowBox's wrap behaviour).
@@ -38,82 +128,63 @@ export component LibraryGridView {
         viewport-width: sv.visible-width;
         viewport-height: root.row-count * root.pitch-y + root.pad;
 
-        for item[idx] in root.items: tile := Rectangle {
+        for item[idx] in root.items: LibraryTile {
             property <float> grid-col: Math.mod(idx, root.columns);
             property <float> grid-row: Math.floor(idx / root.columns);
             x: root.pad + grid-col * root.pitch-x;
             y: root.pad + grid-row * root.pitch-y;
-            width: root.cell-size;
-            height: root.tile-h;
-
-            VerticalLayout {
-                spacing: 4px;
-
-                frame := Rectangle {
-                    height: root.cell-size;
-                    border-radius: Theme.thumb-radius;
-                    clip: true;
-                    background: Theme.placeholder-bg;
-
-                    if item.loaded: Image {
-                        source: item.image;
-                        width: 100%;
-                        height: 100%;
-                        image-fit: cover;
-                    }
-
-                    if !item.loaded && !item.unsupported: Text {
-                        text: "…";
-                        color: Theme.dim-fg;
-                        font-size: 22px;
-                        horizontal-alignment: center;
-                        vertical-alignment: center;
-                    }
-
-                    if item.unsupported: Text {
-                        text: "Format not\nyet supported";
-                        color: Theme.dim-fg;
-                        font-size: 12px;
-                        horizontal-alignment: center;
-                        vertical-alignment: center;
-                    }
-
-                    // Hover ring.
-                    if ta.has-hover: Rectangle {
-                        border-radius: Theme.thumb-radius;
-                        border-width: 2px;
-                        border-color: Theme.accent;
-                    }
-                }
-
-                HorizontalLayout {
-                    padding-left: 6px;
-                    padding-right: 6px;
-                    spacing: 4px;
-
-                    if item.stack-size >= 2: Text {
-                        text: "⊞ \{item.stack-size}";
-                        color: Theme.dim-fg;
-                        font-size: 11px;
-                        font-weight: 700;
-                        vertical-alignment: center;
-                    }
-
-                    Text {
-                        text: item.score == "" ? item.name : item.name + "  ·  " + item.score;
-                        color: item.score == "" ? Theme.dim-fg : Theme.accent;
-                        font-size: 12px;
-                        overflow: elide;
-                        horizontal-alignment: right;
-                        horizontal-stretch: 1;
-                        vertical-alignment: center;
-                    }
-                }
+            cell-size: root.cell-size;
+            item: item;
+            clicked => {
+                root.activated(idx);
             }
+        }
+    }
+}
 
-            ta := TouchArea {
-                clicked => {
-                    root.activated(idx);
+// Same responsive flow grid as `LibraryGridView`, but broken into per-day
+// blocks with a date-header divider. Relies on `items` being pre-sorted so
+// each `DateGroup`'s `start..start+count` slice is contiguous.
+export component LibraryDateGridView {
+    in property <[ThumbItem]> items;
+    in property <[DateGroup]> groups;
+    in property <length> cell-size: 160px;
+    callback activated(int);
+
+    property <length> gap: Theme.gap;
+    property <length> pad: Theme.pad;
+    property <length> tile-h: root.cell-size + 28px;
+    property <length> pitch-x: root.cell-size + root.gap;
+    property <length> pitch-y: root.tile-h + root.gap;
+    property <float> columns: Math.max(1, Math.floor((sv.visible-width - 2 * root.pad + root.gap) / (root.cell-size + root.gap)));
+
+    sv := ScrollView {
+        VerticalLayout {
+            padding: root.pad;
+            spacing: 22px;
+
+            for group[gi] in root.groups: VerticalLayout {
+                spacing: 10px;
+
+                Text {
+                    text: group.label;
+                    color: Theme.ink;
+                    font-size: 15px;
+                    font-weight: 700;
+                }
+
+                Rectangle {
+                    height: Math.ceil(group.count / root.columns) * root.pitch-y;
+
+                    for j in group.count: LibraryTile {
+                        x: Math.mod(j, root.columns) * root.pitch-x;
+                        y: Math.floor(j / root.columns) * root.pitch-y;
+                        cell-size: root.cell-size;
+                        item: root.items[group.start + j];
+                        clicked => {
+                            root.activated(group.start + j);
+                        }
+                    }
                 }
             }
         }
@@ -122,6 +193,8 @@ export component LibraryGridView {
 
 export component LibraryPage inherits Rectangle {
     in property <[ThumbItem]> items;
+    in property <[DateGroup]> date-groups;
+    in property <bool> date-view: false;
     in property <length> cell-size: 160px;
     callback search-changed(string);
     callback activated(int);
@@ -130,9 +203,17 @@ export component LibraryPage inherits Rectangle {
 
     VerticalLayout {
         // ── Grid ─────────────────────────────────────────────────
-        LibraryGridView {
+        if !root.date-view: LibraryGridView {
             vertical-stretch: 1;
             items: root.items;
+            cell-size: root.cell-size;
+            activated(i) => { root.activated(i); }
+        }
+
+        if root.date-view: LibraryDateGridView {
+            vertical-stretch: 1;
+            items: root.items;
+            groups: root.date-groups;
             cell-size: root.cell-size;
             activated(i) => { root.activated(i); }
         }

@@ -13,6 +13,7 @@
 //! `std::thread` + `std::sync::mpsc`, and only the UI-thread delivery changes.
 
 use std::cell::{Cell, RefCell};
+use std::cmp::Reverse;
 use std::rc::Rc;
 use std::sync::{mpsc, Arc, Mutex};
 use std::time::Duration;
@@ -24,8 +25,9 @@ use slint::{
 use maple_db::{LibraryImage, SearchHit, SearchQuery, ThumbnailCache};
 use maple_import::raw_preview_supported;
 
+use crate::date;
 use crate::thumbnail;
-use crate::ThumbItem;
+use crate::{DateGroup, ThumbItem};
 
 const POLL_MS: u64 = 32;
 
@@ -56,11 +58,13 @@ enum GridMsg {
 #[derive(Clone)]
 pub struct LibraryGrid {
     model: Rc<VecModel<ThumbItem>>,
+    date_groups: Rc<VecModel<DateGroup>>,
     records: Rc<RefCell<Vec<LibraryImage>>>,
     db: Arc<Mutex<maple_db::Database>>,
     cache: Arc<ThumbnailCache>,
     quality: u8,
     thumb_px: Rc<Cell<u32>>,
+    date_view: Rc<Cell<bool>>,
     generation: Rc<Cell<u64>>,
     /// Current poller; replaced (and thereby stopped) on each `load()`.
     timer: Rc<RefCell<Option<Timer>>>,
@@ -75,11 +79,13 @@ impl LibraryGrid {
     ) -> Self {
         Self {
             model: Rc::new(VecModel::default()),
+            date_groups: Rc::new(VecModel::default()),
             records: Rc::new(RefCell::new(Vec::new())),
             db,
             cache,
             quality,
             thumb_px: Rc::new(Cell::new(thumb_px)),
+            date_view: Rc::new(Cell::new(false)),
             generation: Rc::new(Cell::new(0)),
             timer: Rc::new(RefCell::new(None)),
         }
@@ -88,6 +94,13 @@ impl LibraryGrid {
     /// The backing model — bind to the `library-items` window property.
     pub fn model(&self) -> ModelRc<ThumbItem> {
         ModelRc::from(self.model.clone())
+    }
+
+    /// Day-grouped headers for the current items — bind to the
+    /// `library-date-groups` window property. Only meaningful (contiguous)
+    /// when the grid was last loaded with date-view sorting enabled.
+    pub fn date_groups_model(&self) -> ModelRc<DateGroup> {
+        ModelRc::from(self.date_groups.clone())
     }
 
     /// Snapshot of the currently loaded records (for the activate handler).
@@ -100,6 +113,12 @@ impl LibraryGrid {
     #[allow(dead_code)]
     pub fn set_thumb_size(&self, px: u32) {
         self.thumb_px.set(px);
+    }
+
+    /// Sort by photo-taken date (grouped into contiguous days) instead of
+    /// library-insertion order. Takes effect on the next `load()`.
+    pub fn set_date_view(&self, on: bool) {
+        self.date_view.set(on);
     }
 
     /// Reload the grid from the database using `query`.
@@ -117,14 +136,21 @@ impl LibraryGrid {
         let cache = self.cache.clone();
         let quality = self.quality;
         let thumb_px = self.thumb_px.get();
+        let date_view = self.date_view.get();
         let (tx, rx) = mpsc::channel::<GridMsg>();
 
         // ── Worker thread (unchanged threading model) ─────────────
         std::thread::spawn(move || {
-            let records = match db.lock() {
+            let mut records = match db.lock() {
                 Ok(d) => d.search_images(&query).unwrap_or_default(),
                 Err(_) => return,
             };
+
+            // Re-sort into contiguous day groups (newest day first) so the
+            // date-grouped view can slice `start..start+count` per day.
+            if date_view {
+                records.sort_by_key(|r| Reverse(r.meta.taken_at.unwrap_or(r.added_at)));
+            }
 
             let _ = tx.send(GridMsg::Records(records.clone()));
 
@@ -168,6 +194,7 @@ impl LibraryGrid {
         let timer = Timer::default();
         let slot = self.timer.clone();
         let model = self.model.clone();
+        let date_groups = self.date_groups.clone();
         let records_ref = self.records.clone();
         let generation = self.generation.clone();
 
@@ -185,6 +212,7 @@ impl LibraryGrid {
                     GridMsg::Records(records) => {
                         let placeholders: Vec<ThumbItem> =
                             records.iter().map(placeholder_item).collect();
+                        date_groups.set_vec(build_date_groups(&records));
                         *records_ref.borrow_mut() = records;
                         model.set_vec(placeholders);
                     }
@@ -228,6 +256,33 @@ fn placeholder_item(rec: &LibraryImage) -> ThumbItem {
         stack_size: rec.stack_size.unwrap_or(0) as i32,
         score: SharedString::from(score_caption(rec.search_hit.as_ref())),
     }
+}
+
+/// Group `records` into contiguous same-day runs for the date-grouped view.
+/// Assumes `records` is already sorted so that same-day images are adjacent
+/// (see the `date_view` sort in `load()`); otherwise the same day may appear
+/// as multiple separate groups.
+fn build_date_groups(records: &[LibraryImage]) -> Vec<DateGroup> {
+    let mut groups: Vec<DateGroup> = Vec::new();
+    let mut current_day: Option<i64> = None;
+
+    for (i, rec) in records.iter().enumerate() {
+        let ts = rec.meta.taken_at.unwrap_or(rec.added_at);
+        let day = date::day_number(ts);
+        if current_day != Some(day) {
+            groups.push(DateGroup {
+                label: SharedString::from(date::day_label(ts)),
+                start: i as i32,
+                count: 0,
+            });
+            current_day = Some(day);
+        }
+        if let Some(g) = groups.last_mut() {
+            g.count += 1;
+        }
+    }
+
+    groups
 }
 
 /// Caption shown under a tile during search (empty when not a search hit).
