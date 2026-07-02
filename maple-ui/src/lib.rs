@@ -216,11 +216,12 @@ pub fn run() -> anyhow::Result<()> {
         let grid = grid.clone();
         let w = window.as_weak();
         let current_query = current_query.clone();
-        move |person_id| {
+        move |person_id, name| {
             let q = SearchQuery::default().with_person(person_id as i64);
             *current_query.borrow_mut() = q.clone();
             grid.load(q);
             if let Some(win) = w.upgrade() {
+                win.set_library_filter_name(name);
                 win.set_page(crate::Page::Library);
             }
         }
@@ -244,10 +245,28 @@ pub fn run() -> anyhow::Result<()> {
     window.on_library_shown({
         let grid = grid.clone();
         let current_query = current_query.clone();
+        let w = window.as_weak();
         move || {
             let q = SearchQuery::default();
             *current_query.borrow_mut() = q.clone();
             grid.load(q);
+            if let Some(win) = w.upgrade() {
+                win.set_library_filter_name(SharedString::new());
+            }
+        }
+    });
+
+    window.on_library_filter_cleared({
+        let grid = grid.clone();
+        let current_query = current_query.clone();
+        let w = window.as_weak();
+        move || {
+            let q = SearchQuery::default();
+            *current_query.borrow_mut() = q.clone();
+            grid.load(q);
+            if let Some(win) = w.upgrade() {
+                win.set_library_filter_name(SharedString::new());
+            }
         }
     });
 
@@ -256,10 +275,14 @@ pub fn run() -> anyhow::Result<()> {
         let grid = grid.clone();
         let search_debounce = search_debounce.clone();
         let current_query = current_query.clone();
+        let w = window.as_weak();
         move |text| {
             let grid = grid.clone();
             let current_query = current_query.clone();
             let text = text.to_string();
+            if let Some(win) = w.upgrade() {
+                win.set_library_filter_name(SharedString::new());
+            }
             let timer = Timer::default();
             timer.start(
                 TimerMode::SingleShot,

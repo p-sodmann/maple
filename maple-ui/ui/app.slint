@@ -260,6 +260,10 @@ export component AppWindow inherits Window {
     in property <[DateGroup]>  library-date-groups;
     in-out property <bool>     date-view-on: false;
     in property <length>       library-cell-size: 160px;
+    // Non-empty when the library grid is filtered to one person's photos
+    // (set from the People page); shows "Photos of {name}" + a clear button
+    // in the top bar instead of "All Photos".
+    in property <string>       library-filter-name: "";
 
     // ── Import page state ─────────────────────────────────────────
     in property <string>           import-source-path:  "";
@@ -295,6 +299,7 @@ export component AppWindow inherits Window {
     callback library-shown;
     callback library-search-changed(string);
     callback library-activated(int);
+    callback library-filter-cleared;
 
     callback import-page-shown;
     callback import-browse;
@@ -304,7 +309,7 @@ export component AppWindow inherits Window {
     callback import-start-scan;
 
     callback people-page-shown;
-    callback people-person-activated(int);  // person_id → filter library
+    callback people-person-activated(int, string);  // person_id, name → filter library
     callback people-tag-faces;
 
     callback collections-page-shown;
@@ -581,8 +586,39 @@ export component AppWindow inherits Window {
                         HorizontalLayout {
                             spacing: 8px;
                             alignment: start;
+
+                            // Clear-filter back button — only while filtered
+                            // to one person's photos.
+                            if root.library-filter-name != "": Rectangle {
+                                width: 26px;
+                                height: 26px;
+                                y: (parent.height - self.height) / 2;
+                                border-radius: 8px;
+                                background: filter-back-ta.has-hover ? Theme.field : transparent;
+                                animate background { duration: 80ms; }
+
+                                Path {
+                                    width: 12px;
+                                    height: 12px;
+                                    x: (parent.width - self.width) / 2;
+                                    y: (parent.height - self.height) / 2;
+                                    viewbox-width: 24;
+                                    viewbox-height: 24;
+                                    fill: transparent;
+                                    stroke: filter-back-ta.has-hover ? Theme.ink : Theme.ink-3;
+                                    stroke-width: 2.4px;
+                                    commands: "M16 4L8 12L16 20";
+                                }
+
+                                filter-back-ta := TouchArea {
+                                    clicked => { root.library-filter-cleared(); }
+                                }
+                            }
+
                             Text {
-                                text: "All Photos";
+                                text: root.library-filter-name == ""
+                                    ? "All Photos"
+                                    : "Photos of " + root.library-filter-name;
                                 color: Theme.ink;
                                 font-size: 18px;
                                 font-weight: 700;
@@ -806,6 +842,7 @@ export component AppWindow inherits Window {
                 activated(i)      => { root.library-activated(i); }
             }
 
+
             if root.page == Page.import: ImportPage {
                 vertical-stretch: 1;
                 source-path:   root.import-source-path;
@@ -823,7 +860,7 @@ export component AppWindow inherits Window {
                 vertical-stretch: 1;
                 people: root.people-items;
                 untagged-count: root.people-untagged-count;
-                person-activated(id) => { root.people-person-activated(id); }
+                person-activated(id, name) => { root.people-person-activated(id, name); }
                 tag-faces-clicked    => { root.people-tag-faces(); }
             }
 

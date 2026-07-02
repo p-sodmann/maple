@@ -73,7 +73,7 @@ export component PeoplePage inherits Rectangle {
     in property <[PersonItem]> people;
     in property <int> untagged-count: 0;
 
-    callback person-activated(int);
+    callback person-activated(int, string);
     callback tag-faces-clicked;
 
     background: Theme.bg;
@@ -162,7 +162,7 @@ export component PeoplePage inherits Rectangle {
             x: root.pad + grid-col * root.pitch-x;
             y: root.pad + grid-row * root.pitch-y;
             item: person;
-            activated => { root.person-activated(person.person-id); }
+            activated => { root.person-activated(person.person-id, person.name); }
         }
     }
 }
