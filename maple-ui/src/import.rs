@@ -17,6 +17,7 @@ use std::time::Duration;
 
 use slint::{ComponentHandle, ModelRc, SharedString, Timer, TimerMode, VecModel};
 
+use crate::services::import::{insert_imported_images, ImportEntry};
 use crate::{ImportItem, ImportWindow};
 use crate::thumbnail;
 
@@ -573,21 +574,18 @@ fn build(db: Arc<Mutex<maple_db::Database>>) -> Result<Import, slint::PlatformEr
                                     let _ = imp.save_imported(&library_dir);
                                 }
                                 // Insert display files into library DB.
-                                if let Ok(db_guard) = db2.lock() {
+                                let to_insert: Vec<ImportEntry> = {
                                     let ents = entries2.borrow();
-                                    for &i in &sel_indices {
-                                        if let Some(e) = ents.get(i) {
-                                            if let Ok(meta) = e.path.metadata() {
-                                                let _ = db_guard.insert_image_with_raw(
-                                                    &e.path,
-                                                    &e.content_hash,
-                                                    meta.len(),
-                                                    None,
-                                                );
-                                            }
-                                        }
-                                    }
-                                }
+                                    sel_indices
+                                        .iter()
+                                        .filter_map(|&i| ents.get(i))
+                                        .map(|e| ImportEntry {
+                                            path: e.path.clone(),
+                                            content_hash: e.content_hash,
+                                        })
+                                        .collect()
+                                };
+                                insert_imported_images(&db2, &to_insert);
                                 // Backfill EXIF for the records just inserted.
                                 maple_db::spawn_metadata_filler(db2.clone());
                                 selected2.borrow_mut().clear();

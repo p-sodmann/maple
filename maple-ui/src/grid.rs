@@ -25,6 +25,7 @@ use slint::{
 use maple_db::{LibraryImage, SearchQuery, ThumbnailCache};
 use maple_import::raw_preview_supported;
 
+use crate::services::images::search_library;
 use crate::thumbnail;
 use crate::transforms::{build_date_groups, score_caption};
 use crate::{DateGroup, ThumbItem};
@@ -141,10 +142,7 @@ impl LibraryGrid {
 
         // ── Worker thread (unchanged threading model) ─────────────
         std::thread::spawn(move || {
-            let mut records = match db.lock() {
-                Ok(d) => d.search_images(&query).unwrap_or_default(),
-                Err(_) => return,
-            };
+            let mut records = search_library(&db, &query);
 
             // Re-sort into contiguous day groups (newest day first) so the
             // date-grouped view can slice `start..start+count` per day.

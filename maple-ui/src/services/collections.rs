@@ -1,11 +1,95 @@
-//! Collection-tree query shaping.
+//! Collection queries — DB access + data-shape composition for the
+//! Collections page and the detail-window add-to-collection picker.
 
 use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 
 use slint::SharedString;
 
 use crate::transforms::hex_to_color;
-use crate::CollectionEntry;
+use crate::{CollectionChip, CollectionEntry};
+
+/// Load all collection chips for the add-to-collection picker in the detail
+/// window. Returns an empty Vec on DB error.
+pub fn load_all_collections(db: &Arc<Mutex<maple_db::Database>>) -> Vec<CollectionChip> {
+    db.lock()
+        .ok()
+        .and_then(|g| g.all_collections().ok())
+        .unwrap_or_default()
+        .iter()
+        .map(|c| CollectionChip {
+            id: c.id as i32,
+            name: c.name.clone().into(),
+            color: hex_to_color(&c.color),
+        })
+        .collect()
+}
+
+/// Flattened collection tree for the Collections page list + sidebar.
+pub fn load_entries(db: &Arc<Mutex<maple_db::Database>>) -> Vec<CollectionEntry> {
+    let colls = db
+        .lock()
+        .ok()
+        .and_then(|g| g.all_collections().ok())
+        .unwrap_or_default();
+    flatten_tree(&colls)
+}
+
+/// Detail-panel fields for one collection: name, color, image count, and
+/// its parent's name (empty string if top-level or parent lookup fails).
+pub struct CollectionDetail {
+    pub name: String,
+    pub color: slint::Color,
+    pub image_count: i32,
+    pub parent_name: String,
+}
+
+pub fn load_collection_detail(
+    db: &Arc<Mutex<maple_db::Database>>,
+    id: i32,
+) -> Option<CollectionDetail> {
+    let g = db.lock().ok()?;
+    let c = g.collection_by_id(id as i64).ok().flatten()?;
+    let parent_name = c
+        .parent_id
+        .and_then(|pid| g.collection_by_id(pid).ok().flatten())
+        .map(|p| p.name)
+        .unwrap_or_default();
+    Some(CollectionDetail {
+        name: c.name,
+        color: hex_to_color(&c.color),
+        image_count: c.image_count as i32,
+        parent_name,
+    })
+}
+
+/// Create a collection; `parent_id: None` for top-level. Returns `false` on
+/// DB error (best-effort, matches existing callback behavior).
+pub fn create_collection(
+    db: &Arc<Mutex<maple_db::Database>>,
+    name: &str,
+    hex_color: &str,
+    parent_id: Option<i64>,
+) -> bool {
+    db.lock()
+        .ok()
+        .and_then(|g| g.create_collection(name, hex_color, parent_id).ok())
+        .is_some()
+}
+
+pub fn rename_collection(db: &Arc<Mutex<maple_db::Database>>, id: i64, name: &str) -> bool {
+    db.lock()
+        .ok()
+        .and_then(|g| g.rename_collection(id, name).ok())
+        .is_some()
+}
+
+pub fn delete_collection(db: &Arc<Mutex<maple_db::Database>>, id: i64) -> bool {
+    db.lock()
+        .ok()
+        .and_then(|g| g.delete_collection(id).ok())
+        .is_some()
+}
 
 /// DFS-flatten the collection tree into a display list with depth info.
 ///

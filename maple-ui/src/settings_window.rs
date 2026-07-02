@@ -9,6 +9,7 @@ use std::sync::{Arc, Mutex};
 
 use slint::{ComponentHandle, SharedString};
 
+use crate::services::settings as settings_service;
 use crate::SettingsWindow;
 
 thread_local! {
@@ -64,7 +65,7 @@ fn build(db: Arc<Mutex<maple_db::Database>>) -> Result<SettingsWindow, slint::Pl
         let w = window.as_weak();
         let db = db.clone();
         move || {
-            let result = db.lock().ok().and_then(|g| g.clear_all_ai_descriptions().ok());
+            let result = settings_service::clear_ai_descriptions(&db);
             if let Some(w) = w.upgrade() {
                 let msg = match result {
                     Some(n) => format!("Cleared {n} AI description{}.", if n == 1 { "" } else { "s" }),
@@ -79,7 +80,7 @@ fn build(db: Arc<Mutex<maple_db::Database>>) -> Result<SettingsWindow, slint::Pl
         let w = window.as_weak();
         let db = db.clone();
         move || {
-            let result = db.lock().ok().and_then(|g| g.clear_all_face_data().ok());
+            let result = settings_service::clear_face_data(&db);
             if let Some(w) = w.upgrade() {
                 let msg = match result {
                     Some((faces, persons)) => format!(

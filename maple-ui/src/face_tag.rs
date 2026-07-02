@@ -11,14 +11,16 @@
 //! the queue is exhausted.
 
 use std::cell::{Cell, RefCell};
-use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 
 use slint::{ComponentHandle, Image, Rgb8Pixel, SharedPixelBuffer, SharedString};
 
 use crate::face_crop::extract_crop;
-use crate::face_overlay::{build_suggestions, is_real_detection, EmbeddingMatrix};
+use crate::face_overlay::build_suggestions;
+use crate::services::faces as face_service;
+use crate::services::people::{collect_untagged_faces, UntaggedFace as FaceEntry};
+use crate::transforms::EmbeddingMatrix;
 use crate::FaceTagWindow;
 
 thread_local! {
@@ -27,11 +29,6 @@ thread_local! {
 
 /// Side length of the crop delivered to Slint (pixels, RGB8).
 const CROP_PX: u32 = 480;
-
-struct FaceEntry {
-    path: PathBuf,
-    face: maple_db::FaceDetection,
-}
 
 struct FaceTagCtx {
     window: FaceTagWindow,
@@ -65,7 +62,7 @@ pub fn open(db: Arc<Mutex<maple_db::Database>>) {
         let Some(ctx) = guard.as_ref() else { return };
         *ctx.entries.borrow_mut() = entries;
         ctx.index.set(0);
-        *ctx.known.borrow_mut() = EmbeddingMatrix::build(&db);
+        *ctx.known.borrow_mut() = face_service::load_embedding_matrix(&db);
         load_face(ctx.window.as_weak(), &ctx.entries, &ctx.index, &ctx.known);
         ctx.window.show().unwrap_or_else(|e| tracing::error!("face_tag: show: {e}"));
     });
@@ -125,16 +122,7 @@ fn build(db: Arc<Mutex<maple_db::Database>>) -> Result<FaceTagCtx, slint::Platfo
         let known = known.clone();
         let db = db.clone();
         move |face_id, person_id| {
-            let ok = db.lock().ok().is_some_and(|g| {
-                let r = g.assign_face_to_person(face_id as i64, Some(person_id as i64))
-                    .map_err(|e| tracing::warn!("face_tag: assign_to_person: {e}"))
-                    .is_ok();
-                if r {
-                    let _ = g.update_person_representative(person_id as i64);
-                }
-                r
-            });
-            if ok {
+            if face_service::assign_face_to_person(&db, face_id as i64, person_id as i64) {
                 advance(&w, &entries, &index, &known);
             }
         }
@@ -158,18 +146,7 @@ fn build(db: Arc<Mutex<maple_db::Database>>) -> Result<FaceTagCtx, slint::Platfo
                 .map(|e| e.face.embedding.clone())
                 .unwrap_or_default();
 
-            let result = db.lock().ok().and_then(|g| {
-                let pid = g.upsert_person(&name)
-                    .map_err(|e| tracing::warn!("face_tag: upsert_person: {e}"))
-                    .ok()?;
-                g.assign_face_to_person(face_id as i64, Some(pid))
-                    .map_err(|e| tracing::warn!("face_tag: assign_face: {e}"))
-                    .ok()?;
-                let _ = g.update_person_representative(pid);
-                Some(pid)
-            });
-
-            if let Some(person_id) = result {
+            if let Some(person_id) = face_service::assign_face_to_name(&db, face_id as i64, &name) {
                 known.borrow_mut().add(person_id, name, &embedding);
                 advance(&w, &entries, &index, &known);
             }
@@ -183,9 +160,7 @@ fn build(db: Arc<Mutex<maple_db::Database>>) -> Result<FaceTagCtx, slint::Platfo
         let known = known.clone();
         let db = db.clone();
         move |face_id| {
-            if let Ok(g) = db.lock() {
-                let _ = g.delete_face_detection(face_id as i64);
-            }
+            face_service::delete_face(&db, face_id as i64);
             advance(&w, &entries, &index, &known);
         }
     });
@@ -197,9 +172,7 @@ fn build(db: Arc<Mutex<maple_db::Database>>) -> Result<FaceTagCtx, slint::Platfo
         let known = known.clone();
         let db = db.clone();
         move |face_id| {
-            if let Ok(g) = db.lock() {
-                let _ = g.mark_face_skipped(face_id as i64, true);
-            }
+            face_service::skip_face(&db, face_id as i64);
             advance(&w, &entries, &index, &known);
         }
     });
@@ -264,20 +237,3 @@ fn load_face(
     });
 }
 
-// ── Data loading ───────────────────────────────────────────────────
-
-/// Collect every real untagged non-skipped face across all present images.
-fn collect_untagged_faces(db: &Arc<Mutex<maple_db::Database>>) -> Vec<FaceEntry> {
-    let Ok(guard) = db.lock() else { return vec![] };
-    let image_ids = guard.images_with_untagged_faces().unwrap_or_default();
-    let mut out = Vec::new();
-    for image_id in image_ids {
-        let Some(img) = guard.image_by_id(image_id).ok().flatten() else { continue };
-        for face in guard.faces_for_image(image_id).unwrap_or_default() {
-            if face.person_id.is_none() && !face.skipped && is_real_detection(&face) {
-                out.push(FaceEntry { path: img.path.clone(), face });
-            }
-        }
-    }
-    out
-}

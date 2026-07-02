@@ -19,11 +19,12 @@ use slint::{ComponentHandle, ModelRc, SharedString, VecModel};
 use maple_db::{FaceDetection, LibraryImage};
 
 use crate::face_overlay::{
-    self, assign_to_name, assign_to_person, build_face_boxes, build_suggestions, delete_face,
-    insert_new_face, EmbeddingMatrix,
+    assign_to_name, assign_to_person, build_face_boxes, build_suggestions, delete_face,
+    insert_new_face,
 };
 use crate::image_loader;
-use crate::transforms::{format_unix_ts, hex_to_color, truncate_value};
+use crate::services::images as image_service;
+use crate::transforms::{format_unix_ts, is_real_detection, truncate_value, EmbeddingMatrix};
 use crate::{CollectionChip, DetailWindow, ImageInfoRow};
 
 thread_local! {
@@ -194,7 +195,7 @@ fn build(db: Arc<Mutex<maple_db::Database>>) -> Result<Detail, slint::PlatformEr
         let db = db.clone();
         move || {
             let Some(w) = w.upgrade() else { return };
-            let chips = crate::collections_window::all_chips(&db);
+            let chips = crate::services::collections::load_all_collections(&db);
             w.set_available_collections(ModelRc::from(Rc::new(VecModel::from(chips))));
             w.set_add_coll_panel_open(true);
         }
@@ -280,7 +281,7 @@ fn build(db: Arc<Mutex<maple_db::Database>>) -> Result<Detail, slint::PlatformEr
             let face_id = {
                 let f = faces.borrow();
                 f.iter().find_map(|face| {
-                    if !face_overlay::is_real_detection(face) {
+                    if !is_real_detection(face) {
                         return None;
                     }
                     let [x1, y1, x2, y2] = face.bbox;
@@ -319,7 +320,7 @@ fn build(db: Arc<Mutex<maple_db::Database>>) -> Result<Detail, slint::PlatformEr
         move |face_id, person_id| {
             let Some(w) = w.upgrade() else { return };
             if assign_to_person(face_id as i64, person_id as i64, &mut faces.borrow_mut(), &db) {
-                let boxes = build_face_boxes(&faces.borrow(), &db, &known_embeddings.borrow());
+                let boxes = build_face_boxes(&faces.borrow(), &known_embeddings.borrow());
                 w.set_face_boxes(boxes);
                 w.set_face_panel_open(false);
             }
@@ -346,7 +347,7 @@ fn build(db: Arc<Mutex<maple_db::Database>>) -> Result<Detail, slint::PlatformEr
             )
             .is_some()
             {
-                let boxes = build_face_boxes(&faces.borrow(), &db, &known_embeddings.borrow());
+                let boxes = build_face_boxes(&faces.borrow(), &known_embeddings.borrow());
                 w.set_face_boxes(boxes);
                 w.set_face_panel_open(false);
                 w.set_face_name_entry(SharedString::new());
@@ -362,7 +363,7 @@ fn build(db: Arc<Mutex<maple_db::Database>>) -> Result<Detail, slint::PlatformEr
         move |face_id| {
             let Some(w) = w.upgrade() else { return };
             delete_face(face_id as i64, &mut faces.borrow_mut(), &db);
-            let boxes = build_face_boxes(&faces.borrow(), &db, &known_embeddings.borrow());
+            let boxes = build_face_boxes(&faces.borrow(), &known_embeddings.borrow());
             w.set_face_boxes(boxes);
             w.set_face_panel_open(false);
         }
@@ -403,7 +404,7 @@ fn build(db: Arc<Mutex<maple_db::Database>>) -> Result<Detail, slint::PlatformEr
             }
             let bbox = [bx1, by1, bx2, by2];
             if let Some(face_id) = insert_new_face(iid, bbox, &mut faces.borrow_mut(), &db) {
-                let boxes = build_face_boxes(&faces.borrow(), &db, &known_embeddings.borrow());
+                let boxes = build_face_boxes(&faces.borrow(), &known_embeddings.borrow());
                 w.set_face_boxes(boxes);
                 // Immediately open the assignment panel for the new box.
                 let sugs = build_suggestions(&[], &known_embeddings.borrow());
@@ -543,14 +544,10 @@ fn build_info_rows(
     }
 
     // ── AI descriptions ─────────────────────────────────────────────
-    let ai_descs = db
-        .lock()
-        .ok()
-        .and_then(|g| g.ai_descriptions_for_image(rec.id).ok())
-        .unwrap_or_default();
-    if !ai_descs.is_empty() {
+    let info = image_service::load_image_info_data(db, rec.id);
+    if !info.ai_descriptions.is_empty() {
         rows.push(section("AI DESCRIPTION"));
-        for (model_id, desc) in ai_descs {
+        for (model_id, desc) in info.ai_descriptions {
             rows.push(row(&model_id, desc));
         }
     }
@@ -565,11 +562,7 @@ fn build_info_rows(
     }
 
     // ── All EXIF (comprehensive, collapsible) ─────────────────────────
-    let exif_tags = db
-        .lock()
-        .ok()
-        .and_then(|g| g.exif_tags_for_image(rec.id).ok())
-        .unwrap_or_default();
+    let exif_tags = info.exif_tags;
     if !exif_tags.is_empty() {
         rows.push(ImageInfoRow {
             label: format!(
@@ -602,22 +595,18 @@ fn show_record(window: &DetailWindow, nav: &NavState) {
 
     let filename = rec.meta.filename.clone().unwrap_or_else(|| "Image".to_owned());
     window.set_filename(filename.into());
-    window.set_collection_chips(load_chips(db, rec.id));
     window.set_error_text(SharedString::new());
     window.set_loading(true);
     window.set_face_panel_open(false);
     window.invoke_reset_view();
 
-    // Load face detections for this image.
+    // Load face detections, embeddings, and collection chips for this image.
     nav.current_image_id.set(rec.id);
-    let new_faces = db
-        .lock()
-        .ok()
-        .and_then(|g| g.faces_for_image(rec.id).ok())
-        .unwrap_or_default();
-    *nav.faces.borrow_mut() = new_faces;
-    *nav.known_embeddings.borrow_mut() = EmbeddingMatrix::build(db);
-    let boxes = build_face_boxes(&nav.faces.borrow(), db, &nav.known_embeddings.borrow());
+    let detail = image_service::load_image_detail(db, rec.id);
+    window.set_collection_chips(chips_model(detail.collection_chips));
+    *nav.faces.borrow_mut() = detail.faces;
+    *nav.known_embeddings.borrow_mut() = detail.embeddings;
+    let boxes = build_face_boxes(&nav.faces.borrow(), &nav.known_embeddings.borrow());
     window.set_face_boxes(boxes);
 
     // Populate the info popup rows (works whether the panel is open or closed).
@@ -641,20 +630,9 @@ fn refresh_info_rows(window: &DetailWindow, nav: &NavState) {
 
 /// Load the current image's collection memberships as chip data.
 fn load_chips(db: &Arc<Mutex<maple_db::Database>>, image_id: i64) -> ModelRc<CollectionChip> {
-    let collections = db
-        .lock()
-        .ok()
-        .and_then(|d| d.collections_for_image(image_id).ok())
-        .unwrap_or_default();
+    chips_model(image_service::load_collection_chips(db, image_id))
+}
 
-    let chips: Vec<CollectionChip> = collections
-        .iter()
-        .map(|c| CollectionChip {
-            id: c.id as i32,
-            name: c.name.clone().into(),
-            color: hex_to_color(&c.color),
-        })
-        .collect();
-
+fn chips_model(chips: Vec<CollectionChip>) -> ModelRc<CollectionChip> {
     ModelRc::from(Rc::new(VecModel::from(chips)))
 }

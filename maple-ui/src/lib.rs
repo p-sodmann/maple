@@ -16,7 +16,6 @@ use maple_db::SearchQuery;
 slint::include_modules!();
 
 mod collections_page;
-mod collections_window;
 mod date;
 mod detail;
 mod face_crop;
@@ -167,7 +166,7 @@ pub fn run() -> anyhow::Result<()> {
                 color.blue(),
             );
             let pid = if parent_id >= 0 { Some(parent_id as i64) } else { None };
-            let _ = db.lock().ok().and_then(|g| g.create_collection(&name, &hex, pid).ok());
+            services::collections::create_collection(&db, &name, &hex, pid);
             if let Some(win) = w.upgrade() {
                 collections_page::reload(&win, &db);
             }
@@ -178,7 +177,7 @@ pub fn run() -> anyhow::Result<()> {
         let db = db.clone();
         let w = window.as_weak();
         move |id| {
-            let _ = db.lock().ok().and_then(|g| g.delete_collection(id as i64).ok());
+            services::collections::delete_collection(&db, id as i64);
             if let Some(win) = w.upgrade() {
                 collections_page::reload(&win, &db);
                 collections_page::clear_detail(&win);
@@ -192,7 +191,7 @@ pub fn run() -> anyhow::Result<()> {
         move |id, name| {
             let name = name.trim().to_string();
             if name.is_empty() { return; }
-            let _ = db.lock().ok().and_then(|g| g.rename_collection(id as i64, &name).ok());
+            services::collections::rename_collection(&db, id as i64, &name);
             if let Some(win) = w.upgrade() {
                 collections_page::reload_keep_sel(&win, &db);
             }

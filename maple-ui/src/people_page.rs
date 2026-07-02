@@ -18,6 +18,7 @@ use slint::{Image, Model, ModelRc, Rgb8Pixel, SharedPixelBuffer, VecModel};
 use std::rc::Rc;
 
 use crate::face_crop::extract_crop;
+use crate::services::people as people_service;
 use crate::{AppWindow, PersonItem};
 
 const CROP_PX: u32 = 240;
@@ -48,10 +49,7 @@ impl PeoplePage {
     ///
     /// Must be called from the Slint event-loop thread.
     pub fn load(&self, window: slint::Weak<AppWindow>) {
-        let persons = {
-            let Ok(g) = self.db.lock() else { return };
-            g.all_persons_with_representatives().unwrap_or_default()
-        };
+        let persons = people_service::load_all_persons(&self.db);
 
         // Build placeholder items, filling in any already-cached crops
         // synchronously so revisiting the page doesn't flash blank tiles.
@@ -130,11 +128,7 @@ impl PeoplePage {
     }
 
     pub fn untagged_count(&self) -> usize {
-        self.db
-            .lock()
-            .ok()
-            .and_then(|g| g.untagged_face_count().ok())
-            .unwrap_or(0)
+        people_service::load_untagged_face_count(&self.db)
     }
 }
 

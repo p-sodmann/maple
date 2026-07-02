@@ -10,9 +10,8 @@ use slint::{Image, ModelRc, Rgb8Pixel, SharedPixelBuffer, SharedString, VecModel
 
 use maple_db::{SearchQuery, ThumbnailCache};
 
-use crate::services::collections::flatten_tree;
+use crate::services::collections::{self, load_entries};
 use crate::thumbnail;
-use crate::transforms::hex_to_color;
 use crate::{AppWindow, CollectionEntry, ThumbItem};
 
 /// `(rgb_bytes_w_h, filename, image_id)` — Send-safe thumbnail payload
@@ -43,17 +42,11 @@ pub fn reload_keep_sel(window: &AppWindow, db: &Arc<Mutex<maple_db::Database>>) 
 
 /// Push detail properties for one collection (no thumbnail load).
 pub fn push_detail(window: &AppWindow, db: &Arc<Mutex<maple_db::Database>>, id: i32) {
-    if let Ok(g) = db.lock() {
-        if let Some(c) = g.collection_by_id(id as i64).ok().flatten() {
-            window.set_collections_sel_name(SharedString::from(c.name));
-            window.set_collections_sel_color(hex_to_color(&c.color));
-            window.set_collections_sel_count(c.image_count as i32);
-            let parent_name = c.parent_id
-                .and_then(|pid| g.collection_by_id(pid).ok().flatten())
-                .map(|p| p.name)
-                .unwrap_or_default();
-            window.set_collections_sel_parent_name(SharedString::from(parent_name));
-        }
+    if let Some(d) = collections::load_collection_detail(db, id) {
+        window.set_collections_sel_name(SharedString::from(d.name));
+        window.set_collections_sel_color(d.color);
+        window.set_collections_sel_count(d.image_count);
+        window.set_collections_sel_parent_name(SharedString::from(d.parent_name));
     }
 }
 
@@ -136,15 +129,6 @@ pub fn load_thumbs(
 }
 
 // ── Internals ─────────────────────────────────────────────────────
-
-fn load_entries(db: &Arc<Mutex<maple_db::Database>>) -> Vec<CollectionEntry> {
-    let colls = db
-        .lock()
-        .ok()
-        .and_then(|g| g.all_collections().ok())
-        .unwrap_or_default();
-    flatten_tree(&colls)
-}
 
 fn make_model(entries: Vec<CollectionEntry>) -> ModelRc<CollectionEntry> {
     ModelRc::from(Rc::new(VecModel::from(entries)))
