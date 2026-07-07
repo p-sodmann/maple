@@ -11,7 +11,7 @@
 
 use std::path::Path;
 
-use redb::{Database, TableDefinition};
+use redb::{Database, ReadableDatabase, TableDefinition};
 
 const THUMBS: TableDefinition<&[u8], &[u8]> = TableDefinition::new("thumbs");
 
@@ -22,10 +22,22 @@ pub struct ThumbnailCache {
 impl ThumbnailCache {
     /// Open (or create) the cache at `dir/thumbs.redb`.
     ///
-    /// `dir` is created automatically if it does not exist.
+    /// `dir` is created automatically if it does not exist. A file left behind
+    /// by an older, file-format-incompatible `redb` release (e.g. the v2→v3
+    /// format break between redb 2.x and 3.x) is treated as disposable — since
+    /// entries are keyed by content hash, discarding it just means the next
+    /// thumbnail requests are cache misses — so it is deleted and recreated
+    /// rather than permanently redirecting this session to a fallback path.
     pub fn open(dir: &Path) -> anyhow::Result<Self> {
         std::fs::create_dir_all(dir)?;
-        let db = Database::create(dir.join("thumbs.redb"))?;
+        let path = dir.join("thumbs.redb");
+        let db = match Database::create(&path) {
+            Err(redb::DatabaseError::UpgradeRequired(_)) => {
+                std::fs::remove_file(&path)?;
+                Database::create(&path)?
+            }
+            other => other?,
+        };
         {
             let wtxn = db.begin_write()?;
             wtxn.open_table(THUMBS)?;

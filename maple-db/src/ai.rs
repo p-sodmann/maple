@@ -63,9 +63,10 @@ impl LmStudioDescriber {
     /// e.g. `http://localhost:1234`.  The `/v1/chat/completions` path is
     /// appended automatically.
     pub fn new(server_url: &str, model: &str, prompt: &str) -> Self {
-        let agent = ureq::AgentBuilder::new()
-            .timeout(Duration::from_secs(120))
+        let config = ureq::Agent::config_builder()
+            .timeout_global(Some(Duration::from_secs(120)))
             .build();
+        let agent: ureq::Agent = config.into();
         Self {
             endpoint: format!("{}/v1/chat/completions", server_url.trim_end_matches('/')),
             model: model.to_owned(),
@@ -100,9 +101,9 @@ impl AiDescriber for LmStudioDescriber {
         let response: serde_json::Value = self
             .agent
             .post(&self.endpoint)
-            .set("Content-Type", "application/json")
             .send_json(body)?
-            .into_json()?;
+            .body_mut()
+            .read_json()?;
 
         let description = response["choices"][0]["message"]["content"]
             .as_str()

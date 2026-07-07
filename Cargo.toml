@@ -22,8 +22,9 @@ slint = { version = "1.17", default-features = false, features = ["std", "compat
 slint-build = "1.17"
 
 # Native file dialogs — xdg-portal backend (NOT the default GTK3 backend) keeps
-# the Linux build GTK-free; async-std drives the portal calls off the main loop.
-rfd = { version = "0.15", default-features = false, features = ["xdg-portal", "async-std"] }
+# the Linux build GTK-free; xdg-portal pulls in pollster to drive the portal
+# calls off the main loop (replaces the async-std backend rfd dropped in 0.16).
+rfd = { version = "0.17", default-features = false, features = ["xdg-portal"] }
 
 # Open files/URLs in the platform's default application (external-app launch).
 open = "5"
@@ -40,19 +41,19 @@ ort = { version = "=2.0.0-rc.12", default-features = false }
 
 # Image
 image = "0.25"
-fast_image_resize = "5"
-kamadak-exif = "0.5"
+fast_image_resize = "6"
+kamadak-exif = "0.6"
 zune-jpeg = "0.5"
 
 # Benchmarking
-criterion = { version = "0.5", features = ["html_reports"] }
+criterion = { version = "0.8", features = ["html_reports"] }
 
 # Data
 ndarray = "0.17.2"
-rusqlite = { version = "0.32", features = ["bundled"] }
+rusqlite = { version = "0.40", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-toml = "0.8"
+toml = "1"
 blake3 = "1"
 
 # Semantic search
@@ -75,10 +76,10 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 anyhow = "1"
 
 # HTTP (blocking, for AI API calls)
-ureq = { version = "2", features = ["json"] }
+ureq = { version = "3", features = ["json"] }
 
 # Thumbnail cache
-redb = "2"
+redb = "4"
 webp = "0.3"
 
 # Encoding
@@ -88,7 +89,7 @@ base64 = "0.22"
 image_hasher = "3"
 
 # Platform directories
-directories = "5"
+directories = "6"
 
 # Cross-platform path normalisation (forward-slash UTF-8 for SQLite storage)
 path-slash = "0.2"
