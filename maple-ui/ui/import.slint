@@ -26,6 +26,7 @@ export struct ImportItem {
     loaded: bool,
     is-selected: bool,
     is-imported: bool,   // already present in the library
+    stack-size: int,     // >=2 when this photo belongs to a detected burst group
 }
 
 // ── Thumbnail grid (mirrors LibraryGridView) ──────────────────────
@@ -42,9 +43,8 @@ component ImportGridView {
     property <length> tile-h: root.cell-size + root.label-h;
     property <length> pitch-x: root.cell-size + root.gap;
     property <length> pitch-y: root.tile-h + root.gap;
-    property <float> columns: Math.max(1, Math.floor(
-        (sv.visible-width - 2 * root.pad + root.gap) / (root.cell-size + root.gap)
-    ));
+    // Single column — one thumbnail per row.
+    property <float> columns: 1;
     property <float> row-count: Math.ceil(root.items.length / root.columns);
 
     sv := ScrollView {
@@ -119,6 +119,23 @@ component ImportGridView {
                         }
                     }
 
+                    if item.stack-size >= 2: Rectangle {
+                        x: 4px;
+                        y: 4px;
+                        width: 34px;
+                        height: 18px;
+                        border-radius: 9px;
+                        background: #000000.with-alpha(0.55);
+                        Text {
+                            text: "⊞ \{item.stack-size}";
+                            color: white;
+                            font-size: 11px;
+                            font-weight: 700;
+                            horizontal-alignment: center;
+                            vertical-alignment: center;
+                        }
+                    }
+
                     if ta.has-hover: Rectangle {
                         border-radius: Theme.thumb-radius;
                         border-width: 2px;
@@ -169,6 +186,8 @@ export component ImportWindow inherits Window {
     in property <int> total-count: 0;
     in property <string> status-text: "Pick a source folder to begin.";
     in property <bool> copying: false;
+    in property <bool> copy-done: false;
+    in property <bool> rotating: false;
 
     callback close-requested;
     callback pick-source;
@@ -178,6 +197,8 @@ export component ImportWindow inherits Window {
     callback copy-selected;
     callback nav-prev;
     callback nav-next;
+    // rotate(clockwise): true = 90° CW, false = 90° CCW.
+    callback rotate(bool);
 
     init => { key-scope.focus(); }
 
@@ -197,6 +218,10 @@ export component ImportWindow inherits Window {
                 }
                 if event.text == Key.RightArrow || event.text == Key.DownArrow {
                     root.nav-next();
+                    return accept;
+                }
+                if event.text == "x" || event.text == "X" {
+                    root.item-clicked(root.current-index);
                     return accept;
                 }
             }
@@ -240,10 +265,36 @@ export component ImportWindow inherits Window {
                         vertical-alignment: center;
                     }
 
-                    if root.in-browser: FlatButton {
-                        text: root.copying ? "Copying…" : "Copy Selected";
-                        enabled: root.selected-count > 0 && !root.copying;
-                        clicked => { root.copy-selected(); }
+                    if root.in-browser: Rectangle {
+                        border-radius: Theme.radius-btn;
+                        background: root.copy-done
+                            ? Theme.success
+                            : (root.selected-count > 0 && !root.copying
+                                ? (copy-ta.has-hover ? Theme.accent.darker(0.12) : Theme.accent)
+                                : Theme.placeholder-bg);
+                        animate background { duration: 120ms; }
+
+                        HorizontalLayout {
+                            padding-left: 14px;
+                            padding-right: 14px;
+                            Text {
+                                text: root.copy-done
+                                    ? "Copying done"
+                                    : (root.copying ? "Copying…" : "Copy Selected");
+                                color: root.copy-done || (root.selected-count > 0 && !root.copying)
+                                    ? Theme.accent-fg
+                                    : Theme.dim-fg;
+                                font-size: 13px;
+                                font-weight: 600;
+                                vertical-alignment: center;
+                                horizontal-alignment: center;
+                            }
+                        }
+
+                        copy-ta := TouchArea {
+                            enabled: root.selected-count > 0 && !root.copying;
+                            clicked => { root.copy-selected(); }
+                        }
                     }
                 }
             }
@@ -356,6 +407,16 @@ export component ImportWindow inherits Window {
                                 text: "›";
                                 clicked => { root.nav-next(); }
                             }
+                            FlatButton {
+                                text: "↺";
+                                enabled: !root.rotating;
+                                clicked => { root.rotate(false); }
+                            }
+                            FlatButton {
+                                text: "↻";
+                                enabled: !root.rotating;
+                                clicked => { root.rotate(true); }
+                            }
                         }
                     }
                 }
@@ -372,7 +433,7 @@ export component ImportWindow inherits Window {
                         vertical-stretch: 1;
                         items: root.items;
                         current-index: root.current-index;
-                        cell-size: 100px;
+                        cell-size: 236px;
                         clicked(i) => { root.item-clicked(i); }
                     }
 

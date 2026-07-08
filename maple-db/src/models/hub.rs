@@ -56,7 +56,7 @@ pub fn fetch_sentence_model(
 
 /// Download (or reuse the cached copy of) a single ONNX vision model file.
 ///
-/// - `repo` — HuggingFace repo id, e.g. `"facebook/dinov2-with-registers-base"`.
+/// - `repo` — HuggingFace repo id, e.g. `"onnx-community/dinov2-small"`.
 /// - `onnx_file` — model path within the repo, e.g. `"onnx/model.onnx"`.
 ///
 /// Returns the local path to the cached ONNX file.  This is a blocking network

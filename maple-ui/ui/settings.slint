@@ -102,6 +102,7 @@ export component SettingsWindow inherits Window {
     callback clear-ai-descriptions;
     callback clear-thumbnail-cache;
     callback delete-all-face-data;
+    callback open-debug-compare;
 
     init => { key-scope.focus(); }
 
@@ -303,6 +304,10 @@ export component SettingsWindow inherits Window {
                                     root.confirm-action-label = "Delete Everything";
                                     root.confirm-open = true;
                                 }
+                            }
+                            ActionButton {
+                                text: "Compare Embeddings";
+                                clicked => { root.open-debug-compare(); }
                             }
                             Rectangle { horizontal-stretch: 1; }
                         }

@@ -13,8 +13,7 @@ use std::collections::{hash_map::Entry, HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
 use anyhow::Result;
-use maple_import::ImageHash;
-use maple_state::{StackMode, StackSettings};
+use maple_state::StackSettings;
 use tracing::{info, warn};
 
 use crate::{lock_db, Database};
@@ -70,12 +69,9 @@ pub fn update_stacks(
     // Compare each new image against ALL images to find similarity edges.
     //
     // FIXME: For large libraries this is still O(new × n) per call.  A future
-    // optimisation could use a spatial index (BK-tree for pHash, HNSW for
-    // embeddings) to cut this to O(new × log n).
-    let edges = match settings.mode {
-        StackMode::PHash => new_vs_all_phash(&rows, &new_set, settings.hash_size, settings.threshold),
-        StackMode::Onnx  => new_vs_all_onnx(&rows, &new_set, settings.threshold),
-    };
+    // optimisation could use a spatial index (e.g. HNSW) to cut this to
+    // O(new × log n).
+    let edges = new_vs_all_onnx(&rows, &new_set, settings.threshold);
 
     if edges.is_empty() {
         return Ok(0);
@@ -163,37 +159,6 @@ fn uf_union(parent: &mut [usize], rank: &mut [u8], a: usize, b: usize) {
 
 // ── Edge discovery: new images vs all ────────────────────────────────────────
 
-fn new_vs_all_phash(
-    rows: &[(i64, Vec<u8>, Option<i64>)],
-    new_set: &HashSet<i64>,
-    hash_size: u32,
-    threshold: f32,
-) -> Vec<(usize, usize)> {
-    let hashes: Vec<(usize, i64, Option<ImageHash>)> = rows
-        .iter()
-        .enumerate()
-        .map(|(i, (id, blob, _))| (i, *id, ImageHash::from_bytes(blob).ok()))
-        .collect();
-
-    let mut edges = Vec::new();
-    for &(i, id_i, ref h_i) in &hashes {
-        if !new_set.contains(&id_i) {
-            continue;
-        }
-        let Some(h_i) = h_i else { continue };
-        for &(j, _, ref h_j) in &hashes {
-            if i == j {
-                continue;
-            }
-            let Some(h_j) = h_j else { continue };
-            if maple_import::phash_similarity(h_i, h_j, hash_size) >= threshold {
-                edges.push((i, j));
-            }
-        }
-    }
-    edges
-}
-
 fn new_vs_all_onnx(
     rows: &[(i64, Vec<u8>, Option<i64>)],
     new_set: &HashSet<i64>,
@@ -228,6 +193,38 @@ fn new_vs_all_onnx(
     edges
 }
 
+// ── From-scratch clustering (no DB) ───────────────────────────────────────────
+
+/// Cluster `embeddings` via a threshold union-find over cosine similarity.
+///
+/// Unlike [`update_stacks`], this does a full O(n²) all-pairs comparison —
+/// intended for a one-off, from-scratch grouping (e.g. photos on an SD card
+/// that aren't in the DB yet), not the DB's incremental new-vs-all update.
+///
+/// Returns clusters (each a list of indices into `embeddings`) with 2 or
+/// more members; singletons are omitted.
+pub fn cluster_embeddings(embeddings: &[Vec<f32>], threshold: f32) -> Vec<Vec<usize>> {
+    let n = embeddings.len();
+    let mut parent: Vec<usize> = (0..n).collect();
+    let mut rank: Vec<u8> = vec![0; n];
+
+    for i in 0..n {
+        for j in (i + 1)..n {
+            if crate::models::image_cosine_similarity(&embeddings[i], &embeddings[j]) >= threshold {
+                uf_union(&mut parent, &mut rank, i, j);
+            }
+        }
+    }
+
+    let mut clusters: HashMap<usize, Vec<usize>> = HashMap::new();
+    for i in 0..n {
+        let root = uf_find(&mut parent, i);
+        clusters.entry(root).or_default().push(i);
+    }
+
+    clusters.into_values().filter(|c| c.len() >= 2).collect()
+}
+
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -236,11 +233,11 @@ mod tests {
     use crate::Database;
     use std::path::PathBuf;
 
-    const ALG: &str = "phash:8";
+    const ALG: &str = "onnx:test-model";
 
-    // pHash similarity for hash_size=8: similarity = (64 - hamming_distance) / 64.
-    // [0xFF; 8] vs [0xFF; 8] → dist=0  → sim=1.00  (match above threshold 0.90)
-    // [0xFF; 8] vs [0x00; 8] → dist=64 → sim=0.00  (no match)
+    // Cosine similarity of unit vectors, threshold 0.90 (StackSettings default):
+    // [1.0, 0.0] vs [1.0, 0.0] → sim=1.00 (identical, match)
+    // [1.0, 0.0] vs [0.0, 1.0] → sim=0.00 (orthogonal, no match)
 
     fn tmp_db() -> (tempfile::TempDir, Arc<Mutex<Database>>) {
         let dir = tempfile::tempdir().unwrap();
@@ -252,8 +249,8 @@ mod tests {
         StackSettings::default()
     }
 
-    /// Insert an image and store a known pHash blob. Returns the DB image id.
-    fn seed(db: &Arc<Mutex<Database>>, path: &str, hash_blob: [u8; 8]) -> i64 {
+    /// Insert an image and store a known embedding. Returns the DB image id.
+    fn seed(db: &Arc<Mutex<Database>>, path: &str, embedding: [f32; 2]) -> i64 {
         let p = PathBuf::from(path);
         let guard = db.lock().unwrap();
         guard.insert_image(&p, &[0u8; 32], 1024).unwrap();
@@ -264,7 +261,8 @@ mod tests {
             .find(|r| r.path == p)
             .unwrap()
             .id;
-        guard.insert_image_hash(id, ALG, &hash_blob).unwrap();
+        let blob: Vec<u8> = embedding.iter().flat_map(|f| f.to_le_bytes()).collect();
+        guard.insert_image_hash(id, ALG, &blob).unwrap();
         id
     }
 
@@ -281,8 +279,8 @@ mod tests {
     #[test]
     fn two_new_similar_images_form_stack() {
         let (_dir, db) = tmp_db();
-        let a = seed(&db, "/photos/a.jpg", [0xFF; 8]);
-        let b = seed(&db, "/photos/b.jpg", [0xFF; 8]);
+        let a = seed(&db, "/photos/a.jpg", [1.0, 0.0]);
+        let b = seed(&db, "/photos/b.jpg", [1.0, 0.0]);
 
         let created = update_stacks(&db, ALG, &[a, b], &settings()).unwrap();
 
@@ -296,12 +294,12 @@ mod tests {
     #[test]
     fn new_image_joins_existing_stack() {
         let (_dir, db) = tmp_db();
-        let a = seed(&db, "/photos/a.jpg", [0xFF; 8]);
-        let b = seed(&db, "/photos/b.jpg", [0xFF; 8]);
+        let a = seed(&db, "/photos/a.jpg", [1.0, 0.0]);
+        let b = seed(&db, "/photos/b.jpg", [1.0, 0.0]);
         update_stacks(&db, ALG, &[a, b], &settings()).unwrap();
         let existing_sid = stack_of(&db, a).unwrap();
 
-        let c = seed(&db, "/photos/c.jpg", [0xFF; 8]);
+        let c = seed(&db, "/photos/c.jpg", [1.0, 0.0]);
         let created = update_stacks(&db, ALG, &[c], &settings()).unwrap();
 
         assert_eq!(created, 0, "no new stack created — c joins the existing one");
@@ -314,8 +312,8 @@ mod tests {
     #[test]
     fn dissimilar_new_image_stays_unstacked() {
         let (_dir, db) = tmp_db();
-        let a = seed(&db, "/photos/a.jpg", [0xFF; 8]);
-        let b = seed(&db, "/photos/b.jpg", [0x00; 8]);
+        let a = seed(&db, "/photos/a.jpg", [1.0, 0.0]);
+        let b = seed(&db, "/photos/b.jpg", [0.0, 1.0]);
 
         let created = update_stacks(&db, ALG, &[a, b], &settings()).unwrap();
 
@@ -327,17 +325,38 @@ mod tests {
     #[test]
     fn existing_stacks_unaffected_by_unrelated_new_image() {
         let (_dir, db) = tmp_db();
-        let a = seed(&db, "/photos/a.jpg", [0xFF; 8]);
-        let b = seed(&db, "/photos/b.jpg", [0xFF; 8]);
+        let a = seed(&db, "/photos/a.jpg", [1.0, 0.0]);
+        let b = seed(&db, "/photos/b.jpg", [1.0, 0.0]);
         update_stacks(&db, ALG, &[a, b], &settings()).unwrap();
         let existing_sid = stack_of(&db, a).unwrap();
 
-        // d has a completely different hash — no similarity to a or b.
-        let d = seed(&db, "/photos/d.jpg", [0x00; 8]);
+        // d has an orthogonal embedding — no similarity to a or b.
+        let d = seed(&db, "/photos/d.jpg", [0.0, 1.0]);
         update_stacks(&db, ALG, &[d], &settings()).unwrap();
 
         assert_eq!(stack_of(&db, a), Some(existing_sid), "a unaffected");
         assert_eq!(stack_of(&db, b), Some(existing_sid), "b unaffected");
         assert!(stack_of(&db, d).is_none(), "d has no similar partner");
+    }
+
+    #[test]
+    fn cluster_embeddings_groups_similar_and_omits_singletons() {
+        let embeddings = vec![
+            vec![1.0, 0.0], // 0: identical to 1
+            vec![1.0, 0.0], // 1
+            vec![0.0, 1.0], // 2: orthogonal to everything, no partner
+        ];
+
+        let clusters = cluster_embeddings(&embeddings, 0.90);
+
+        assert_eq!(clusters.len(), 1, "only the 0/1 pair should form a cluster");
+        let mut cluster = clusters[0].clone();
+        cluster.sort_unstable();
+        assert_eq!(cluster, vec![0, 1]);
+    }
+
+    #[test]
+    fn cluster_embeddings_empty_input_returns_no_clusters() {
+        assert!(cluster_embeddings(&[], 0.90).is_empty());
     }
 }

@@ -26,8 +26,8 @@ pub mod stacker;
 pub use ai::{spawn_ai_tagger, AiDescriber, AiTagger, LmStudioDescriber};
 pub use metadata::rotate_image_file;
 pub use collections::Collection;
-pub use hasher::spawn_hasher;
-pub use stacker::update_stacks;
+pub use hasher::{load_onnx_embedder, spawn_hasher};
+pub use stacker::{cluster_embeddings, update_stacks};
 pub use face_detector::{spawn_face_tagger, DetectedFace, FaceDetector, FaceTagger};
 pub use faces::{best_person_match, best_person_matches, cosine_similarity, FaceDetection, Person, PersonWithRep};
 pub use metadata::{extract_all_exif_tags, extract_metadata, spawn_metadata_filler, ImageMetadata};
@@ -1061,12 +1061,11 @@ impl Database {
         Ok(result)
     }
 
-    /// Compute perceptual similarity between two images under `algorithm`.
+    /// Compute cosine similarity between two images' stored embeddings under
+    /// `algorithm`.
     ///
-    /// Returns `None` if either image has no stored hash for that algorithm.
-    /// Algorithm prefix determines comparison method:
-    ///   `"phash:N"` → normalised Hamming distance (fraction of bits that agree).
-    ///   `"onnx:…"`  → cosine similarity of the stored float embeddings.
+    /// Returns `None` if either image has no stored embedding for that
+    /// algorithm.
     pub fn similarity_for_images(
         &self,
         id_a: i64,
@@ -1078,25 +1077,15 @@ impl Database {
         let (Some(a), Some(b)) = (blob_a, blob_b) else {
             return Ok(None);
         };
-        let sim = if let Some(size_str) = algorithm.strip_prefix("phash:") {
-            let hash_size: u32 = size_str.parse().unwrap_or(8);
-            let ha = maple_import::ImageHash::from_bytes(&a)
-                .map_err(|e| anyhow::anyhow!("invalid pHash bytes for id_a: {e:?}"))?;
-            let hb = maple_import::ImageHash::from_bytes(&b)
-                .map_err(|e| anyhow::anyhow!("invalid pHash bytes for id_b: {e:?}"))?;
-            maple_import::phash_similarity(&ha, &hb, hash_size)
-        } else {
-            let ea: Vec<f32> = a
-                .chunks_exact(4)
-                .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
-                .collect();
-            let eb: Vec<f32> = b
-                .chunks_exact(4)
-                .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
-                .collect();
-            crate::models::image_cosine_similarity(&ea, &eb)
-        };
-        Ok(Some(sim))
+        let ea: Vec<f32> = a
+            .chunks_exact(4)
+            .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+            .collect();
+        let eb: Vec<f32> = b
+            .chunks_exact(4)
+            .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+            .collect();
+        Ok(Some(crate::models::image_cosine_similarity(&ea, &eb)))
     }
 
     /// Return all distinct algorithm keys currently stored in `image_hashes`.

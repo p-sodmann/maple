@@ -92,6 +92,13 @@ component LibraryTile inherits Rectangle {
             }
 
             Text {
+                text: "#\{root.item.id}";
+                color: Theme.dim-fg;
+                font-size: 11px;
+                vertical-alignment: center;
+            }
+
+            Text {
                 text: root.item.score == "" ? root.item.name : root.item.name + "  ·  " + root.item.score;
                 color: root.item.score == "" ? Theme.dim-fg : Theme.accent;
                 font-size: 12px;

@@ -96,6 +96,15 @@ fn build(db: Arc<Mutex<maple_db::Database>>) -> Result<SettingsWindow, slint::Pl
         }
     });
 
+    window.on_open_debug_compare({
+        let w = window.as_weak();
+        let db = db.clone();
+        move || {
+            let is_dark = w.upgrade().map(|w| w.get_dark()).unwrap_or(false);
+            crate::debug_compare::open(db.clone(), is_dark);
+        }
+    });
+
     window.on_clear_thumbnail_cache({
         let w = window.as_weak();
         move || {

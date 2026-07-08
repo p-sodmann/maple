@@ -1,9 +1,8 @@
-//! Background perceptual hasher.
+//! Background image embedder for stack detection.
 //!
 //! [`spawn_hasher`] starts a thread that continuously polls the database for
-//! images that do not yet have a hash for the active algorithm, computes the
-//! hash (pHash or ONNX embedding), stores it, and triggers the stacker to
-//! update group assignments.
+//! images that do not yet have a DINOv2 embedding, computes it, stores it, and
+//! triggers the stacker to update group assignments.
 //!
 //! The thread runs for the lifetime of the process and can pick up images that
 //! arrive during an active import — newly inserted rows appear in the poll
@@ -12,15 +11,15 @@
 //! # Algorithm key
 //!
 //! The algorithm is identified by [`StackSettings::algorithm_key`] (e.g.
-//! `"phash:8"` or `"onnx:facebook/dinov2-with-registers-base"`).  If the user
-//! changes the algorithm in settings, the key changes and the background hasher
-//! starts working on the new key; old rows under the previous key are ignored.
+//! `"onnx:onnx-community/dinov2-small"`).  If the user changes `model_repo` in
+//! settings, the key changes and the background hasher starts working on the
+//! new key; old rows under the previous key are ignored.
 
 use std::sync::{mpsc, Arc, Mutex};
 use std::time::Duration;
 
 use maple_import::decode_image;
-use maple_state::{StackMode, StackSettings};
+use maple_state::StackSettings;
 use tracing::{info, warn};
 
 use crate::worker::WorkerHandle;
@@ -51,31 +50,26 @@ pub fn spawn_hasher(
         .spawn(move || {
             info!("Background hasher started (algorithm: {})", settings.algorithm_key());
 
-            // For ONNX mode, load the embedder once for the lifetime of the thread.
-            let mut onnx_embedder: Option<crate::models::OnnxImageEmbedder> =
-                if settings.mode == StackMode::Onnx {
-                    match load_onnx_embedder(&settings) {
-                        Ok(e) => Some(e),
-                        Err(err) => {
-                            warn!("Hasher: failed to load ONNX embedder, falling back to pHash: {err}");
-                            None
-                        }
+            // Load the image embedder, retrying on failure (e.g. a transient
+            // network error fetching the model from HuggingFace Hub) so the
+            // worker self-heals instead of silently degrading.
+            let mut embedder = loop {
+                if stop_rx.try_recv().is_ok() {
+                    info!("Background hasher stopped before model loaded");
+                    return;
+                }
+                match load_onnx_embedder(&settings) {
+                    Ok(e) => break e,
+                    Err(err) => {
+                        warn!(
+                            "Hasher: failed to load image embedder, retrying in {IDLE_SLEEP:?}: {err}"
+                        );
+                        std::thread::sleep(IDLE_SLEEP);
                     }
-                } else {
-                    None
-                };
-
-            // Effective mode — falls back to pHash if ONNX embedder failed to load.
-            let effective_mode = if settings.mode == StackMode::Onnx && onnx_embedder.is_none() {
-                StackMode::PHash
-            } else {
-                settings.mode
+                }
             };
 
-            let algorithm = match effective_mode {
-                StackMode::PHash => format!("phash:{}", settings.hash_size),
-                StackMode::Onnx => format!("onnx:{}", settings.model_repo),
-            };
+            let algorithm = settings.algorithm_key();
 
             // `done` tracks images hashed in the current "run" (resets when
             // we go idle and come back).  `total` is sampled once per run so
@@ -123,24 +117,15 @@ pub fn spawn_hasher(
                         break;
                     }
 
-                    let result = match effective_mode {
-                        StackMode::PHash => hash_phash(
-                            *image_id,
-                            path,
-                            content_hash.as_ref(),
-                            cache.as_deref(),
-                            &settings,
-                            &db,
-                            &algorithm,
-                        ),
-                        StackMode::Onnx => {
-                            if let Some(ref mut embedder) = onnx_embedder {
-                                hash_onnx(*image_id, path, content_hash.as_ref(), cache.as_deref(), embedder, &db, &algorithm)
-                            } else {
-                                hash_phash(*image_id, path, content_hash.as_ref(), cache.as_deref(), &settings, &db, &algorithm)
-                            }
-                        }
-                    };
+                    let result = hash_onnx(
+                        *image_id,
+                        path,
+                        content_hash.as_ref(),
+                        cache.as_deref(),
+                        &mut embedder,
+                        &db,
+                        &algorithm,
+                    );
 
                     match result {
                         Ok(()) => {
@@ -173,7 +158,7 @@ pub fn spawn_hasher(
     WorkerHandle::from_sync_sender(stop_tx)
 }
 
-// ── Per-algorithm hashing ─────────────────────────────────────────────────────
+// ── Image embedding ────────────────────────────────────────────────────────────
 
 /// Load an image for hashing.  Uses the thumbnail cache when available
 /// (already a small WebP — fast to decode), falls back to the full image.
@@ -192,29 +177,6 @@ fn load_image_for_hash(
     decode_image(path)
 }
 
-fn hash_phash(
-    image_id: i64,
-    path: &std::path::Path,
-    content_hash: Option<&[u8; 32]>,
-    cache: Option<&ThumbnailCache>,
-    settings: &StackSettings,
-    db: &Arc<Mutex<Database>>,
-    algorithm: &str,
-) -> anyhow::Result<()> {
-    use image_hasher::{HashAlg, HasherConfig};
-
-    let img = load_image_for_hash(path, content_hash, cache)?;
-    let hasher = HasherConfig::new()
-        .hash_alg(HashAlg::Median)
-        .preproc_dct()
-        .hash_size(settings.hash_size, settings.hash_size)
-        .to_hasher();
-    let hash = hasher.hash_image(&img);
-    let blob = hash.as_bytes().to_vec();
-    lock_db(db).insert_image_hash(image_id, algorithm, &blob)?;
-    Ok(())
-}
-
 fn hash_onnx(
     image_id: i64,
     path: &std::path::Path,
@@ -231,7 +193,14 @@ fn hash_onnx(
     Ok(())
 }
 
-fn load_onnx_embedder(settings: &StackSettings) -> anyhow::Result<crate::models::OnnxImageEmbedder> {
+/// Load the ONNX image embedder for `settings`, fetching the model from
+/// HuggingFace Hub if `onnx_file` isn't already an existing absolute path.
+///
+/// Exposed publicly so other callers (e.g. the import browser, which wants
+/// to compute the same embeddings during an SD-card scan) can load the
+/// exact same model the background hasher would, rather than duplicating
+/// this logic.
+pub fn load_onnx_embedder(settings: &StackSettings) -> anyhow::Result<crate::models::OnnxImageEmbedder> {
     let onnx_path = {
         let p = std::path::Path::new(&settings.onnx_file);
         if p.is_absolute() && p.exists() {

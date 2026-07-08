@@ -265,18 +265,16 @@ const V9_INDEX: &str =
 
 // ── V10: image_hashes ────────────────────────────────────────────
 //
-// Stores a perceptual hash or dense embedding for each image, keyed by an
-// algorithm string that encodes both the method and its parameters (e.g.
-// "phash:8" or "onnx:facebook/dinov2-with-registers-base").
+// Stores a dense DINOv2 image embedding for each image, keyed by an algorithm
+// string that encodes the model repo (e.g. "onnx:onnx-community/dinov2-small").
 //
-// When the active algorithm changes (settings.toml edit), the key changes and
-// old rows are ignored.  The background hasher fills in the new rows
+// When `model_repo` changes (settings.toml edit), the key changes and old
+// rows are ignored.  The background hasher fills in the new rows
 // automatically.  Old rows from unused algorithms are left in place (harmless)
 // and may be cleaned up by a future migration.
 //
-// `hash_blob` encoding:
-//   phash  — ImageHash bytes (image_hasher::ImageHash::as_bytes())
-//   onnx   — Vec<f32> as little-endian bytes (same layout as face embeddings)
+// `hash_blob` encoding: Vec<f32> as little-endian bytes (same layout as face
+// embeddings).
 
 const V10: &str = "
     CREATE TABLE IF NOT EXISTS image_hashes (

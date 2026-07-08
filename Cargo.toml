@@ -85,9 +85,6 @@ webp = "0.3"
 # Encoding
 base64 = "0.22"
 
-# Image hashing (perceptual hash for stack detection)
-image_hasher = "3"
-
 # Platform directories
 directories = "6"
 

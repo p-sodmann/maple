@@ -85,6 +85,7 @@ export component DetailWindow inherits Window {
     in property <bool> loading;
     in property <string> error-text;
     in property <bool> is-fullscreen;
+    in property <bool> rotating: false;
     in property <[CollectionChip]> collection-chips;
     // All collections (loaded when the add-picker opens).
     in property <[CollectionChip]> available-collections;
@@ -129,6 +130,8 @@ export component DetailWindow inherits Window {
     callback close-requested;
     callback toggle-fullscreen;
     callback open-external;
+    // rotate(clockwise): true = 90° CW, false = 90° CCW.
+    callback rotate(bool);
     callback remove-collection(int);
     // add-to-collection: Rust loads available-collections, opens picker panel.
     callback add-to-collection;
@@ -261,6 +264,16 @@ export component DetailWindow inherits Window {
                         text: root.face-draw-mode ? "Stop Draw" : "Draw Face";
                         enabled: root.show-faces;
                         clicked => { root.toggle-face-draw(); }
+                    }
+                    FlatButton {
+                        text: "↺";
+                        enabled: !root.rotating;
+                        clicked => { root.rotate(false); }
+                    }
+                    FlatButton {
+                        text: "↻";
+                        enabled: !root.rotating;
+                        clicked => { root.rotate(true); }
                     }
                     FlatButton { text: "Open"; clicked => { root.open-external(); } }
                     FlatButton {

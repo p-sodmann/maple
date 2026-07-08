@@ -12,9 +12,10 @@
 
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
-use std::sync::{Arc, Mutex};
+use std::sync::{mpsc, Arc, Mutex};
+use std::time::Duration;
 
-use slint::{ComponentHandle, ModelRc, SharedString, VecModel};
+use slint::{ComponentHandle, ModelRc, SharedString, Timer, TimerMode, VecModel};
 
 use maple_db::{FaceDetection, LibraryImage};
 
@@ -45,6 +46,10 @@ struct NavState {
     /// Whether the "ALL EXIF METADATA" section in the info panel is expanded.
     /// Reset to collapsed whenever a different image is shown.
     show_all_exif: Rc<Cell<bool>>,
+    /// Poller for an in-flight rotation (see [`rotate_current`]). Held here
+    /// so it outlives the callback that starts it; `Timer` stops itself on
+    /// completion but the slot keeps it alive until then.
+    rotate_timer: Rc<RefCell<Option<Timer>>>,
 }
 
 /// The detail window and its shared state.
@@ -111,6 +116,7 @@ fn build(db: Arc<Mutex<maple_db::Database>>) -> Result<Detail, slint::PlatformEr
         Rc::new(RefCell::new(EmbeddingMatrix::empty()));
     let current_image_id: Rc<Cell<i64>> = Rc::new(Cell::new(0));
     let show_all_exif: Rc<Cell<bool>> = Rc::new(Cell::new(false));
+    let rotate_timer: Rc<RefCell<Option<Timer>>> = Rc::new(RefCell::new(None));
     let nav = NavState {
         records: records.clone(),
         index: index.clone(),
@@ -119,6 +125,7 @@ fn build(db: Arc<Mutex<maple_db::Database>>) -> Result<Detail, slint::PlatformEr
         known_embeddings: known_embeddings.clone(),
         current_image_id: current_image_id.clone(),
         show_all_exif: show_all_exif.clone(),
+        rotate_timer: rotate_timer.clone(),
     };
 
     // ── Navigation ────────────────────────────────────────────────
@@ -164,6 +171,12 @@ fn build(db: Arc<Mutex<maple_db::Database>>) -> Result<Detail, slint::PlatformEr
                 }
             }
         }
+    });
+
+    window.on_rotate({
+        let w = window.as_weak();
+        let nav = nav.clone();
+        move |clockwise| rotate_current(&w, &nav, clockwise)
     });
 
     window.on_remove_collection({
@@ -446,6 +459,82 @@ fn navigate(w: &slint::Weak<DetailWindow>, nav: &NavState, delta: i32) {
     }
     nav.index.set(new);
     show_record(&window, nav);
+}
+
+/// Rotate the current record's EXIF orientation 90° CW/CCW.
+///
+/// The rewrite happens in-place on disk (background thread — it's a full
+/// read + write of the file), so the button pair is disabled via `rotating`
+/// until it completes. `NavState` holds `Rc`/`RefCell` fields, so it can't
+/// cross into a `Send` closure (unlike `image_loader`'s `upgrade_in_event_loop`
+/// use) — instead a `slint::Timer` polls an mpsc channel on the UI thread,
+/// the same pattern `grid.rs` uses for its thumbnail loader.
+///
+/// On success the DB record and in-memory `nav.records` entry are updated
+/// and the image is reloaded (dimensions can swap between portrait/
+/// landscape); on failure (RAW file, no EXIF Orientation tag, …) the message
+/// surfaces via the existing `error-text` overlay.
+fn rotate_current(w: &slint::Weak<DetailWindow>, nav: &NavState, clockwise: bool) {
+    let Some(window) = w.upgrade() else { return };
+    if window.get_rotating() || window.get_loading() {
+        return;
+    }
+    let (image_id, path) = {
+        let recs = nav.records.borrow();
+        match recs.get(nav.index.get()) {
+            Some(r) => (r.id, r.path.clone()),
+            None => return,
+        }
+    };
+
+    window.set_rotating(true);
+    window.set_error_text(SharedString::new());
+
+    let (tx, rx) = mpsc::channel::<Result<(u16, [u8; 32]), String>>();
+    std::thread::spawn(move || {
+        let _ = tx.send(maple_db::rotate_image_file(&path, clockwise).map_err(|e| e.to_string()));
+    });
+
+    let rotate_timer_slot = nav.rotate_timer.clone();
+    let w = w.clone();
+    let nav = nav.clone();
+    let slot = rotate_timer_slot.clone();
+    let timer = Timer::default();
+    timer.start(TimerMode::Repeated, Duration::from_millis(32), move || {
+        let outcome = match rx.try_recv() {
+            Ok(result) => result,
+            Err(mpsc::TryRecvError::Empty) => return,
+            Err(mpsc::TryRecvError::Disconnected) => Err("Rotation worker vanished".to_owned()),
+        };
+        if let Some(t) = slot.borrow().as_ref() {
+            t.stop();
+        }
+        let Some(window) = w.upgrade() else { return };
+        match outcome {
+            Ok((new_orientation, new_hash)) => {
+                if let Ok(guard) = nav.db.lock() {
+                    if let Err(e) = guard.update_image_hash_and_orientation(
+                        image_id,
+                        &new_hash,
+                        new_orientation as i64,
+                    ) {
+                        tracing::warn!("Failed to update DB after rotation: {e}");
+                    }
+                }
+                if let Some(rec) = nav.records.borrow_mut().get_mut(nav.index.get()) {
+                    rec.meta.orientation = Some(new_orientation as i64);
+                    rec.hash = Some(new_hash);
+                }
+                window.set_rotating(false);
+                show_record(&window, &nav);
+            }
+            Err(msg) => {
+                window.set_error_text(format!("Rotation failed: {msg}").into());
+                window.set_rotating(false);
+            }
+        }
+    });
+    *rotate_timer_slot.borrow_mut() = Some(timer);
 }
 
 fn show_current(detail: &Detail) {

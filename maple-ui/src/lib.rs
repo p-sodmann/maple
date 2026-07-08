@@ -17,6 +17,7 @@ slint::include_modules!();
 
 mod collections_page;
 mod date;
+mod debug_compare;
 mod detail;
 mod face_crop;
 mod face_overlay;
@@ -501,6 +502,7 @@ pub fn run() -> anyhow::Result<()> {
     window.on_theme_toggled(|is_dark| {
         settings_window::set_dark(is_dark);
         detail::set_dark(is_dark);
+        debug_compare::set_dark(is_dark);
     });
 
     // ── Other secondary windows ────────────────────────────────────

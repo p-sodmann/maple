@@ -93,36 +93,22 @@ quality = 80
 size = 200
 
 # ── Stack detection ─────────────────────────────────────────────
-# After each import batch, newly copied images are compared and similar shots
-# are grouped into stacks.  The library shows each stack as one tile with a
-# count badge so burst duplicates don't clutter the grid.
+# After each import batch, newly copied images are compared using dense
+# DINOv2 vision embeddings and similar shots are grouped into stacks.  The
+# library shows each stack as one tile with a count badge so burst duplicates
+# and near-identical shots don't clutter the grid.
 
 [stacks]
 # Whether stack detection runs automatically after each import batch.
 enabled = false
 
-# Similarity algorithm:
-#   "phash" — perceptual hash (DCT-based, fast, no models needed).
-#             Best for detecting near-identical / burst duplicates.
-#   "onnx"  — dense vision embedding (e.g. DINOv2).  Slower but captures
-#             semantic similarity across different exposures / compositions.
-mode = "phash"
-
-# Similarity threshold (0.0–1.0).  Images ≥ this value are stacked together.
-#   pHash:  fraction of hash bits that agree (0.90 = at most 6/64 bits differ).
-#   ONNX:   cosine similarity of the image embeddings.
+# Cosine-similarity threshold (0.0–1.0) between image embeddings.
+# Images ≥ this value are stacked together.
 threshold = 0.90
-
-# pHash hash size (only for mode = "phash").
-# 8 → 8×8 = 64-bit hash.  Larger = more discriminating, slightly slower.
-hash_size = 8
-
-# ── ONNX mode settings (ignored when mode = "phash") ────────────
 
 # HuggingFace repo id of the ONNX vision model.
 # The repo must contain an ONNX export at the path given by onnx_file.
-# e.g. "facebook/dinov2-with-registers-base" (requires ONNX export from Optimum)
-model_repo = "facebook/dinov2-with-registers-base"
+model_repo = "onnx-community/dinov2-small"
 
 # Path of the ONNX file within the repo.
 onnx_file = "onnx/model.onnx"

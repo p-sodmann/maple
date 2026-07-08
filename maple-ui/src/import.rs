@@ -15,11 +15,21 @@ use std::rc::Rc;
 use std::sync::{mpsc, Arc, Mutex};
 use std::time::Duration;
 
+use image::{DynamicImage, RgbImage};
 use slint::{ComponentHandle, ModelRc, SharedString, Timer, TimerMode, VecModel};
 
 use crate::services::import::{insert_imported_images, ImportEntry};
 use crate::{ImportItem, ImportWindow};
 use crate::thumbnail;
+
+/// Name of the embedding cache file written to the root of a scanned source
+/// directory (e.g. an SD card). Dotfile-prefixed so the scanner's existing
+/// hidden-file filtering already ignores it.
+const EMBED_CACHE_FILE: &str = ".maple_embed_cache.bin";
+
+/// How many newly-computed embeddings accumulate before the SD-card cache is
+/// flushed to disk (mirrors `maple-db::hasher`'s `BATCH_SIZE` convention).
+const EMBED_CACHE_FLUSH_EVERY: usize = 20;
 
 thread_local! {
     static IMPORT: RefCell<Option<Import>> = const { RefCell::new(None) };
@@ -38,6 +48,12 @@ enum ScanMsg {
         height: u32,
         content_hash: [u8; 32],
         imported: bool,
+        /// DINOv2 embedding, if stack detection is enabled and inference
+        /// (or an SD-card cache hit) succeeded.
+        embedding: Option<Vec<f32>>,
+        /// Variance-of-Laplacian sharpness score, computed whenever an
+        /// embedding is (used to auto-pick the "best" shot in a burst).
+        sharpness: Option<f32>,
     },
     Done,
     Error(String),
@@ -58,6 +74,12 @@ struct Entry {
     is_imported: bool,
     /// Decoded thumbnail (None until the scan worker sends it).
     thumb: Option<slint::Image>,
+    /// DINOv2 embedding computed during the scan (`None` if stack detection
+    /// is disabled or inference failed for this photo).
+    embedding: Option<Vec<f32>>,
+    /// Variance-of-Laplacian sharpness score, used to auto-pick the "best"
+    /// shot within a detected burst group.
+    sharpness: Option<f32>,
 }
 
 // ── Controller struct ─────────────────────────────────────────────
@@ -73,8 +95,18 @@ struct Import {
     source: Rc<RefCell<PathBuf>>,
     dest: Rc<RefCell<PathBuf>>,
     db: Arc<Mutex<maple_db::Database>>,
+    /// Detected burst groups from the last scan — each a sorted list of
+    /// flat `entries` indices. Populated once, when the scan finishes.
+    groups: Rc<RefCell<Vec<Vec<usize>>>>,
     _scan_timer: Rc<RefCell<Option<Timer>>>,
     _copy_timer: Rc<RefCell<Option<Timer>>>,
+    _copy_done_timer: Rc<RefCell<Option<Timer>>>,
+    _rotate_timer: Rc<RefCell<Option<Timer>>>,
+}
+
+/// Find the burst group (if any) that `idx` belongs to.
+fn find_group(groups: &[Vec<usize>], idx: usize) -> Option<&[usize]> {
+    groups.iter().find(|g| g.contains(&idx)).map(|g| g.as_slice())
 }
 
 /// Open (or reuse) the import window (legacy entry point).
@@ -121,9 +153,19 @@ fn build(db: Arc<Mutex<maple_db::Database>>) -> Result<Import, slint::PlatformEr
     let selected: Rc<RefCell<HashSet<usize>>> = Rc::new(RefCell::new(HashSet::new()));
     let current: Rc<Cell<usize>> = Rc::new(Cell::new(0));
     let source: Rc<RefCell<PathBuf>> = Rc::new(RefCell::new(PathBuf::new()));
-    let dest: Rc<RefCell<PathBuf>> = Rc::new(RefCell::new(PathBuf::new()));
+    // The embedded sidebar ImportPage only lets the user pick a *source*
+    // folder — there is no destination step in that flow anymore, so default
+    // to the configured library directory (the same place the scanner,
+    // thumbcache, etc. already treat as "the library"). Without this, `dest`
+    // stays empty forever and "Copy Selected" silently no-ops.
+    let dest: Rc<RefCell<PathBuf>> =
+        Rc::new(RefCell::new(maple_state::Settings::load().library_dir));
+    window.set_dest_path(SharedString::from(dest.borrow().to_string_lossy().into_owned()));
+    let groups: Rc<RefCell<Vec<Vec<usize>>>> = Rc::new(RefCell::new(Vec::new()));
     let scan_timer: Rc<RefCell<Option<Timer>>> = Rc::new(RefCell::new(None));
     let copy_timer: Rc<RefCell<Option<Timer>>> = Rc::new(RefCell::new(None));
+    let copy_done_timer: Rc<RefCell<Option<Timer>>> = Rc::new(RefCell::new(None));
+    let rotate_timer: Rc<RefCell<Option<Timer>>> = Rc::new(RefCell::new(None));
 
     // ── Close ─────────────────────────────────────────────────────
     window.on_close_requested({
@@ -178,6 +220,7 @@ fn build(db: Arc<Mutex<maple_db::Database>>) -> Result<Import, slint::PlatformEr
         let selected = selected.clone();
         let current = current.clone();
         let source = source.clone();
+        let groups = groups.clone();
         let scan_timer = scan_timer.clone();
 
         move || {
@@ -190,9 +233,11 @@ fn build(db: Arc<Mutex<maple_db::Database>>) -> Result<Import, slint::PlatformEr
             // Reset state.
             entries.borrow_mut().clear();
             selected.borrow_mut().clear();
+            groups.borrow_mut().clear();
             current.set(0);
             w.set_items(ModelRc::from(Rc::new(VecModel::<ImportItem>::default())));
             w.set_selected_count(0);
+            w.set_copy_done(false);
             w.set_total_count(0);
             w.set_preview_photo(slint::Image::default());
             w.set_preview_filename(SharedString::default());
@@ -203,6 +248,7 @@ fn build(db: Arc<Mutex<maple_db::Database>>) -> Result<Import, slint::PlatformEr
 
             let settings = maple_state::Settings::load();
             let library_dir = settings.library_dir.clone();
+            let stack_settings = settings.stacks.clone();
 
             let imported_set = Arc::new(Mutex::new(
                 maple_state::SeenSet::load_imported(&library_dir),
@@ -212,17 +258,43 @@ fn build(db: Arc<Mutex<maple_db::Database>>) -> Result<Import, slint::PlatformEr
             let src_clone = src.clone();
             let imported_set_clone = imported_set.clone();
             std::thread::spawn(move || {
-                let groups = match maple_import::scan_grouped(&src_clone) {
+                let scanned_groups = match maple_import::scan_grouped(&src_clone) {
                     Ok(g) => g,
                     Err(e) => {
                         let _ = tx_clone.send(ScanMsg::Error(e.to_string()));
                         return;
                     }
                 };
-                let total = groups.len();
+                let total = scanned_groups.len();
                 let _ = tx_clone.send(ScanMsg::Count(total));
 
-                for (idx, group) in groups.into_iter().enumerate() {
+                // Burst detection during the scan reuses the [stacks]
+                // settings — same toggle/threshold/model as post-import
+                // library stacking. If the embedder fails to load (e.g. no
+                // network for a first-time model fetch), log once and
+                // continue the scan without embeddings/sharpness — this is
+                // enrichment, never a hard requirement to finish scanning.
+                let algorithm_key = stack_settings.algorithm_key();
+                let cache_path = src_clone.join(EMBED_CACHE_FILE);
+                let mut embedder = if stack_settings.enabled {
+                    match maple_db::load_onnx_embedder(&stack_settings) {
+                        Ok(e) => Some(e),
+                        Err(err) => {
+                            tracing::warn!(
+                                "Import scan: failed to load image embedder, skipping burst detection: {err}"
+                            );
+                            None
+                        }
+                    }
+                } else {
+                    None
+                };
+                let mut embed_cache = stack_settings
+                    .enabled
+                    .then(|| maple_import::EmbeddingCache::load_from(&cache_path, &algorithm_key));
+                let mut unflushed = 0usize;
+
+                for (idx, group) in scanned_groups.into_iter().enumerate() {
                     let display_path = group.display.path.clone();
                     let companions: Vec<PathBuf> =
                         group.companions.iter().map(|c| c.path.clone()).collect();
@@ -241,6 +313,49 @@ fn build(db: Arc<Mutex<maple_db::Database>>) -> Result<Import, slint::PlatformEr
                     let (rgb, width, height) =
                         thumbnail::render_to_rgb(&display_path, 256).unwrap_or_default();
 
+                    let (sharpness, embedding) = if stack_settings.enabled
+                        && !rgb.is_empty()
+                        && width > 0
+                        && height > 0
+                    {
+                        let sharp = maple_import::laplacian_variance(&rgb, width, height);
+                        let cached = embed_cache.as_ref().and_then(|c| c.get(&hash)).map(|s| s.to_vec());
+                        let embedding = match cached {
+                            Some(e) => Some(e),
+                            None => embedder.as_mut().and_then(|embedder| {
+                                let img = RgbImage::from_raw(width, height, rgb.clone())?;
+                                match embedder.embed(&DynamicImage::ImageRgb8(img)) {
+                                    Ok(v) => {
+                                        if let Some(cache) = embed_cache.as_mut() {
+                                            cache.insert(hash, v.clone());
+                                            unflushed += 1;
+                                        }
+                                        Some(v)
+                                    }
+                                    Err(err) => {
+                                        tracing::warn!(
+                                            "Import scan: embedding failed for {}: {err}",
+                                            display_path.display()
+                                        );
+                                        None
+                                    }
+                                }
+                            }),
+                        };
+                        (Some(sharp), embedding)
+                    } else {
+                        (None, None)
+                    };
+
+                    if unflushed >= EMBED_CACHE_FLUSH_EVERY {
+                        if let Some(cache) = embed_cache.as_ref() {
+                            if let Err(err) = cache.save_to(&cache_path) {
+                                tracing::warn!("Import scan: failed to write embedding cache: {err}");
+                            }
+                        }
+                        unflushed = 0;
+                    }
+
                     let _ = tx_clone.send(ScanMsg::Thumb {
                         index: idx,
                         path: display_path,
@@ -250,8 +365,17 @@ fn build(db: Arc<Mutex<maple_db::Database>>) -> Result<Import, slint::PlatformEr
                         height,
                         content_hash: hash,
                         imported,
+                        embedding,
+                        sharpness,
                     });
                 }
+
+                if let Some(cache) = embed_cache.as_ref() {
+                    if let Err(err) = cache.save_to(&cache_path) {
+                        tracing::warn!("Import scan: failed to write embedding cache: {err}");
+                    }
+                }
+
                 let _ = tx_clone.send(ScanMsg::Done);
             });
 
@@ -260,6 +384,7 @@ fn build(db: Arc<Mutex<maple_db::Database>>) -> Result<Import, slint::PlatformEr
             let entries2 = entries.clone();
             let selected2 = selected.clone();
             let current2 = current.clone();
+            let groups2 = groups.clone();
             let timer = Timer::default();
             timer.start(
                 TimerMode::Repeated,
@@ -279,6 +404,8 @@ fn build(db: Arc<Mutex<maple_db::Database>>) -> Result<Import, slint::PlatformEr
                                         content_hash: [0; 32],
                                         is_imported: false,
                                         thumb: None,
+                                        embedding: None,
+                                        sharpness: None,
                                     });
                                 }
                                 drop(ents);
@@ -286,11 +413,12 @@ fn build(db: Arc<Mutex<maple_db::Database>>) -> Result<Import, slint::PlatformEr
                                 w.set_items(build_model(
                                     &entries2.borrow(),
                                     &selected2.borrow(),
+                                    &groups2.borrow(),
                                 ));
                             }
                             Ok(ScanMsg::Thumb {
                                 index, path, companions, rgb, width, height,
-                                content_hash, imported,
+                                content_hash, imported, embedding, sharpness,
                             }) => {
                                 let thumb = if !rgb.is_empty() && width > 0 && height > 0 {
                                     let buf = slint::SharedPixelBuffer::<slint::Rgb8Pixel>::clone_from_slice(
@@ -310,11 +438,14 @@ fn build(db: Arc<Mutex<maple_db::Database>>) -> Result<Import, slint::PlatformEr
                                         e.content_hash = content_hash;
                                         e.is_imported = imported;
                                         e.thumb = thumb.clone();
+                                        e.embedding = embedding;
+                                        e.sharpness = sharpness;
                                     }
                                 }
                                 w.set_items(build_model(
                                     &entries2.borrow(),
                                     &selected2.borrow(),
+                                    &groups2.borrow(),
                                 ));
                                 // Show preview for the first result.
                                 if is_first {
@@ -330,10 +461,65 @@ fn build(db: Arc<Mutex<maple_db::Database>>) -> Result<Import, slint::PlatformEr
                             }
                             Ok(ScanMsg::Done) => {
                                 let n = entries2.borrow().len();
+
+                                // Cluster into burst groups from the embeddings
+                                // collected during the scan, then auto-select
+                                // the sharpest member of each group.
+                                let resolved_groups = {
+                                    let ents = entries2.borrow();
+                                    let mut idx_map: Vec<usize> = Vec::new();
+                                    let mut embeddings: Vec<Vec<f32>> = Vec::new();
+                                    for (i, e) in ents.iter().enumerate() {
+                                        if let Some(emb) = &e.embedding {
+                                            idx_map.push(i);
+                                            embeddings.push(emb.clone());
+                                        }
+                                    }
+                                    if embeddings.is_empty() {
+                                        Vec::new()
+                                    } else {
+                                        let threshold = maple_state::Settings::load().stacks.threshold;
+                                        maple_db::cluster_embeddings(&embeddings, threshold)
+                                            .into_iter()
+                                            .map(|members| {
+                                                let mut flat: Vec<usize> =
+                                                    members.iter().map(|&m| idx_map[m]).collect();
+                                                flat.sort_unstable();
+                                                flat
+                                            })
+                                            .collect()
+                                    }
+                                };
+
+                                if !resolved_groups.is_empty() {
+                                    let ents = entries2.borrow();
+                                    let mut sel = selected2.borrow_mut();
+                                    for group in &resolved_groups {
+                                        let mut best = group[0];
+                                        let mut best_sharpness = ents[best].sharpness.unwrap_or(0.0);
+                                        for &idx in &group[1..] {
+                                            let s = ents[idx].sharpness.unwrap_or(0.0);
+                                            if s > best_sharpness {
+                                                best = idx;
+                                                best_sharpness = s;
+                                            }
+                                        }
+                                        sel.insert(best);
+                                    }
+                                    drop(sel);
+                                    w.set_selected_count(selected2.borrow().len() as i32);
+                                }
+                                *groups2.borrow_mut() = resolved_groups;
+
                                 w.set_status_text(
                                     format!("{n} photo{} found",
                                         if n == 1 { "" } else { "s" }).into(),
                                 );
+                                w.set_items(build_model(
+                                    &entries2.borrow(),
+                                    &selected2.borrow(),
+                                    &groups2.borrow(),
+                                ));
                                 return;
                             }
                             Ok(ScanMsg::Error(e)) => {
@@ -356,9 +542,11 @@ fn build(db: Arc<Mutex<maple_db::Database>>) -> Result<Import, slint::PlatformEr
         let entries = entries.clone();
         let selected = selected.clone();
         let current = current.clone();
+        let groups = groups.clone();
         move |idx| {
             let Some(w) = w.upgrade() else { return };
             let idx = idx as usize;
+            let navigated_to_new_item = current.get() != idx;
             {
                 let mut sel = selected.borrow_mut();
                 if sel.contains(&idx) {
@@ -367,9 +555,17 @@ fn build(db: Arc<Mutex<maple_db::Database>>) -> Result<Import, slint::PlatformEr
                     sel.insert(idx);
                 }
             }
+            w.set_copy_done(false);
+            w.set_selected_count(selected.borrow().len() as i32);
+
+            // Clicking the already-open photo just toggles its selection —
+            // don't re-decode and re-render the big preview for no reason.
+            if !navigated_to_new_item {
+                w.set_items(build_model(&entries.borrow(), &selected.borrow(), &groups.borrow()));
+                return;
+            }
             current.set(idx);
             w.set_current_index(idx as i32);
-            w.set_selected_count(selected.borrow().len() as i32);
 
             let ents = entries.borrow();
             if let Some(e) = ents.get(idx) {
@@ -403,25 +599,51 @@ fn build(db: Arc<Mutex<maple_db::Database>>) -> Result<Import, slint::PlatformEr
                 });
             }
             drop(ents);
-            w.set_items(build_model(&entries.borrow(), &selected.borrow()));
+            w.set_items(build_model(&entries.borrow(), &selected.borrow(), &groups.borrow()));
         }
     });
 
     // ── Navigation ────────────────────────────────────────────────
+    //
+    // If the current photo belongs to a detected burst group, left/right
+    // jumps directly to the prev/next member of that group (skipping over
+    // unrelated interleaved photos). Moving past the first/last member of
+    // the group falls through to ordinary flat navigation — arrow keys
+    // never trap the user inside a burst; they page through all of its
+    // members, then continue into the rest of the scan. Solo entries behave
+    // exactly as a plain flat clamp, same as before this feature existed.
     let make_nav = |delta: i32| {
         let w = window.as_weak();
         let entries = entries.clone();
         let current = current.clone();
         let selected = selected.clone();
+        let groups = groups.clone();
         move || {
             let Some(w) = w.upgrade() else { return };
             let len = entries.borrow().len();
             if len == 0 {
                 return;
             }
-            let cur = current.get() as i64;
-            let new_idx = (cur + delta as i64).clamp(0, len as i64 - 1) as usize;
-            if new_idx as i64 == cur {
+            let cur = current.get();
+
+            let groups_ref = groups.borrow();
+            let new_idx = match find_group(&groups_ref, cur) {
+                Some(members) => {
+                    let pos = members.iter().position(|&m| m == cur).unwrap_or(0);
+                    let next_pos = pos as i64 + delta as i64;
+                    if next_pos >= 0 && (next_pos as usize) < members.len() {
+                        members[next_pos as usize]
+                    } else {
+                        // Fell off the group's boundary — continue past it
+                        // with ordinary flat navigation from here.
+                        (cur as i64 + delta as i64).clamp(0, len as i64 - 1) as usize
+                    }
+                }
+                None => (cur as i64 + delta as i64).clamp(0, len as i64 - 1) as usize,
+            };
+            drop(groups_ref);
+
+            if new_idx == cur {
                 return;
             }
             current.set(new_idx);
@@ -457,7 +679,7 @@ fn build(db: Arc<Mutex<maple_db::Database>>) -> Result<Import, slint::PlatformEr
                 });
             }
             drop(ents);
-            w.set_items(build_model(&entries.borrow(), &selected.borrow()));
+            w.set_items(build_model(&entries.borrow(), &selected.borrow(), &groups.borrow()));
         }
     };
     window.on_nav_prev(make_nav(-1));
@@ -470,7 +692,9 @@ fn build(db: Arc<Mutex<maple_db::Database>>) -> Result<Import, slint::PlatformEr
         let selected = selected.clone();
         let dest = dest.clone();
         let db = db.clone();
+        let groups = groups.clone();
         let copy_timer = copy_timer.clone();
+        let copy_done_timer = copy_done_timer.clone();
         move || {
             let Some(w) = w.upgrade() else { return };
             let sel = selected.borrow().clone();
@@ -484,11 +708,13 @@ fn build(db: Arc<Mutex<maple_db::Database>>) -> Result<Import, slint::PlatformEr
             }
 
             w.set_copying(true);
+            w.set_copy_done(false);
             w.set_status_text("Copying…".into());
 
             let settings = maple_state::Settings::load();
             let folder_format = settings.folder_format.clone();
             let library_dir = settings.library_dir.clone();
+            let algorithm_key = settings.stacks.algorithm_key();
 
             let mut sources: Vec<PathBuf> = Vec::new();
             let mut sel_indices: Vec<usize> = sel.iter().copied().collect();
@@ -544,7 +770,9 @@ fn build(db: Arc<Mutex<maple_db::Database>>) -> Result<Import, slint::PlatformEr
             let w_weak = w.as_weak();
             let entries2 = entries.clone();
             let selected2 = selected.clone();
+            let groups2 = groups.clone();
             let db2 = db.clone();
+            let copy_done_timer = copy_done_timer.clone();
             let timer = Timer::default();
             timer.start(
                 TimerMode::Repeated,
@@ -582,10 +810,11 @@ fn build(db: Arc<Mutex<maple_db::Database>>) -> Result<Import, slint::PlatformEr
                                         .map(|e| ImportEntry {
                                             path: e.path.clone(),
                                             content_hash: e.content_hash,
+                                            embedding: e.embedding.clone(),
                                         })
                                         .collect()
                                 };
-                                insert_imported_images(&db2, &to_insert);
+                                insert_imported_images(&db2, &to_insert, &algorithm_key);
                                 // Backfill EXIF for the records just inserted.
                                 maple_db::spawn_metadata_filler(db2.clone());
                                 selected2.borrow_mut().clear();
@@ -603,7 +832,24 @@ fn build(db: Arc<Mutex<maple_db::Database>>) -> Result<Import, slint::PlatformEr
                                 w.set_items(build_model(
                                     &entries2.borrow(),
                                     &selected2.borrow(),
+                                    &groups2.borrow(),
                                 ));
+
+                                // Flash the button green, then revert to the
+                                // normal "Copy Selected" state.
+                                w.set_copy_done(true);
+                                let w_weak2 = w.as_weak();
+                                let done_timer = Timer::default();
+                                done_timer.start(
+                                    TimerMode::SingleShot,
+                                    Duration::from_millis(2500),
+                                    move || {
+                                        if let Some(w) = w_weak2.upgrade() {
+                                            w.set_copy_done(false);
+                                        }
+                                    },
+                                );
+                                *copy_done_timer.borrow_mut() = Some(done_timer);
                                 return;
                             }
                             Ok(CopyMsg::Error(e)) => {
@@ -624,6 +870,108 @@ fn build(db: Arc<Mutex<maple_db::Database>>) -> Result<Import, slint::PlatformEr
         }
     });
 
+    // ── Rotate current photo ─────────────────────────────────────────
+    //
+    // Patches the EXIF Orientation tag on the *source* file in place
+    // (mirrors detail.rs's rotate_current), then re-renders the grid thumb
+    // and the big preview so the change is visible immediately. The file's
+    // bytes (and therefore its content hash) change, so the in-memory
+    // Entry's content_hash is updated too — it's what gets recorded in the
+    // SeenSet / DB on copy.
+    window.on_rotate({
+        let w = window.as_weak();
+        let entries = entries.clone();
+        let current = current.clone();
+        let selected = selected.clone();
+        let groups = groups.clone();
+        let rotate_timer = rotate_timer.clone();
+        move |clockwise| {
+            let Some(w) = w.upgrade() else { return };
+            if w.get_rotating() {
+                return;
+            }
+            let idx = current.get();
+            let path = {
+                let ents = entries.borrow();
+                match ents.get(idx) {
+                    Some(e) => e.path.clone(),
+                    None => return,
+                }
+            };
+
+            w.set_rotating(true);
+
+            enum RotateMsg {
+                Done {
+                    content_hash: [u8; 32],
+                    thumb: (Vec<u8>, u32, u32),
+                    preview: (Vec<u8>, u32, u32),
+                },
+                Error(String),
+            }
+
+            let (tx, rx) = mpsc::channel::<RotateMsg>();
+            std::thread::spawn(move || {
+                let msg = match maple_db::rotate_image_file(&path, clockwise) {
+                    Ok((_, content_hash)) => {
+                        let thumb = thumbnail::render_to_rgb(&path, 256);
+                        let preview = thumbnail::render_to_rgb(&path, 1200);
+                        match (thumb, preview) {
+                            (Ok(thumb), Ok(preview)) => RotateMsg::Done { content_hash, thumb, preview },
+                            (Err(e), _) | (_, Err(e)) => RotateMsg::Error(e.to_string()),
+                        }
+                    }
+                    Err(e) => RotateMsg::Error(e.to_string()),
+                };
+                let _ = tx.send(msg);
+            });
+
+            let w_weak = w.as_weak();
+            let entries2 = entries.clone();
+            let selected2 = selected.clone();
+            let groups2 = groups.clone();
+            let rotate_timer_slot = rotate_timer.clone();
+            let timer = Timer::default();
+            timer.start(TimerMode::Repeated, Duration::from_millis(32), move || {
+                let Some(w) = w_weak.upgrade() else { return };
+                let outcome = match rx.try_recv() {
+                    Ok(m) => m,
+                    Err(mpsc::TryRecvError::Empty) => return,
+                    Err(mpsc::TryRecvError::Disconnected) => {
+                        RotateMsg::Error("Rotation worker vanished".to_owned())
+                    }
+                };
+                if let Some(t) = rotate_timer_slot.borrow().as_ref() {
+                    t.stop();
+                }
+                match outcome {
+                    RotateMsg::Done { content_hash, thumb, preview } => {
+                        if let Some(e) = entries2.borrow_mut().get_mut(idx) {
+                            e.content_hash = content_hash;
+                            let (rgb, tw, th) = thumb;
+                            let buf = slint::SharedPixelBuffer::<slint::Rgb8Pixel>::clone_from_slice(
+                                &rgb, tw, th,
+                            );
+                            e.thumb = Some(slint::Image::from_rgb8(buf));
+                        }
+                        let (rgb, pw, ph) = preview;
+                        let buf = slint::SharedPixelBuffer::<slint::Rgb8Pixel>::clone_from_slice(
+                            &rgb, pw, ph,
+                        );
+                        w.set_preview_photo(slint::Image::from_rgb8(buf));
+                        w.set_items(build_model(&entries2.borrow(), &selected2.borrow(), &groups2.borrow()));
+                        w.set_rotating(false);
+                    }
+                    RotateMsg::Error(msg) => {
+                        w.set_status_text(format!("Rotate failed: {msg}").into());
+                        w.set_rotating(false);
+                    }
+                }
+            });
+            *rotate_timer.borrow_mut() = Some(timer);
+        }
+    });
+
     Ok(Import {
         window,
         entries,
@@ -632,8 +980,11 @@ fn build(db: Arc<Mutex<maple_db::Database>>) -> Result<Import, slint::PlatformEr
         source,
         dest,
         db,
+        groups,
         _scan_timer: scan_timer,
         _copy_timer: copy_timer,
+        _copy_done_timer: copy_done_timer,
+        _rotate_timer: rotate_timer,
     })
 }
 
@@ -642,7 +993,7 @@ fn build(db: Arc<Mutex<maple_db::Database>>) -> Result<Import, slint::PlatformEr
 /// Called each time the selection or scan state changes. This is not cheap
 /// (rebuilds every item) but the import grid is small (100s of items) and
 /// we don't update on every frame, so it's acceptable.
-fn build_model(entries: &[Entry], selected: &HashSet<usize>) -> ModelRc<ImportItem> {
+fn build_model(entries: &[Entry], selected: &HashSet<usize>, groups: &[Vec<usize>]) -> ModelRc<ImportItem> {
     let items: Vec<ImportItem> = entries
         .iter()
         .enumerate()
@@ -657,6 +1008,7 @@ fn build_model(entries: &[Entry], selected: &HashSet<usize>) -> ModelRc<ImportIt
             loaded: !e.path.as_os_str().is_empty(),
             is_selected: selected.contains(&i),
             is_imported: e.is_imported,
+            stack_size: find_group(groups, i).map(|g| g.len() as i32).unwrap_or(0),
         })
         .collect();
     ModelRc::from(Rc::new(VecModel::from(items)))

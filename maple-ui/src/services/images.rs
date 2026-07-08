@@ -75,3 +75,38 @@ pub fn load_image_info_data(db: &Arc<Mutex<maple_db::Database>>, image_id: i64) 
         .unwrap_or_default();
     ImageInfoData { ai_descriptions, exif_tags }
 }
+
+/// Debug helper: cosine similarity between two images' stored stack-detection
+/// embeddings, keyed by the current `StackSettings::algorithm_key()`. Returns
+/// `(filename_a, filename_b, similarity)` on success, or a user-facing error
+/// message (unknown id / no stored embedding / DB error).
+pub fn compare_embeddings(
+    db: &Arc<Mutex<maple_db::Database>>,
+    id_a: i64,
+    id_b: i64,
+) -> Result<(String, String, f32), String> {
+    let algorithm = maple_state::Settings::load().stacks.algorithm_key();
+    let guard = db.lock().map_err(|_| "Database lock poisoned.".to_owned())?;
+
+    let display_name = |id: i64| -> Result<String, String> {
+        let img = guard
+            .image_by_id(id)
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| format!("No image with id {id}."))?;
+        Ok(img.meta.filename.unwrap_or_else(|| img.path.to_string_lossy().into_owned()))
+    };
+    let name_a = display_name(id_a)?;
+    let name_b = display_name(id_b)?;
+
+    let similarity = guard
+        .similarity_for_images(id_a, id_b, &algorithm)
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| {
+            format!(
+                "No stored embedding for one or both images under algorithm \"{algorithm}\". \
+                 Enable stack detection in Settings and let the background hasher run."
+            )
+        })?;
+
+    Ok((name_a, name_b, similarity))
+}
