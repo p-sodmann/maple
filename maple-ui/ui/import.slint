@@ -4,7 +4,7 @@
 // ImportPage:   Rectangle embedded in AppWindow's sidebar shell.
 
 import { Theme } from "theme.slint";
-import { FlatButton, PillButton } from "widgets.slint";
+import { FlatButton, PillButton, ProgressBar } from "widgets.slint";
 import { ScrollView } from "std-widgets.slint";
 
 // ── Exported structs ──────────────────────────────────────────────
@@ -27,6 +27,8 @@ export struct ImportItem {
     is-selected: bool,
     is-imported: bool,   // already present in the library
     stack-size: int,     // >=2 when this photo belongs to a detected burst group
+    has-jpg: bool,        // group has a non-raw (JPG/PNG) file
+    has-raw: bool,        // group has a raw companion (or the display itself is raw)
 }
 
 // ── Thumbnail grid (mirrors LibraryGridView) ──────────────────────
@@ -143,17 +145,130 @@ component ImportGridView {
                     }
                 }
 
-                Text {
-                    text: item.filename;
-                    color: Theme.dim-fg;
-                    font-size: 11px;
-                    overflow: elide;
-                    horizontal-alignment: center;
+                HorizontalLayout {
+                    height: root.label-h;
+                    spacing: 6px;
+
+                    if item.loaded: Text {
+                        text: "JPG";
+                        font-size: 9px;
+                        font-weight: 700;
+                        letter-spacing: 0.4px;
+                        vertical-alignment: center;
+                        color: item.has-jpg ? Theme.fg : Theme.dim-fg.with-alpha(0.4);
+                    }
+                    if item.loaded: Text {
+                        text: "RAW";
+                        font-size: 9px;
+                        font-weight: 700;
+                        letter-spacing: 0.4px;
+                        vertical-alignment: center;
+                        color: item.has-raw ? Theme.fg : Theme.dim-fg.with-alpha(0.4);
+                    }
+
+                    Text {
+                        text: item.filename;
+                        color: Theme.dim-fg;
+                        font-size: 11px;
+                        overflow: elide;
+                        horizontal-stretch: 1;
+                        horizontal-alignment: right;
+                    }
                 }
             }
 
             ta := TouchArea {
                 clicked => { root.clicked(idx); }
+            }
+        }
+    }
+}
+
+// ── Copy-mode dropdown ─────────────────────────────────────────────
+//
+// Picks what gets copied for each selected group: display file only
+// ("JPG"), display + raw companion ("JPG + RAW"), or raw only ("RAW").
+// Mirrors `maple_import::CopyMode` — indices line up with `DisplayOnly`
+// (0), `All` (1), `RawOnly` (2).
+
+component CopyModeDropdown inherits Rectangle {
+    in property <int> mode: 1;
+    callback mode-changed(int);
+
+    property <[string]> labels: ["JPG", "JPG + RAW", "RAW"];
+
+    width: 108px;
+    height: 30px;
+    border-radius: Theme.radius-btn;
+    background: dd-ta.has-hover ? Theme.card-bg-hover : Theme.card-bg;
+    border-width: 1px;
+    border-color: Theme.separator-color;
+    animate background { duration: 100ms; }
+
+    HorizontalLayout {
+        padding-left: 10px;
+        padding-right: 8px;
+        spacing: 4px;
+
+        Text {
+            text: root.labels[root.mode];
+            color: Theme.fg;
+            font-size: 12px;
+            font-weight: 600;
+            vertical-alignment: center;
+            horizontal-stretch: 1;
+        }
+        Text {
+            text: popup.is-open ? "▴" : "▾";
+            color: Theme.dim-fg;
+            font-size: 10px;
+            vertical-alignment: center;
+        }
+    }
+
+    dd-ta := TouchArea {
+        clicked => { popup.show(); }
+    }
+
+    popup := PopupWindow {
+        x: 0px;
+        y: root.height + 4px;
+        width: root.width;
+
+        Rectangle {
+            border-radius: Theme.radius-btn;
+            background: Theme.card-bg;
+            border-width: 1px;
+            border-color: Theme.separator-color;
+            drop-shadow-blur: 8px;
+            drop-shadow-color: #00000033;
+
+            VerticalLayout {
+                padding: 4px;
+                spacing: 2px;
+
+                for label[i] in root.labels: Rectangle {
+                    height: 28px;
+                    border-radius: 6px;
+                    background: opt-ta.has-hover ? Theme.card-bg-hover : transparent;
+                    animate background { duration: 80ms; }
+
+                    Text {
+                        text: label;
+                        color: i == root.mode ? Theme.accent : Theme.fg;
+                        font-size: 12px;
+                        font-weight: i == root.mode ? 700 : 500;
+                        vertical-alignment: center;
+                        x: 10px;
+                    }
+
+                    opt-ta := TouchArea {
+                        clicked => {
+                            root.mode-changed(i);
+                            popup.close();
+                        }
+                    }
+                }
             }
         }
     }
@@ -170,6 +285,8 @@ export component ImportWindow inherits Window {
     background: Theme.window-bg;
     default-font-size: 14px;
 
+    in-out property <bool> dark <=> Theme.dark;
+
     in-out property <bool> in-browser: false;
 
     // Picker state
@@ -185,9 +302,16 @@ export component ImportWindow inherits Window {
     in property <int> selected-count: 0;
     in property <int> total-count: 0;
     in property <string> status-text: "Pick a source folder to begin.";
+    // Live scan progress — while true the status bar shows a progress bar
+    // (scanned-count / total-count) instead of status-text.
+    in property <bool> scanning: false;
+    in property <int> scanned-count: 0;
     in property <bool> copying: false;
     in property <bool> copy-done: false;
     in property <bool> rotating: false;
+    // What to copy for each selected group — mirrors `maple_import::CopyMode`:
+    // 0 = display only ("JPG"), 1 = display + raw ("JPG + RAW"), 2 = raw only ("RAW").
+    in-out property <int> copy-mode: 1;
 
     callback close-requested;
     callback pick-source;
@@ -263,6 +387,11 @@ export component ImportWindow inherits Window {
                         color: Theme.dim-fg;
                         font-size: 13px;
                         vertical-alignment: center;
+                    }
+
+                    if root.in-browser: CopyModeDropdown {
+                        mode: root.copy-mode;
+                        mode-changed(i) => { root.copy-mode = i; }
                     }
 
                     if root.in-browser: Rectangle {
@@ -440,7 +569,31 @@ export component ImportWindow inherits Window {
                     Rectangle {
                         height: 28px;
                         background: Theme.card-bg;
-                        Text {
+
+                        if root.scanning: HorizontalLayout {
+                            padding-left: 10px;
+                            padding-right: 10px;
+                            spacing: 8px;
+
+                            ProgressBar {
+                                vertical-stretch: 0;
+                                y: (parent.height - self.height) / 2;
+                                horizontal-stretch: 1;
+                                value: root.total-count > 0
+                                    ? root.scanned-count * 1.0 / root.total-count
+                                    : 0;
+                            }
+                            Text {
+                                text: root.total-count > 0
+                                    ? "Scanning: \{root.scanned-count} / \{root.total-count}"
+                                    : "Scanning…";
+                                color: Theme.dim-fg;
+                                font-size: 11px;
+                                vertical-alignment: center;
+                            }
+                        }
+
+                        if !root.scanning: Text {
                             text: root.status-text;
                             color: Theme.dim-fg;
                             font-size: 11px;

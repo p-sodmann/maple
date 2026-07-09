@@ -37,6 +37,26 @@ export component PillButton inherits Rectangle {
     }
 }
 
+// Thin horizontal progress bar — `value` is clamped to [0, 1].
+export component ProgressBar inherits Rectangle {
+    in property <float> value: 0;
+
+    height: 6px;
+    border-radius: 3px;
+    background: Theme.placeholder-bg;
+    clip: true;
+
+    Rectangle {
+        x: 0;
+        y: 0;
+        height: 100%;
+        width: parent.width * max(0.0, min(1.0, root.value));
+        border-radius: 3px;
+        background: Theme.accent;
+        animate width { duration: 150ms; }
+    }
+}
+
 // Flat header button (text label for now; SVG icons land in a later phase).
 export component FlatButton inherits Rectangle {
     in property <string> text;

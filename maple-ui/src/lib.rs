@@ -428,12 +428,14 @@ pub fn run() -> anyhow::Result<()> {
     window.on_import_start_scan({
         let db = db.clone();
         let source = import_source.clone();
+        let w = window.as_weak();
         move || {
             let src = source.borrow().clone();
             if src.as_os_str().is_empty() {
                 return;
             }
-            import::open_with_source(db.clone(), src);
+            let is_dark = w.upgrade().map(|w| w.get_dark()).unwrap_or(false);
+            import::open_with_source(db.clone(), src, is_dark);
         }
     });
 
@@ -503,6 +505,7 @@ pub fn run() -> anyhow::Result<()> {
         settings_window::set_dark(is_dark);
         detail::set_dark(is_dark);
         debug_compare::set_dark(is_dark);
+        import::set_dark(is_dark);
     });
 
     // ── Other secondary windows ────────────────────────────────────

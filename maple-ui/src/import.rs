@@ -16,7 +16,7 @@ use std::sync::{mpsc, Arc, Mutex};
 use std::time::Duration;
 
 use image::{DynamicImage, RgbImage};
-use slint::{ComponentHandle, ModelRc, SharedString, Timer, TimerMode, VecModel};
+use slint::{ComponentHandle, Model, ModelRc, SharedString, Timer, TimerMode, VecModel};
 
 use crate::services::import::{insert_imported_images, ImportEntry};
 use crate::{ImportItem, ImportWindow};
@@ -111,15 +111,16 @@ fn find_group(groups: &[Vec<usize>], idx: usize) -> Option<&[usize]> {
 
 /// Open (or reuse) the import window (legacy entry point).
 #[allow(dead_code)]
-pub fn open(db: Arc<Mutex<maple_db::Database>>) {
-    open_with_source(db, std::path::PathBuf::new());
+pub fn open(db: Arc<Mutex<maple_db::Database>>, is_dark: bool) {
+    open_with_source(db, std::path::PathBuf::new(), is_dark);
 }
 
-/// Open the import browser window pre-seeded with `source_path`.
+/// Open the import browser window pre-seeded with `source_path`, syncing
+/// dark-mode state.
 ///
 /// Called when the user clicks "Start Scan" on the embedded ImportPage.
 /// If `source_path` is empty the window opens on the picker phase as before.
-pub fn open_with_source(db: Arc<Mutex<maple_db::Database>>, source_path: std::path::PathBuf) {
+pub fn open_with_source(db: Arc<Mutex<maple_db::Database>>, source_path: std::path::PathBuf, is_dark: bool) {
     if IMPORT.with(|i| i.borrow().is_none()) {
         match build(db) {
             Ok(imp) => IMPORT.with(|cell| *cell.borrow_mut() = Some(imp)),
@@ -132,6 +133,7 @@ pub fn open_with_source(db: Arc<Mutex<maple_db::Database>>, source_path: std::pa
     IMPORT.with(|cell| {
         let guard = cell.borrow();
         if let Some(imp) = guard.as_ref() {
+            imp.window.set_dark(is_dark);
             // Pre-set the source path then trigger a scan if one was provided.
             if !source_path.as_os_str().is_empty() {
                 let s = source_path.to_string_lossy().into_owned();
@@ -146,12 +148,40 @@ pub fn open_with_source(db: Arc<Mutex<maple_db::Database>>, source_path: std::pa
     });
 }
 
+/// Propagate a theme change to the import window while it is open.
+pub fn set_dark(dark: bool) {
+    IMPORT.with(|i| {
+        let guard = i.borrow();
+        if let Some(imp) = guard.as_ref() {
+            imp.window.set_dark(dark);
+        }
+    });
+}
+
 fn build(db: Arc<Mutex<maple_db::Database>>) -> Result<Import, slint::PlatformError> {
     let window = ImportWindow::new()?;
 
     let entries: Rc<RefCell<Vec<Entry>>> = Rc::new(RefCell::new(Vec::new()));
     let selected: Rc<RefCell<HashSet<usize>>> = Rc::new(RefCell::new(HashSet::new()));
     let current: Rc<Cell<usize>> = Rc::new(Cell::new(0));
+    // Persistent model, mutated in place via `set_row_data` for single-row
+    // changes (selection toggle, thumb arriving, rotate, …) instead of being
+    // replaced wholesale. Swapping in a brand-new `VecModel` on every click
+    // forces Slint to tear down and recreate every tile's `TouchArea`; a
+    // second click landing mid-rebuild would then hit a fresh TouchArea that
+    // never saw the press, silently dropping the click. Reserve full
+    // `set_vec` resets for genuinely bulk changes (new scan, all counts known).
+    let model: Rc<VecModel<ImportItem>> = Rc::new(VecModel::default());
+    window.set_items(ModelRc::from(model.clone()));
+    // Which entry's big preview is actually on screen right now — `None`
+    // until something has genuinely been rendered into it. `current`
+    // defaults to 0 before anything is ever previewed, so comparing against
+    // `current` alone can't tell "index 0 is already showing" apart from
+    // "nothing has been shown yet, and this happens to be index 0".
+    let preview_shown_idx: Rc<Cell<Option<usize>>> = Rc::new(Cell::new(None));
+    // Count of thumbnails processed so far during the current scan — drives
+    // the progress bar shown while `scanning` is true.
+    let scanned_count: Rc<Cell<usize>> = Rc::new(Cell::new(0));
     let source: Rc<RefCell<PathBuf>> = Rc::new(RefCell::new(PathBuf::new()));
     // The embedded sidebar ImportPage only lets the user pick a *source*
     // folder — there is no destination step in that flow anymore, so default
@@ -221,7 +251,10 @@ fn build(db: Arc<Mutex<maple_db::Database>>) -> Result<Import, slint::PlatformEr
         let current = current.clone();
         let source = source.clone();
         let groups = groups.clone();
+        let preview_shown_idx = preview_shown_idx.clone();
+        let scanned_count = scanned_count.clone();
         let scan_timer = scan_timer.clone();
+        let model = model.clone();
 
         move || {
             let Some(w) = w.upgrade() else { return };
@@ -235,10 +268,14 @@ fn build(db: Arc<Mutex<maple_db::Database>>) -> Result<Import, slint::PlatformEr
             selected.borrow_mut().clear();
             groups.borrow_mut().clear();
             current.set(0);
-            w.set_items(ModelRc::from(Rc::new(VecModel::<ImportItem>::default())));
+            preview_shown_idx.set(None);
+            scanned_count.set(0);
+            model.set_vec(Vec::new());
             w.set_selected_count(0);
             w.set_copy_done(false);
             w.set_total_count(0);
+            w.set_scanned_count(0);
+            w.set_scanning(true);
             w.set_preview_photo(slint::Image::default());
             w.set_preview_filename(SharedString::default());
             w.set_status_text("Scanning…".into());
@@ -385,6 +422,9 @@ fn build(db: Arc<Mutex<maple_db::Database>>) -> Result<Import, slint::PlatformEr
             let selected2 = selected.clone();
             let current2 = current.clone();
             let groups2 = groups.clone();
+            let preview_shown_idx2 = preview_shown_idx.clone();
+            let scanned_count2 = scanned_count.clone();
+            let model2 = model.clone();
             let timer = Timer::default();
             timer.start(
                 TimerMode::Repeated,
@@ -410,7 +450,9 @@ fn build(db: Arc<Mutex<maple_db::Database>>) -> Result<Import, slint::PlatformEr
                                 }
                                 drop(ents);
                                 w.set_total_count(n as i32);
-                                w.set_items(build_model(
+                                // Bulk reset — happens once per scan when the
+                                // count first arrives, not on every click.
+                                model2.set_vec(build_items(
                                     &entries2.borrow(),
                                     &selected2.borrow(),
                                     &groups2.borrow(),
@@ -442,11 +484,15 @@ fn build(db: Arc<Mutex<maple_db::Database>>) -> Result<Import, slint::PlatformEr
                                         e.sharpness = sharpness;
                                     }
                                 }
-                                w.set_items(build_model(
+                                update_row(
+                                    &model2,
                                     &entries2.borrow(),
                                     &selected2.borrow(),
                                     &groups2.borrow(),
-                                ));
+                                    index,
+                                );
+                                scanned_count2.set(scanned_count2.get() + 1);
+                                w.set_scanned_count(scanned_count2.get() as i32);
                                 // Show preview for the first result.
                                 if is_first {
                                     let filename = path
@@ -455,6 +501,7 @@ fn build(db: Arc<Mutex<maple_db::Database>>) -> Result<Import, slint::PlatformEr
                                         .unwrap_or_default();
                                     if let Some(img) = thumb {
                                         w.set_preview_photo(img);
+                                        preview_shown_idx2.set(Some(0));
                                     }
                                     w.set_preview_filename(filename.into());
                                 }
@@ -511,11 +558,14 @@ fn build(db: Arc<Mutex<maple_db::Database>>) -> Result<Import, slint::PlatformEr
                                 }
                                 *groups2.borrow_mut() = resolved_groups;
 
+                                w.set_scanning(false);
                                 w.set_status_text(
                                     format!("{n} photo{} found",
                                         if n == 1 { "" } else { "s" }).into(),
                                 );
-                                w.set_items(build_model(
+                                // Bulk reset — happens once when the scan
+                                // finishes, not on every click.
+                                model2.set_vec(build_items(
                                     &entries2.borrow(),
                                     &selected2.borrow(),
                                     &groups2.borrow(),
@@ -523,6 +573,7 @@ fn build(db: Arc<Mutex<maple_db::Database>>) -> Result<Import, slint::PlatformEr
                                 return;
                             }
                             Ok(ScanMsg::Error(e)) => {
+                                w.set_scanning(false);
                                 w.set_status_text(format!("Scan error: {e}").into());
                                 return;
                             }
@@ -543,10 +594,15 @@ fn build(db: Arc<Mutex<maple_db::Database>>) -> Result<Import, slint::PlatformEr
         let selected = selected.clone();
         let current = current.clone();
         let groups = groups.clone();
+        let preview_shown_idx = preview_shown_idx.clone();
+        let model = model.clone();
         move |idx| {
             let Some(w) = w.upgrade() else { return };
             let idx = idx as usize;
-            let navigated_to_new_item = current.get() != idx;
+            // Only skip the reload if this exact photo is *already* the one
+            // on screen — `current` alone isn't enough, since it defaults to
+            // 0 before anything has ever been previewed.
+            let already_shown = preview_shown_idx.get() == Some(idx);
             {
                 let mut sel = selected.borrow_mut();
                 if sel.contains(&idx) {
@@ -557,15 +613,18 @@ fn build(db: Arc<Mutex<maple_db::Database>>) -> Result<Import, slint::PlatformEr
             }
             w.set_copy_done(false);
             w.set_selected_count(selected.borrow().len() as i32);
+            // A click only ever changes this one row's selection state —
+            // update it in place rather than rebuilding the whole model.
+            update_row(&model, &entries.borrow(), &selected.borrow(), &groups.borrow(), idx);
 
             // Clicking the already-open photo just toggles its selection —
             // don't re-decode and re-render the big preview for no reason.
-            if !navigated_to_new_item {
-                w.set_items(build_model(&entries.borrow(), &selected.borrow(), &groups.borrow()));
+            if already_shown {
                 return;
             }
             current.set(idx);
             w.set_current_index(idx as i32);
+            preview_shown_idx.set(Some(idx));
 
             let ents = entries.borrow();
             if let Some(e) = ents.get(idx) {
@@ -598,8 +657,6 @@ fn build(db: Arc<Mutex<maple_db::Database>>) -> Result<Import, slint::PlatformEr
                     });
                 });
             }
-            drop(ents);
-            w.set_items(build_model(&entries.borrow(), &selected.borrow(), &groups.borrow()));
         }
     });
 
@@ -616,8 +673,8 @@ fn build(db: Arc<Mutex<maple_db::Database>>) -> Result<Import, slint::PlatformEr
         let w = window.as_weak();
         let entries = entries.clone();
         let current = current.clone();
-        let selected = selected.clone();
         let groups = groups.clone();
+        let preview_shown_idx = preview_shown_idx.clone();
         move || {
             let Some(w) = w.upgrade() else { return };
             let len = entries.borrow().len();
@@ -648,6 +705,7 @@ fn build(db: Arc<Mutex<maple_db::Database>>) -> Result<Import, slint::PlatformEr
             }
             current.set(new_idx);
             w.set_current_index(new_idx as i32);
+            preview_shown_idx.set(Some(new_idx));
 
             let ents = entries.borrow();
             if let Some(e) = ents.get(new_idx) {
@@ -678,8 +736,6 @@ fn build(db: Arc<Mutex<maple_db::Database>>) -> Result<Import, slint::PlatformEr
                     });
                 });
             }
-            drop(ents);
-            w.set_items(build_model(&entries.borrow(), &selected.borrow(), &groups.borrow()));
         }
     };
     window.on_nav_prev(make_nav(-1));
@@ -695,6 +751,7 @@ fn build(db: Arc<Mutex<maple_db::Database>>) -> Result<Import, slint::PlatformEr
         let groups = groups.clone();
         let copy_timer = copy_timer.clone();
         let copy_done_timer = copy_done_timer.clone();
+        let model = model.clone();
         move || {
             let Some(w) = w.upgrade() else { return };
             let sel = selected.borrow().clone();
@@ -716,6 +773,12 @@ fn build(db: Arc<Mutex<maple_db::Database>>) -> Result<Import, slint::PlatformEr
             let library_dir = settings.library_dir.clone();
             let algorithm_key = settings.stacks.algorithm_key();
 
+            let copy_mode = match w.get_copy_mode() {
+                0 => maple_import::CopyMode::DisplayOnly,
+                2 => maple_import::CopyMode::RawOnly,
+                _ => maple_import::CopyMode::All,
+            };
+
             let mut sources: Vec<PathBuf> = Vec::new();
             let mut sel_indices: Vec<usize> = sel.iter().copied().collect();
             sel_indices.sort_unstable();
@@ -735,7 +798,7 @@ fn build(db: Arc<Mutex<maple_db::Database>>) -> Result<Import, slint::PlatformEr
                                 .map(|p| maple_import::ImageFile { path: p.clone(), size: 0 })
                                 .collect(),
                         };
-                        for p in group.paths_for_copy(maple_import::CopyMode::default()) {
+                        for p in group.paths_for_copy(copy_mode) {
                             sources.push(p);
                         }
                         entry_data.push((e.path.clone(), e.content_hash));
@@ -773,6 +836,7 @@ fn build(db: Arc<Mutex<maple_db::Database>>) -> Result<Import, slint::PlatformEr
             let groups2 = groups.clone();
             let db2 = db.clone();
             let copy_done_timer = copy_done_timer.clone();
+            let model2 = model.clone();
             let timer = Timer::default();
             timer.start(
                 TimerMode::Repeated,
@@ -829,11 +893,16 @@ fn build(db: Arc<Mutex<maple_db::Database>>) -> Result<Import, slint::PlatformEr
                                     format!("Copied {copied}, {failed} failed")
                                 };
                                 w.set_status_text(msg.into());
-                                w.set_items(build_model(
-                                    &entries2.borrow(),
-                                    &selected2.borrow(),
-                                    &groups2.borrow(),
-                                ));
+                                // Only the copied rows' selected/imported flags
+                                // changed — update those in place.
+                                {
+                                    let ents = entries2.borrow();
+                                    let sel = selected2.borrow();
+                                    let grp = groups2.borrow();
+                                    for &i in &sel_indices {
+                                        update_row(&model2, &ents, &sel, &grp, i);
+                                    }
+                                }
 
                                 // Flash the button green, then revert to the
                                 // normal "Copy Selected" state.
@@ -885,6 +954,7 @@ fn build(db: Arc<Mutex<maple_db::Database>>) -> Result<Import, slint::PlatformEr
         let selected = selected.clone();
         let groups = groups.clone();
         let rotate_timer = rotate_timer.clone();
+        let model = model.clone();
         move |clockwise| {
             let Some(w) = w.upgrade() else { return };
             if w.get_rotating() {
@@ -931,6 +1001,7 @@ fn build(db: Arc<Mutex<maple_db::Database>>) -> Result<Import, slint::PlatformEr
             let selected2 = selected.clone();
             let groups2 = groups.clone();
             let rotate_timer_slot = rotate_timer.clone();
+            let model2 = model.clone();
             let timer = Timer::default();
             timer.start(TimerMode::Repeated, Duration::from_millis(32), move || {
                 let Some(w) = w_weak.upgrade() else { return };
@@ -959,7 +1030,7 @@ fn build(db: Arc<Mutex<maple_db::Database>>) -> Result<Import, slint::PlatformEr
                             &rgb, pw, ph,
                         );
                         w.set_preview_photo(slint::Image::from_rgb8(buf));
-                        w.set_items(build_model(&entries2.borrow(), &selected2.borrow(), &groups2.borrow()));
+                        update_row(&model2, &entries2.borrow(), &selected2.borrow(), &groups2.borrow(), idx);
                         w.set_rotating(false);
                     }
                     RotateMsg::Error(msg) => {
@@ -988,28 +1059,51 @@ fn build(db: Arc<Mutex<maple_db::Database>>) -> Result<Import, slint::PlatformEr
     })
 }
 
-/// Rebuild the full [`ImportItem`] model from current state.
-///
-/// Called each time the selection or scan state changes. This is not cheap
-/// (rebuilds every item) but the import grid is small (100s of items) and
-/// we don't update on every frame, so it's acceptable.
-fn build_model(entries: &[Entry], selected: &HashSet<usize>, groups: &[Vec<usize>]) -> ModelRc<ImportItem> {
-    let items: Vec<ImportItem> = entries
-        .iter()
-        .enumerate()
-        .map(|(i, e)| ImportItem {
-            index: i as i32,
-            filename: e
-                .path
-                .file_name()
-                .map(|n| SharedString::from(n.to_string_lossy().as_ref()))
-                .unwrap_or_default(),
-            thumb: e.thumb.clone().unwrap_or_default(),
-            loaded: !e.path.as_os_str().is_empty(),
-            is_selected: selected.contains(&i),
-            is_imported: e.is_imported,
-            stack_size: find_group(groups, i).map(|g| g.len() as i32).unwrap_or(0),
-        })
-        .collect();
-    ModelRc::from(Rc::new(VecModel::from(items)))
+/// Build the [`ImportItem`] for a single entry.
+fn make_item(entries: &[Entry], selected: &HashSet<usize>, groups: &[Vec<usize>], i: usize) -> ImportItem {
+    let e = &entries[i];
+    let display_is_raw = maple_import::is_raw_format(&e.path);
+    let has_jpg =
+        !display_is_raw || e.companions.iter().any(|c| !maple_import::is_raw_format(c));
+    let has_raw =
+        display_is_raw || e.companions.iter().any(|c| maple_import::is_raw_format(c));
+    ImportItem {
+        index: i as i32,
+        filename: e
+            .path
+            .file_name()
+            .map(|n| SharedString::from(n.to_string_lossy().as_ref()))
+            .unwrap_or_default(),
+        thumb: e.thumb.clone().unwrap_or_default(),
+        loaded: !e.path.as_os_str().is_empty(),
+        is_selected: selected.contains(&i),
+        is_imported: e.is_imported,
+        stack_size: find_group(groups, i).map(|g| g.len() as i32).unwrap_or(0),
+        has_jpg,
+        has_raw,
+    }
+}
+
+/// Build the full [`ImportItem`] vec from current state, for bulk resets
+/// (new scan, count/size known, scan finished). Not for per-click updates —
+/// use [`update_row`] for those so a full model swap doesn't tear down and
+/// recreate every tile's `TouchArea` (which can drop a click landing
+/// mid-rebuild).
+fn build_items(entries: &[Entry], selected: &HashSet<usize>, groups: &[Vec<usize>]) -> Vec<ImportItem> {
+    (0..entries.len())
+        .map(|i| make_item(entries, selected, groups, i))
+        .collect()
+}
+
+/// Update a single row of the persistent model in place.
+fn update_row(
+    model: &VecModel<ImportItem>,
+    entries: &[Entry],
+    selected: &HashSet<usize>,
+    groups: &[Vec<usize>],
+    i: usize,
+) {
+    if i < entries.len() {
+        model.set_row_data(i, make_item(entries, selected, groups, i));
+    }
 }
