@@ -25,6 +25,7 @@ mod face_tag;
 mod grid;
 mod image_loader;
 mod import;
+mod path_template_window;
 mod people_page;
 mod services;
 mod settings_window;
@@ -90,6 +91,11 @@ pub fn run() -> anyhow::Result<()> {
     // Tracks the query last passed to `grid.load()` (search text / person
     // filter / …) so the date-view toggle can reload with it unchanged.
     let current_query: Rc<RefCell<SearchQuery>> = Rc::new(RefCell::new(SearchQuery::default()));
+
+    // Let other windows (rotation, library restructure, …) request a grid
+    // reload without needing `grid`/`current_query` threaded through their
+    // own constructors — see `grid::request_reload`.
+    grid::register(grid.clone(), current_query.clone());
 
     // Library is the default page — load immediately.
     grid.load(SearchQuery::default());
@@ -506,6 +512,7 @@ pub fn run() -> anyhow::Result<()> {
         detail::set_dark(is_dark);
         debug_compare::set_dark(is_dark);
         import::set_dark(is_dark);
+        path_template_window::set_dark(is_dark);
     });
 
     // ── Other secondary windows ────────────────────────────────────

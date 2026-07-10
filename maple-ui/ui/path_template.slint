@@ -1,0 +1,401 @@
+// Destination path template popup — configures how imported files are
+// organised into subfolders and (optionally) renamed.
+import { Theme } from "theme.slint";
+import { ProgressBar } from "widgets.slint";
+import { LineEdit, ScrollView } from "std-widgets.slint";
+
+// Footer action button — bordered, with an optional filled "primary" style
+// for the affirmative action (Save).
+component DialogButton inherits Rectangle {
+    in property <string> text: "";
+    in property <bool> primary: false;
+    callback clicked;
+
+    height: 34px;
+    horizontal-stretch: 0;
+    border-radius: Theme.radius-btn;
+    background: root.primary
+        ? (btn-ta.has-hover ? Theme.accent.darker(0.12) : Theme.accent)
+        : (btn-ta.has-hover ? Theme.border.with-alpha(0.5) : Theme.surface);
+    border-width: 1px;
+    border-color: root.primary ? Theme.accent : Theme.border;
+    animate background { duration: 100ms; }
+
+    HorizontalLayout {
+        padding-left: 16px;
+        padding-right: 16px;
+        padding-top: 9px;
+        padding-bottom: 9px;
+        Text {
+            text: root.text;
+            color: root.primary ? Theme.accent-fg : Theme.ink;
+            font-size: 13px;
+            font-weight: 600;
+            vertical-alignment: center;
+        }
+    }
+
+    btn-ta := TouchArea { clicked => { root.clicked(); } }
+}
+
+// Small preset button — sets a template field to a canned value.
+component PresetChip inherits Rectangle {
+    in property <string> text: "";
+    callback clicked;
+
+    height: 26px;
+    horizontal-stretch: 0;
+    border-radius: 7px;
+    background: chip-ta.has-hover ? Theme.border.with-alpha(0.6) : Theme.field;
+    border-width: 1px;
+    border-color: Theme.border;
+    animate background { duration: 100ms; }
+
+    HorizontalLayout {
+        padding-left: 10px;
+        padding-right: 10px;
+        Text {
+            text: root.text;
+            color: Theme.ink-2;
+            font-size: 11px;
+            font-weight: 500;
+            vertical-alignment: center;
+        }
+    }
+
+    chip-ta := TouchArea { clicked => { root.clicked(); } }
+}
+
+component FieldLabel inherits Text {
+    color: Theme.ink-3;
+    font-size: 11px;
+    font-weight: 600;
+    letter-spacing: 0.5px;
+}
+
+export component PathTemplateWindow inherits Window {
+    title: "Maple — File Naming";
+    preferred-width: 480px;
+    preferred-height: 640px;
+    min-width: 420px;
+    min-height: 420px;
+    background: Theme.bg;
+    default-font-size: 14px;
+
+    // Two-way alias so Rust can sync the theme from AppWindow.
+    in-out property <bool> dark <=> Theme.dark;
+
+    in-out property <string> folder-template:   "";
+    in-out property <string> filename-template: "";
+    in property <string> preview-text: "";
+
+    // ── Restructure existing library files ────────────────────────
+    in-out property <bool>   confirm-open:        false;
+    in property <string>     confirm-message:      "";
+    in-out property <bool>   restructuring:        false;
+    in property <int>        restructure-done:     0;
+    in property <int>        restructure-total:    0;
+    in property <string>     restructure-summary:  "";
+
+    callback close-requested;
+    callback save;
+    callback preview;
+    callback restructure-confirmed;
+
+    init => { key-scope.focus(); root.preview(); }
+
+    key-scope := FocusScope {
+        width: 100%; height: 100%;
+
+        key-pressed(event) => {
+            if event.text == Key.Escape {
+                if root.restructuring {
+                    return accept;
+                }
+                if root.confirm-open {
+                    root.confirm-open = false;
+                } else {
+                    root.close-requested();
+                }
+                return accept;
+            }
+            return reject;
+        }
+
+        VerticalLayout {
+            // ── Header ───────────────────────────────────────────
+            Rectangle {
+                height: 56px;
+                background: Theme.bg;
+
+                Rectangle {
+                    x: 0; y: parent.height - 1px;
+                    width: parent.width; height: 1px;
+                    background: Theme.border;
+                }
+
+                HorizontalLayout {
+                    padding-left: 22px;
+                    padding-right: 14px;
+                    spacing: 10px;
+                    Text {
+                        text: "File Naming";
+                        color: Theme.ink;
+                        font-size: 17px;
+                        font-weight: 700;
+                        vertical-alignment: center;
+                        horizontal-stretch: 1;
+                    }
+                    Rectangle {
+                        width: 32px; height: 32px;
+                        horizontal-stretch: 0;
+                        border-radius: 8px;
+                        background: close-ta.has-hover ? Theme.border.with-alpha(0.7) : transparent;
+                        y: (parent.height - self.height) / 2;
+                        animate background { duration: 100ms; }
+                        Path {
+                            width: 12px; height: 12px;
+                            x: (parent.width  - self.width)  / 2;
+                            y: (parent.height - self.height) / 2;
+                            viewbox-width: 24; viewbox-height: 24;
+                            fill: transparent;
+                            stroke: Theme.ink-2;
+                            stroke-width: 2.2px;
+                            commands: "M6 6L18 18M18 6L6 18";
+                        }
+                        close-ta := TouchArea {
+                            clicked => { if !root.restructuring { root.close-requested(); } }
+                        }
+                    }
+                }
+            }
+
+            // ── Body (scrollable) ─────────────────────────────────
+            ScrollView {
+                vertical-stretch: 1;
+
+            VerticalLayout {
+                padding: 20px;
+                spacing: 18px;
+
+                Text {
+                    text: "Controls where imported photos land and, optionally, how they're renamed. Both fields use {TOKEN} placeholders — the file's original extension is always kept.";
+                    color: Theme.ink-2;
+                    font-size: 12px;
+                    wrap: word-wrap;
+                }
+
+                // ── Folder structure ──────────────────────────────
+                VerticalLayout {
+                    spacing: 6px;
+                    FieldLabel { text: "FOLDER STRUCTURE"; }
+                    HorizontalLayout {
+                        spacing: 6px;
+                        PresetChip {
+                            text: "Flat";
+                            clicked => { root.folder-template = ""; root.preview(); }
+                        }
+                        PresetChip {
+                            text: "Year/Month";
+                            clicked => { root.folder-template = "{YYYY}/{MM}"; root.preview(); }
+                        }
+                        PresetChip {
+                            text: "Year/Month/Day";
+                            clicked => { root.folder-template = "{YYYY}/{MM}/{DD}"; root.preview(); }
+                        }
+                        Rectangle { horizontal-stretch: 1; }
+                    }
+                    LineEdit {
+                        text <=> root.folder-template;
+                        placeholder-text: "e.g. {YYYY}/{MM}/{DD}";
+                        edited => { root.preview(); }
+                    }
+                }
+
+                // ── Filename ───────────────────────────────────────
+                VerticalLayout {
+                    spacing: 6px;
+                    FieldLabel { text: "FILENAME"; }
+                    HorizontalLayout {
+                        spacing: 6px;
+                        PresetChip {
+                            text: "None (keep original)";
+                            clicked => { root.filename-template = "{original}"; root.preview(); }
+                        }
+                        PresetChip {
+                            text: "Date + original";
+                            clicked => { root.filename-template = "{YYYY}{MM}{DD}_{original}"; root.preview(); }
+                        }
+                    }
+                    HorizontalLayout {
+                        spacing: 6px;
+                        PresetChip {
+                            text: "Date + time + original";
+                            clicked => { root.filename-template = "{YYYY}{MM}{DD}_{hh}{mm}{ss}_{original}"; root.preview(); }
+                        }
+                        PresetChip {
+                            text: "Sequential";
+                            clicked => { root.filename-template = "{YYYY}{MM}{DD}_{counter}"; root.preview(); }
+                        }
+                        Rectangle { horizontal-stretch: 1; }
+                    }
+                    LineEdit {
+                        text <=> root.filename-template;
+                        placeholder-text: "e.g. {original}";
+                        edited => { root.preview(); }
+                    }
+                }
+
+                // ── Preview ────────────────────────────────────────
+                Rectangle {
+                    border-radius: 10px;
+                    border-width: 1px; border-color: Theme.border;
+                    background: Theme.surface;
+                    VerticalLayout {
+                        padding: 12px;
+                        spacing: 4px;
+                        FieldLabel { text: "PREVIEW"; }
+                        Text {
+                            text: root.preview-text;
+                            color: Theme.accent-text;
+                            font-size: 13px;
+                            font-family: "monospace";
+                            wrap: word-wrap;
+                        }
+                    }
+                }
+
+                // ── Token reference ────────────────────────────────
+                Text {
+                    text: "Tokens: {YYYY} {YY} {MM} {DD} {hh} {mm} {ss} — capture date/time (falls back to file date). {original} — source filename. {counter} — position in this import. {camera} — EXIF make + model, when available.";
+                    color: Theme.ink-3;
+                    font-size: 11px;
+                    wrap: word-wrap;
+                }
+            }
+            }
+
+            // ── Footer (pinned, always visible) ───────────────────
+            Rectangle {
+                height: 64px;
+                background: Theme.bg;
+
+                Rectangle {
+                    x: 0; y: 0;
+                    width: parent.width; height: 1px;
+                    background: Theme.border;
+                }
+
+                if !root.restructuring && root.restructure-summary == "": HorizontalLayout {
+                    padding: 15px;
+                    spacing: 8px;
+                    Rectangle { horizontal-stretch: 1; }
+                    DialogButton {
+                        text: "Cancel";
+                        clicked => { root.close-requested(); }
+                    }
+                    DialogButton {
+                        text: "Save";
+                        primary: true;
+                        clicked => { root.save(); }
+                    }
+                }
+
+                if root.restructuring: HorizontalLayout {
+                    padding: 15px;
+                    spacing: 8px;
+                    VerticalLayout {
+                        horizontal-stretch: 1;
+                        spacing: 6px;
+                        ProgressBar {
+                            value: root.restructure-total > 0
+                                ? root.restructure-done * 1.0 / root.restructure-total
+                                : 0;
+                        }
+                        Text {
+                            text: "Moving files: \{root.restructure-done} / \{root.restructure-total}";
+                            color: Theme.ink-2;
+                            font-size: 11px;
+                        }
+                    }
+                }
+
+                if !root.restructuring && root.restructure-summary != "": HorizontalLayout {
+                    padding: 15px;
+                    spacing: 8px;
+                    Text {
+                        text: root.restructure-summary;
+                        color: Theme.ink-2;
+                        font-size: 12px;
+                        vertical-alignment: center;
+                        horizontal-stretch: 1;
+                        wrap: word-wrap;
+                    }
+                    DialogButton {
+                        text: "Done";
+                        primary: true;
+                        clicked => { root.close-requested(); }
+                    }
+                }
+            }
+        }
+
+        // ── Restructure confirmation modal ────────────────────────
+        if root.confirm-open: Rectangle {
+            width: 100%; height: 100%;
+            background: #000000bb;
+            TouchArea { }
+
+            Rectangle {
+                x: (parent.width  - self.width)  / 2;
+                y: (parent.height - self.height) / 2;
+                width: 380px;
+                height: confirm-layout.preferred-height;
+                background: Theme.surface;
+                border-radius: 12px;
+                border-width: 1px;
+                border-color: Theme.border;
+                drop-shadow-blur: 24px;
+                drop-shadow-offset-y: 4px;
+                drop-shadow-color: #00000025;
+
+                confirm-layout := VerticalLayout {
+                    padding: 22px;
+                    spacing: 16px;
+
+                    Text {
+                        text: "Restructure Library";
+                        color: Theme.ink;
+                        font-size: 16px;
+                        font-weight: 700;
+                    }
+                    Text {
+                        text: root.confirm-message;
+                        color: Theme.ink-2;
+                        font-size: 13px;
+                        wrap: word-wrap;
+                    }
+                    HorizontalLayout {
+                        spacing: 8px;
+                        Rectangle { horizontal-stretch: 1; }
+                        DialogButton {
+                            text: "Not Now";
+                            clicked => {
+                                root.confirm-open = false;
+                                root.close-requested();
+                            }
+                        }
+                        DialogButton {
+                            text: "Move Files";
+                            primary: true;
+                            clicked => {
+                                root.confirm-open = false;
+                                root.restructure-confirmed();
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}

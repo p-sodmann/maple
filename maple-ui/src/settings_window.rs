@@ -39,6 +39,24 @@ pub fn open(db: Arc<Mutex<maple_db::Database>>, is_dark: bool) {
     });
 }
 
+/// Refresh the destination-path summary rows, if the settings window is
+/// currently open. Called by `path_template_window` after a save so the
+/// two windows stay in sync without a full re-`open()`.
+pub fn refresh_path_template_display() {
+    SETTINGS.with(|s| {
+        let guard = s.borrow();
+        if let Some(win) = guard.as_ref() {
+            let settings = maple_state::Settings::load();
+            win.set_path_template_folder(if settings.path_template.folder.is_empty() {
+                "(flat)".into()
+            } else {
+                settings.path_template.folder.into()
+            });
+            win.set_path_template_filename(SharedString::from(settings.path_template.filename));
+        }
+    });
+}
+
 /// Propagate a theme change to the settings window while it is open.
 pub fn set_dark(dark: bool) {
     SETTINGS.with(|s| {
@@ -105,6 +123,15 @@ fn build(db: Arc<Mutex<maple_db::Database>>) -> Result<SettingsWindow, slint::Pl
         }
     });
 
+    window.on_open_path_template({
+        let w = window.as_weak();
+        let db = db.clone();
+        move || {
+            let is_dark = w.upgrade().map(|w| w.get_dark()).unwrap_or(false);
+            crate::path_template_window::open(db.clone(), is_dark);
+        }
+    });
+
     window.on_clear_thumbnail_cache({
         let w = window.as_weak();
         move || {
@@ -137,6 +164,14 @@ fn populate(window: &SettingsWindow) {
     window.set_thumbnail_quality(
         SharedString::from(format!("{}%", s.thumbnails.quality))
     );
+    window.set_path_template_folder(
+        if s.path_template.folder.is_empty() {
+            "(flat)".into()
+        } else {
+            s.path_template.folder.clone().into()
+        },
+    );
+    window.set_path_template_filename(SharedString::from(s.path_template.filename.clone()));
     window.set_ai_endpoint(
         if s.ai.enabled {
             s.ai.server_url.clone().into()

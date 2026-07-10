@@ -32,7 +32,7 @@ pub use face_detector::{spawn_face_tagger, DetectedFace, FaceDetector, FaceTagge
 pub use faces::{best_person_match, best_person_matches, cosine_similarity, FaceDetection, Person, PersonWithRep};
 pub use metadata::{extract_all_exif_tags, extract_metadata, spawn_metadata_filler, ImageMetadata};
 pub use query::SearchQuery;
-pub use scanner::LibraryScanner;
+pub use scanner::{set_scanner_paused, LibraryScanner};
 pub use thumb_cache::ThumbnailCache;
 pub use semantic::{spawn_sentence_embedder, split_sentences, SemanticEncoder, SentenceEmbedder};
 
@@ -520,6 +520,28 @@ impl Database {
         self.conn.execute(
             "UPDATE images SET raw_path = ?1 WHERE id = ?2",
             params![path_to_db(raw_path), id],
+        )?;
+        Ok(())
+    }
+
+    /// Update the on-disk location and display filename for an image record
+    /// after a library restructure move (see `maple_import::restructure`).
+    /// The `images_fts_au` trigger keeps `image_fts` in sync automatically.
+    pub fn update_image_location(
+        &self,
+        id: i64,
+        new_path: &Path,
+        new_raw_path: Option<&Path>,
+        new_filename: &str,
+    ) -> anyhow::Result<()> {
+        self.conn.execute(
+            "UPDATE images SET path = ?1, raw_path = ?2, filename = ?3 WHERE id = ?4",
+            params![
+                path_to_db(new_path),
+                new_raw_path.map(path_to_db),
+                new_filename,
+                id,
+            ],
         )?;
         Ok(())
     }
@@ -1013,6 +1035,43 @@ impl Database {
             })?
             .filter_map(|r| r.ok())
             .map(|(p, s, h)| (p, s, h.try_into().ok()))
+            .collect();
+        Ok(rows)
+    }
+
+    /// All present images, packaged as restructure planning candidates (see
+    /// `maple_import::restructure::plan_moves`). Metadata comes straight
+    /// from already-extracted EXIF columns — no per-file disk re-read.
+    pub fn restructure_candidates(&self) -> anyhow::Result<Vec<maple_import::RestructureCandidate>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, path, raw_path, taken_at, make, model FROM images WHERE status = 'present'",
+        )?;
+        let rows = stmt
+            .query_map([], |r| {
+                Ok((
+                    r.get::<_, i64>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, Option<String>>(2)?,
+                    r.get::<_, Option<i64>>(3)?,
+                    r.get::<_, Option<String>>(4)?,
+                    r.get::<_, Option<String>>(5)?,
+                ))
+            })?
+            .filter_map(|r| r.ok())
+            .map(|(id, path, raw_path, taken_at, make, model)| {
+                let camera = match (make, model) {
+                    (Some(make), Some(model)) => Some(format!("{make} {model}")),
+                    (Some(v), None) | (None, Some(v)) => Some(v),
+                    (None, None) => None,
+                };
+                maple_import::RestructureCandidate {
+                    id,
+                    current_path: path_from_db(path),
+                    current_raw_path: raw_path.map(path_from_db),
+                    datetime: taken_at.map(maple_import::ExifDateTime::from_unix_timestamp),
+                    camera,
+                }
+            })
             .collect();
         Ok(rows)
     }
@@ -1535,5 +1594,55 @@ mod tests {
         let results = db.search_images(&SearchQuery::default()).unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].raw_path.as_deref(), Some(raf.as_path()));
+    }
+
+    #[test]
+    fn restructure_candidates_reflects_present_images_only() {
+        let (_dir, db) = tmp_db();
+        let present = PathBuf::from("/library/a.jpg");
+        let missing = PathBuf::from("/library/b.jpg");
+        db.insert_image(&present, &fake_hash(70), 1024).unwrap();
+        db.insert_image(&missing, &fake_hash(71), 1024).unwrap();
+        db.mark_missing(&missing).unwrap();
+
+        let id = db.image_id_for_path(&present).unwrap().unwrap();
+        db.update_metadata(
+            id,
+            &ImageMetadata {
+                filename: Some("a.jpg".into()),
+                taken_at: Some(1_710_513_045),
+                make: Some("Fujifilm".into()),
+                model: Some("X100V".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        let candidates = db.restructure_candidates().unwrap();
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].current_path, present);
+        assert_eq!(candidates[0].camera.as_deref(), Some("Fujifilm X100V"));
+        assert!(candidates[0].datetime.is_some());
+    }
+
+    #[test]
+    fn update_image_location_moves_row_and_resyncs_fts() {
+        let (_dir, db) = tmp_db();
+        let old = PathBuf::from("/library/old/a.jpg");
+        db.insert_image(&old, &fake_hash(72), 1024).unwrap();
+        let id = db.image_id_for_path(&old).unwrap().unwrap();
+
+        let new_path = PathBuf::from("/library/2024/03/photo.jpg");
+        db.update_image_location(id, &new_path, None, "photo.jpg").unwrap();
+
+        let results = db.search_images(&SearchQuery::default()).unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].path, new_path);
+        assert_eq!(results[0].meta.filename.as_deref(), Some("photo.jpg"));
+
+        // The images_fts_au trigger should have resynced the FTS row to the
+        // new filename.
+        let hits = db.search_images(&SearchQuery::default().with_text("photo")).unwrap();
+        assert_eq!(hits.len(), 1);
     }
 }

@@ -13,6 +13,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -26,6 +27,23 @@ const SCAN_INTERVAL: Duration = Duration::from_secs(60);
 
 /// Subdirectory names inside `library_dir` that the scanner never ingests.
 const EXCLUDED_DIRS: &[&str] = &["aligned_faces", ".thumbcache"];
+
+/// When set, [`LibraryScanner::run_scan`] becomes a no-op for the duration.
+///
+/// Used to keep the periodic reconciliation from racing a library
+/// restructure (`maple_ui::path_template_window`), which moves files and
+/// updates their DB row one at a time — a scan firing mid-operation could
+/// see a file "missing" at its old path and "new" at its new path before
+/// the corresponding DB update lands, inserting a duplicate row.
+static PAUSED: AtomicBool = AtomicBool::new(false);
+
+/// Pause or resume the periodic scanner. There is only ever one
+/// [`LibraryScanner`] per process, so this is process-global rather than
+/// tied to a particular instance. Callers must not overlap pause/resume
+/// spans (not reference-counted).
+pub fn set_scanner_paused(paused: bool) {
+    PAUSED.store(paused, Ordering::SeqCst);
+}
 
 pub struct LibraryScanner {
     db: Arc<Mutex<Database>>,
@@ -59,6 +77,11 @@ impl LibraryScanner {
     }
 
     fn run_scan(&self) {
+        if PAUSED.load(Ordering::SeqCst) {
+            tracing::debug!("Library scan skipped: paused for a restructure");
+            return;
+        }
+
         let dir = &self.library_dir;
         if !dir.is_dir() {
             tracing::debug!(

@@ -7,4 +7,5 @@ pub mod faces;
 pub mod images;
 pub mod import;
 pub mod people;
+pub mod restructure;
 pub mod settings;

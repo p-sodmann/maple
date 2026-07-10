@@ -19,9 +19,22 @@ library_dir = ""
 # Defaults to ~/.config/maple/library.db when left empty.
 database_path = ""
 
-# strftime-style format string for organising imported files into
-# subdirectories based on EXIF date.  Set to "" to disable (flat copy).
-folder_format = "%Y/%m"
+# ── Destination path template ───────────────────────────────────
+# Controls how imported files are organised on disk. Both use {TOKEN}
+# placeholders resolved from the file's EXIF capture date (falls back to
+# its filesystem modified time when there's no EXIF date):
+#   {YYYY} {YY} {MM} {DD} {hh} {mm} {ss}   — date/time
+#   {original}  — source filename, no extension
+#   {counter}   — 1-based index within this import, zero-padded to 4 digits
+#   {camera}    — EXIF Make+Model, when present
+# The original file extension is always preserved regardless of `filename`.
+
+[path_template]
+# Subfolder path under the destination, "/"-separated. "" = flat copy.
+folder = "{YYYY}/{MM}"
+
+# Filename stem. "{original}" keeps the source filename unchanged.
+filename = "{original}"
 
 # ── AI image description ────────────────────────────────────────
 

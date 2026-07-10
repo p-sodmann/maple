@@ -305,6 +305,51 @@ impl Default for ThumbnailSettings {
     }
 }
 
+/// Destination path template settings for imported files.
+///
+/// Stored under `[path_template]` in `settings.toml`.
+///
+/// Both `folder` and `filename` use `{TOKEN}` placeholders resolved from
+/// each file's EXIF capture date (falling back to its filesystem mtime when
+/// no EXIF date is present):
+///   `{YYYY}` `{YY}` `{MM}` `{DD}` `{hh}` `{mm}` `{ss}` — date/time
+///   `{original}` — source filename stem (no extension)
+///   `{counter}`  — 1-based index within the current import, zero-padded to 4 digits
+///   `{camera}`   — EXIF Make+Model, when present
+///
+/// The original file extension is always preserved regardless of
+/// `filename` — it is never user-templatable.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PathTemplateSettings {
+    /// Subfolder path under the destination root, `/`-separated.
+    /// Empty string = flat copy (no subfolders). Default: `"{YYYY}/{MM}"`.
+    #[serde(default = "PathTemplateSettings::default_folder")]
+    pub folder: String,
+    /// Filename stem template. Default `"{original}"` keeps the source
+    /// filename unchanged.
+    #[serde(default = "PathTemplateSettings::default_filename")]
+    pub filename: String,
+}
+
+impl PathTemplateSettings {
+    fn default_folder() -> String {
+        "{YYYY}/{MM}".into()
+    }
+
+    fn default_filename() -> String {
+        "{original}".into()
+    }
+}
+
+impl Default for PathTemplateSettings {
+    fn default() -> Self {
+        Self {
+            folder: Self::default_folder(),
+            filename: Self::default_filename(),
+        }
+    }
+}
+
 /// Collection hotkey settings.
 ///
 /// Stored under `[collections]` in `settings.toml`.
@@ -537,11 +582,9 @@ pub struct Settings {
     /// Defaults to `~/.config/maple/library.db`.
     #[serde(default = "Settings::default_database_path")]
     pub database_path: PathBuf,
-    /// `strftime`-style format string for organising imported files into
-    /// subdirectories based on EXIF date.  Set to an empty string to
-    /// disable (flat copy).  Defaults to `"%Y/%m"` → `2024/01/`.
-    #[serde(default = "Settings::default_folder_format")]
-    pub folder_format: String,
+    /// Destination folder/filename templates for imported files.
+    #[serde(default)]
+    pub path_template: PathTemplateSettings,
     /// AI image description settings.
     #[serde(default)]
     pub ai: AiSettings,
@@ -573,10 +616,6 @@ impl Settings {
 
     fn default_database_path() -> PathBuf {
         config_dir().join("library.db")
-    }
-
-    fn default_folder_format() -> String {
-        "%Y/%m".into()
     }
 
     /// Replace empty path fields with their runtime defaults.
@@ -645,7 +684,7 @@ impl Default for Settings {
             preview_buffer_size: Self::default_preview_buffer_size(),
             library_dir: Self::default_library_dir(),
             database_path: Self::default_database_path(),
-            folder_format: Self::default_folder_format(),
+            path_template: PathTemplateSettings::default(),
             ai: AiSettings::default(),
             face: FaceSettings::default(),
             collections: CollectionSettings::default(),
@@ -756,6 +795,10 @@ mod tests {
             preview_buffer_size: 11,
             library_dir: PathBuf::from("/my/library"),
             database_path: PathBuf::from("/my/library/library.db"),
+            path_template: PathTemplateSettings {
+                folder: "{YYYY}/{MM}/{DD}".into(),
+                filename: "{YYYY}{MM}{DD}_{counter}".into(),
+            },
             ..Settings::default()
         };
         let toml_str = toml::to_string_pretty(&s).unwrap();
@@ -763,6 +806,8 @@ mod tests {
         assert_eq!(parsed.preview_buffer_size, 11);
         assert_eq!(parsed.library_dir, PathBuf::from("/my/library"));
         assert_eq!(parsed.database_path, PathBuf::from("/my/library/library.db"));
+        assert_eq!(parsed.path_template.folder, "{YYYY}/{MM}/{DD}");
+        assert_eq!(parsed.path_template.filename, "{YYYY}{MM}{DD}_{counter}");
     }
 
     #[test]
@@ -775,6 +820,8 @@ mod tests {
         assert_eq!(settings.library_dir, config_dir());
         assert_eq!(settings.database_path, config_dir().join("library.db"));
         assert_eq!(settings.preview_buffer_size, 21);
+        assert_eq!(settings.path_template.folder, "{YYYY}/{MM}");
+        assert_eq!(settings.path_template.filename, "{original}");
         assert!(!settings.ai.enabled);
         assert!(!settings.face.enabled);
     }

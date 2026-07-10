@@ -71,6 +71,36 @@ pub struct LibraryGrid {
     timer: Rc<RefCell<Option<Timer>>>,
 }
 
+thread_local! {
+    /// The app's single `LibraryGrid` + its last-used query, registered once
+    /// from `run()`. Lets any other window (rotation, library restructure, …)
+    /// ask the library to refresh after an out-of-band change, without
+    /// `LibraryGrid`/`SearchQuery` having to be threaded through that
+    /// window's own constructor.
+    static REFRESH_HANDLE: RefCell<Option<(LibraryGrid, Rc<RefCell<SearchQuery>>)>> =
+        const { RefCell::new(None) };
+}
+
+/// Register the app's `LibraryGrid` and its current-query cell. Called once
+/// from `run()` right after both are constructed.
+pub fn register(grid: LibraryGrid, current_query: Rc<RefCell<SearchQuery>>) {
+    REFRESH_HANDLE.with(|cell| *cell.borrow_mut() = Some((grid, current_query)));
+}
+
+/// Reload the library grid with whatever query it was last showing.
+///
+/// Call this after a change made from outside the grid's own callbacks
+/// leaves its cached records/thumbnails stale — e.g. a library restructure
+/// moving files, or an in-place image rotation changing a thumbnail's hash.
+/// A no-op before `register` has run.
+pub fn request_reload() {
+    REFRESH_HANDLE.with(|cell| {
+        if let Some((grid, current_query)) = cell.borrow().as_ref() {
+            grid.load(current_query.borrow().clone());
+        }
+    });
+}
+
 impl LibraryGrid {
     pub fn new(
         db: Arc<Mutex<maple_db::Database>>,

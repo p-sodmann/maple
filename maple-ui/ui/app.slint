@@ -13,11 +13,12 @@ import { CollectionsWindow, CollectionEntry, CollectionsPage } from "collections
 import { FaceTagWindow } from "face_tag.slint";
 import { PeoplePage, PersonItem } from "people.slint";
 import { DebugCompareWindow } from "debug_compare.slint";
+import { PathTemplateWindow } from "path_template.slint";
 
 // Re-export second-window types so Rust can build & show them.
 export { ThumbItem, DateGroup, DetailWindow, CollectionChip, FaceBox, FacePersonSuggestion,
          ImportWindow, ImportItem, SettingsWindow, CollectionsWindow, CollectionEntry,
-         FaceTagWindow, ImportLocation, PersonItem, DebugCompareWindow }
+         FaceTagWindow, ImportLocation, PersonItem, DebugCompareWindow, PathTemplateWindow }
 
 export enum Page { library, import, people, collections }
 

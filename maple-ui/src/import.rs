@@ -243,6 +243,16 @@ fn build(db: Arc<Mutex<maple_db::Database>>) -> Result<Import, slint::PlatformEr
         }
     });
 
+    // ── Configure file naming ────────────────────────────────────
+    window.on_open_path_template({
+        let w = window.as_weak();
+        let db = db.clone();
+        move || {
+            let is_dark = w.upgrade().map(|w| w.get_dark()).unwrap_or(false);
+            crate::path_template_window::open(db.clone(), is_dark);
+        }
+    });
+
     // ── Start scan ────────────────────────────────────────────────
     window.on_start_scan({
         let w = window.as_weak();
@@ -769,7 +779,8 @@ fn build(db: Arc<Mutex<maple_db::Database>>) -> Result<Import, slint::PlatformEr
             w.set_status_text("Copying…".into());
 
             let settings = maple_state::Settings::load();
-            let folder_format = settings.folder_format.clone();
+            let folder_template = settings.path_template.folder.clone();
+            let filename_template = settings.path_template.filename.clone();
             let library_dir = settings.library_dir.clone();
             let algorithm_key = settings.stacks.algorithm_key();
 
@@ -812,7 +823,8 @@ fn build(db: Arc<Mutex<maple_db::Database>>) -> Result<Import, slint::PlatformEr
                 let result = maple_import::copy_images(
                     &sources,
                     &dst2,
-                    &folder_format,
+                    &folder_template,
+                    &filename_template,
                     |done, total| {
                         let _ = tx.send(CopyMsg::Progress { done, total });
                     },

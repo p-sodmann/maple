@@ -59,6 +59,37 @@ impl ExifDateTime {
             .replace("%m", &format!("{:02}", self.month))
             .replace("%d", &format!("{:02}", self.day))
     }
+
+    /// Convert from a Unix timestamp (seconds since 1970-01-01 UTC).
+    ///
+    /// Inverse of [`Self::to_unix_timestamp`]; same "treat as UTC, no
+    /// timezone adjustment" convention. Used as a fallback (e.g. file mtime)
+    /// when no EXIF date is available.
+    /// Algorithm: <https://howardhinnant.github.io/date_algorithms.html#civil_from_days>
+    pub fn from_unix_timestamp(ts: i64) -> Self {
+        let seconds_of_day = ts.rem_euclid(86400);
+        let days = ts.div_euclid(86400);
+
+        let z = days + 719468;
+        let era = z.div_euclid(146097);
+        let doe = z - era * 146097;
+        let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+        let y = yoe + era * 400;
+        let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+        let mp = (5 * doy + 2) / 153;
+        let day = (doy - (153 * mp + 2) / 5 + 1) as u32;
+        let month = (if mp < 10 { mp + 3 } else { mp - 9 }) as u32;
+        let year = (if month <= 2 { y + 1 } else { y }) as u32;
+
+        Self {
+            year,
+            month,
+            day,
+            hour: (seconds_of_day / 3600) as u32,
+            minute: (seconds_of_day / 60 % 60) as u32,
+            second: (seconds_of_day % 60) as u32,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -99,5 +130,20 @@ mod tests {
         let dt = ExifDateTime::parse("2024:03:15 14:30:45").unwrap();
         assert_eq!(dt.format("%Y/%m"), "2024/03");
         assert_eq!(dt.format("%Y-%m-%d"), "2024-03-15");
+    }
+
+    #[test]
+    fn from_unix_timestamp_epoch() {
+        assert_eq!(
+            ExifDateTime::from_unix_timestamp(0),
+            ExifDateTime::parse("1970:01:01 00:00:00").unwrap()
+        );
+    }
+
+    #[test]
+    fn from_unix_timestamp_roundtrips() {
+        let dt = ExifDateTime::parse("2024:03:15 14:30:45").unwrap();
+        let ts = dt.to_unix_timestamp();
+        assert_eq!(ExifDateTime::from_unix_timestamp(ts), dt);
     }
 }

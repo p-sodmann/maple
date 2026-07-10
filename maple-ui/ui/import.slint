@@ -316,6 +316,7 @@ export component ImportWindow inherits Window {
     callback close-requested;
     callback pick-source;
     callback pick-dest;
+    callback open-path-template;
     callback start-scan;
     callback item-clicked(int);
     callback copy-selected;
@@ -462,6 +463,14 @@ export component ImportWindow inherits Window {
                     FlatButton {
                         text: root.dest-path == "" ? "Choose Destination…" : root.dest-path;
                         clicked => { root.pick-dest(); }
+                    }
+                }
+
+                HorizontalLayout {
+                    alignment: center;
+                    FlatButton {
+                        text: "Configure file naming…";
+                        clicked => { root.open-path-template(); }
                     }
                 }
 

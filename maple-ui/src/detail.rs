@@ -527,6 +527,9 @@ fn rotate_current(w: &slint::Weak<DetailWindow>, nav: &NavState, clockwise: bool
                 }
                 window.set_rotating(false);
                 show_record(&window, &nav);
+                // The library grid's cached thumbnail is keyed by the old
+                // hash — reload so the grid picks up the rotated image.
+                crate::grid::request_reload();
             }
             Err(msg) => {
                 window.set_error_text(format!("Rotation failed: {msg}").into());
