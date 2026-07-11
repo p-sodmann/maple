@@ -17,6 +17,7 @@ export struct ThumbItem {
     unsupported: bool,
     stack-size: int,
     score: string,
+    selected: bool,
 }
 
 // One day's worth of tiles within the date-grouped view: `start`/`count`
@@ -76,6 +77,29 @@ component LibraryTile inherits Rectangle {
                 border-width: 2px;
                 border-color: Theme.accent;
             }
+
+            // Selection ring + checkmark badge (select-mode).
+            if root.item.selected: Rectangle {
+                border-radius: Theme.thumb-radius;
+                border-width: 3px;
+                border-color: Theme.accent;
+            }
+            if root.item.selected: Rectangle {
+                x: parent.width - 22px;
+                y: 6px;
+                width: 16px;
+                height: 16px;
+                border-radius: 8px;
+                background: Theme.accent;
+                Text {
+                    text: "✓";
+                    color: #FFFFFF;
+                    font-size: 10px;
+                    font-weight: 700;
+                    horizontal-alignment: center;
+                    vertical-alignment: center;
+                }
+            }
         }
 
         HorizontalLayout {
@@ -117,10 +141,74 @@ component LibraryTile inherits Rectangle {
     }
 }
 
+// Marquee/tap selection layer — stacked above a block of tiles, active only
+// in select-mode. A drag paints a live rectangle preview; on release the
+// gesture (tap vs. drag) and its rectangle are reported to Rust, which owns
+// selection state and does the geometry-to-index translation. `columns` is
+// reported alongside the rect because it depends on the live viewport width,
+// which only Slint knows.
+//
+// `base`/`count` let one overlay serve either the whole flat grid (`base:
+// -1`, `count: items.length`) or a single date-group's tile block (`base:
+// group.start`, `count: group.count`) without the caller needing two
+// implementations — Rust treats `base < 0` as "flat, subtract page padding".
+component SelectOverlay inherits Rectangle {
+    in property <bool> active: false;
+    in property <int> base: -1;
+    in property <int> count: 0;
+    in property <float> columns: 1;
+    callback released(int, int, length, length, length, length, float);
+
+    property <length> x0: 0;
+    property <length> y0: 0;
+    property <length> x1: 0;
+    property <length> y1: 0;
+    property <bool> dragging: false;
+
+    ta := TouchArea {
+        visible: root.active;
+        width: 100%;
+        height: 100%;
+
+        pointer-event(e) => {
+            if e.kind == PointerEventKind.down {
+                root.x0 = self.mouse-x;
+                root.y0 = self.mouse-y;
+                root.x1 = self.mouse-x;
+                root.y1 = self.mouse-y;
+                root.dragging = true;
+            } else if e.kind == PointerEventKind.up {
+                if root.dragging {
+                    root.dragging = false;
+                    root.released(root.base, root.count, root.x0, root.y0, root.x1, root.y1, root.columns);
+                }
+            }
+        }
+
+        moved => {
+            root.x1 = self.mouse-x;
+            root.y1 = self.mouse-y;
+        }
+    }
+
+    if root.dragging: Rectangle {
+        x: min(root.x0, root.x1);
+        y: min(root.y0, root.y1);
+        width: max(root.x0, root.x1) - min(root.x0, root.x1);
+        height: max(root.y0, root.y1) - min(root.y0, root.y1);
+        background: Theme.accent.with-alpha(0.12);
+        border-width: 1.5px;
+        border-color: Theme.accent;
+        border-radius: 4px;
+    }
+}
+
 export component LibraryGridView {
     in property <[ThumbItem]> items;
     in property <length> cell-size: 160px;
+    in property <bool> select-mode: false;
     callback activated(int);
+    callback select-drag(int, int, length, length, length, length, float);
 
     property <length> gap: Theme.gap;
     property <length> pad: Theme.pad;
@@ -146,6 +234,20 @@ export component LibraryGridView {
                 root.activated(idx);
             }
         }
+
+        SelectOverlay {
+            x: 0;
+            y: 0;
+            width: sv.viewport-width;
+            height: sv.viewport-height;
+            active: root.select-mode;
+            base: -1;
+            count: root.items.length;
+            columns: root.columns;
+            released(b, c, x0, y0, x1, y1, cols) => {
+                root.select-drag(b, c, x0, y0, x1, y1, cols);
+            }
+        }
     }
 }
 
@@ -156,7 +258,9 @@ export component LibraryDateGridView {
     in property <[ThumbItem]> items;
     in property <[DateGroup]> groups;
     in property <length> cell-size: 160px;
+    in property <bool> select-mode: false;
     callback activated(int);
+    callback select-drag(int, int, length, length, length, length, float);
 
     property <length> gap: Theme.gap;
     property <length> pad: Theme.pad;
@@ -192,6 +296,23 @@ export component LibraryDateGridView {
                             root.activated(group.start + j);
                         }
                     }
+
+                    // A marquee here cannot cross into the next day's block —
+                    // each group gets its own overlay confined to its own
+                    // Rectangle, matching the tiles' local coordinate space.
+                    SelectOverlay {
+                        x: 0;
+                        y: 0;
+                        width: 100%;
+                        height: 100%;
+                        active: root.select-mode;
+                        base: group.start;
+                        count: group.count;
+                        columns: root.columns;
+                        released(b, c, x0, y0, x1, y1, cols) => {
+                            root.select-drag(b, c, x0, y0, x1, y1, cols);
+                        }
+                    }
                 }
             }
         }
@@ -203,8 +324,10 @@ export component LibraryPage inherits Rectangle {
     in property <[DateGroup]> date-groups;
     in property <bool> date-view: false;
     in property <length> cell-size: 160px;
+    in property <bool> select-mode: false;
     callback search-changed(string);
     callback activated(int);
+    callback select-drag(int, int, length, length, length, length, float);
 
     background: Theme.bg;
 
@@ -214,7 +337,9 @@ export component LibraryPage inherits Rectangle {
             vertical-stretch: 1;
             items: root.items;
             cell-size: root.cell-size;
+            select-mode: root.select-mode;
             activated(i) => { root.activated(i); }
+            select-drag(b, c, x0, y0, x1, y1, cols) => { root.select-drag(b, c, x0, y0, x1, y1, cols); }
         }
 
         if root.date-view: LibraryDateGridView {
@@ -222,7 +347,9 @@ export component LibraryPage inherits Rectangle {
             items: root.items;
             groups: root.date-groups;
             cell-size: root.cell-size;
+            select-mode: root.select-mode;
             activated(i) => { root.activated(i); }
+            select-drag(b, c, x0, y0, x1, y1, cols) => { root.select-drag(b, c, x0, y0, x1, y1, cols); }
         }
     }
 }

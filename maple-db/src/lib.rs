@@ -6,6 +6,7 @@
 //! database, marking records as `missing` when the file is deleted and
 //! re-marking them `present` when it reappears.
 
+mod embedding;
 mod scanner;
 mod schema;
 mod semantic_db;
@@ -25,7 +26,7 @@ pub mod stacker;
 
 pub use ai::{spawn_ai_tagger, AiDescriber, AiTagger, LmStudioDescriber};
 pub use metadata::rotate_image_file;
-pub use collections::Collection;
+pub use collections::{Collection, CollectionWithRep};
 pub use hasher::{load_onnx_embedder, spawn_hasher};
 pub use stacker::{cluster_embeddings, update_stacks};
 pub use face_detector::{spawn_face_tagger, DetectedFace, FaceDetector, FaceTagger};

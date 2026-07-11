@@ -2,69 +2,13 @@
 
 import { Theme } from "theme.slint";
 import { ScrollView } from "std-widgets.slint";
+import { RepTile, EditEntityModal } from "widgets.slint";
 
 export struct PersonItem {
     person-id: int,
     name: string,
     face-image: image,
     face-loaded: bool,
-}
-
-// ── Person tile ───────────────────────────────────────────────────
-
-component PersonTile inherits Rectangle {
-    in property <PersonItem> item;
-    callback activated;
-
-    property <length> face-size: 120px;
-    property <length> label-h:   26px;
-
-    width: root.face-size;
-    height: root.face-size + root.label-h + 6px;
-
-    ta := TouchArea { clicked => { root.activated(); } }
-
-    VerticalLayout {
-        spacing: 6px;
-
-        frame := Rectangle {
-            height: root.face-size;
-            width: root.face-size;
-            border-radius: root.face-size / 2;
-            clip: true;
-            background: Theme.placeholder-bg;
-
-            if root.item.face-loaded: Image {
-                source: root.item.face-image;
-                width: 100%;
-                height: 100%;
-                image-fit: fill;
-            }
-            if !root.item.face-loaded: Text {
-                text: "?";
-                color: Theme.dim-fg;
-                font-size: 28px;
-                horizontal-alignment: center;
-                vertical-alignment: center;
-            }
-
-            if ta.has-hover: Rectangle {
-                border-radius: root.face-size / 2;
-                border-width: 2.5px;
-                border-color: Theme.accent;
-            }
-        }
-
-        Text {
-            text: root.item.name;
-            color: ta.has-hover ? Theme.accent : Theme.fg;
-            font-size: 12px;
-            font-weight: 500;
-            horizontal-alignment: center;
-            overflow: elide;
-            height: root.label-h;
-        }
-    }
 }
 
 // ── People page ───────────────────────────────────────────────────
@@ -75,6 +19,10 @@ export component PeoplePage inherits Rectangle {
 
     callback person-activated(int, string);
     callback tag-faces-clicked;
+    callback person-edit-save(int, string);
+    callback person-edit-delete(int);
+
+    property <int> editing-person-id: -1;
 
     background: Theme.bg;
 
@@ -156,13 +104,36 @@ export component PeoplePage inherits Rectangle {
         viewport-width: self.visible-width;
         viewport-height: root.row-count * root.pitch-y + root.pad;
 
-        for person[idx] in root.people: PersonTile {
+        for person[idx] in root.people: RepTile {
             property <float> grid-col: Math.mod(idx, root.columns);
             property <float> grid-row: Math.floor(idx / root.columns);
             x: root.pad + grid-col * root.pitch-x;
             y: root.pad + grid-row * root.pitch-y;
-            item: person;
+            tile-image: person.face-image;
+            loaded: person.face-loaded;
+            label: person.name;
+            shape-round: true;
             activated => { root.person-activated(person.person-id, person.name); }
+            edit-clicked => {
+                edit-modal.name-value = person.name;
+                edit-modal.confirming-delete = false;
+                root.editing-person-id = person.person-id;
+            }
         }
+    }
+
+    edit-modal := EditEntityModal {
+        open: root.editing-person-id >= 0;
+        title: "Edit Person";
+        show-color: false;
+        save(name, color) => {
+            root.person-edit-save(root.editing-person-id, name);
+            root.editing-person-id = -1;
+        }
+        delete => {
+            root.person-edit-delete(root.editing-person-id);
+            root.editing-person-id = -1;
+        }
+        cancel => { root.editing-person-id = -1; }
     }
 }

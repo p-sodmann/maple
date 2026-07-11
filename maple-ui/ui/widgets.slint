@@ -1,6 +1,7 @@
 // Small shared, custom-themed UI building blocks (Slint port of widgets.rs).
 // Custom components keep the maple look without pulling a std-widgets style.
 import { Theme } from "theme.slint";
+import { LineEdit } from "std-widgets.slint";
 
 // Full-width rounded "pill" action button.
 export component PillButton inherits Rectangle {
@@ -83,6 +84,324 @@ export component FlatButton inherits Rectangle {
         enabled: root.enabled;
         clicked => {
             root.clicked();
+        }
+    }
+}
+
+// ── Representative-photo tile ────────────────────────────────────────
+//
+// Shared between the People page (round, one photo per person) and the
+// Collections gallery (rounded-square, one cover photo per collection) —
+// both are "a computed representative image on a labelled card, with a
+// hover-visible edit affordance". Plain properties rather than a bundled
+// struct so each caller's own item model (`PersonItem`, a collections
+// gallery item, …) can feed it directly from a `for` loop without an extra
+// struct-mapping layer.
+export component RepTile inherits Rectangle {
+    in property <image> tile-image;
+    in property <bool> loaded;
+    in property <string> label;
+    in property <string> sub-label: "";
+    in property <color> accent: Theme.accent;
+    in property <bool> shape-round: true;
+    // True when this tile's entity is the one the Library grid is currently
+    // filtered to (see the Collections gallery's `active-collection-id`) —
+    // a persistent ring, distinct from the hover-only one.
+    in property <bool> active: false;
+    callback activated;
+    callback edit-clicked;
+
+    in property <length> photo-size: 120px;
+    property <length> label-h: root.sub-label == "" ? 26px : 40px;
+    property <length> photo-radius: root.shape-round ? root.photo-size / 2 : 14px;
+
+    width: root.photo-size;
+    height: root.photo-size + root.label-h + 6px;
+
+    ta := TouchArea {
+        width: 100%;
+        height: 100%;
+        clicked => { root.activated(); }
+
+        VerticalLayout {
+            spacing: 6px;
+
+            frame := Rectangle {
+                height: root.photo-size;
+                width: root.photo-size;
+                border-radius: root.photo-radius;
+                clip: true;
+                background: Theme.placeholder-bg;
+
+                if root.loaded: Image {
+                    source: root.tile-image;
+                    width: 100%;
+                    height: 100%;
+                    image-fit: root.shape-round ? fill : cover;
+                }
+                if !root.loaded: Text {
+                    text: "?";
+                    color: Theme.dim-fg;
+                    font-size: 28px;
+                    horizontal-alignment: center;
+                    vertical-alignment: center;
+                }
+
+                if root.active || ta.has-hover: Rectangle {
+                    border-radius: root.photo-radius;
+                    border-width: 2.5px;
+                    border-color: root.accent;
+                }
+
+                // Hover-visible edit affordance — opens the shared edit modal.
+                if ta.has-hover: edit-ta := TouchArea {
+                    x: parent.width - 24px;
+                    y: 4px;
+                    width: 20px;
+                    height: 20px;
+                    clicked => { root.edit-clicked(); }
+                    Rectangle {
+                        border-radius: 10px;
+                        background: edit-ta.has-hover
+                            ? #000000.with-alpha(0.8)
+                            : #000000.with-alpha(0.55);
+                        Text {
+                            text: "✎";
+                            color: #FFFFFF;
+                            font-size: 10px;
+                            horizontal-alignment: center;
+                            vertical-alignment: center;
+                        }
+                    }
+                }
+            }
+
+            Text {
+                text: root.label;
+                color: ta.has-hover ? root.accent : Theme.fg;
+                font-size: 12px;
+                font-weight: 500;
+                horizontal-alignment: center;
+                overflow: elide;
+                height: root.sub-label == "" ? root.label-h : 18px;
+            }
+
+            if root.sub-label != "": Text {
+                text: root.sub-label;
+                color: Theme.dim-fg;
+                font-size: 10.5px;
+                font-weight: 500;
+                horizontal-alignment: center;
+                overflow: elide;
+                height: 16px;
+            }
+        }
+    }
+}
+
+// ── Shared rename/recolor/delete modal ───────────────────────────────
+//
+// Used for both persons (name only) and collections (name + colour) — see
+// the "edit" affordance on `RepTile`. Two instantiations of this one
+// definition (one per page), each wired to its own save/delete callbacks,
+// since Slint has no clean discriminated-union story for routing a single
+// shared instance to two different entity kinds.
+export component EditEntityModal inherits Rectangle {
+    in property <bool> open: false;
+    in property <string> title: "Edit";
+    in property <bool> show-color: false;
+    in-out property <string> name-value: "";
+    in-out property <color> color-value: #3584e4;
+    in-out property <bool> confirming-delete: false;
+    callback save(string, color);
+    callback delete;
+    callback cancel;
+
+    property <[color]> palette: [
+        #e8590c, #3388ff, #33d770, #ffa500, #ff6b6b,
+        #9b59b6, #1abc9c, #f39c12, #e74c3c, #2c3e50,
+    ];
+
+    if root.open: Rectangle {
+        x: 0; y: 0;
+        width: 100%; height: 100%;
+        background: #000000.with-alpha(0.45);
+
+        backdrop-ta := TouchArea {
+            width: 100%; height: 100%;
+            clicked => {
+                root.confirming-delete = false;
+                root.cancel();
+            }
+        }
+
+        modal-card := Rectangle {
+            x: (parent.width - self.width) / 2;
+            y: (parent.height - self.height) / 2;
+            width: 360px;
+            height: root.show-color ? 246px : 190px;
+            animate height { duration: 120ms; easing: ease-out; }
+            background: Theme.surface;
+            border-radius: Theme.radius-card;
+            border-width: 1px;
+            border-color: Theme.border;
+            drop-shadow-blur: 32px;
+            drop-shadow-offset-y: 8px;
+            drop-shadow-color: Theme.dark ? #00000070 : #00000028;
+            clip: true;
+
+            // Absorb pointer events — prevents backdrop-ta from firing.
+            TouchArea { width: 100%; height: 100%; }
+
+            VerticalLayout {
+                padding-left: 20px;
+                padding-right: 20px;
+                padding-top: 20px;
+                padding-bottom: 20px;
+                spacing: 14px;
+
+                HorizontalLayout {
+                    spacing: 0;
+                    Text {
+                        text: root.title;
+                        color: Theme.ink;
+                        font-size: 15px;
+                        font-weight: 700;
+                        vertical-alignment: center;
+                        horizontal-stretch: 1;
+                    }
+                    modal-close-ta := TouchArea {
+                        width: 28px; height: 28px;
+                        Text {
+                            text: "✕";
+                            color: modal-close-ta.has-hover ? Theme.ink : Theme.ink-3;
+                            font-size: 14px;
+                            horizontal-alignment: center;
+                            vertical-alignment: center;
+                        }
+                        clicked => {
+                            root.confirming-delete = false;
+                            root.cancel();
+                        }
+                    }
+                }
+
+                LineEdit {
+                    placeholder-text: "Name";
+                    text <=> root.name-value;
+                    accepted(t) => {
+                        if t != "" {
+                            root.confirming-delete = false;
+                            root.save(t, root.color-value);
+                        }
+                    }
+                }
+
+                if root.show-color: HorizontalLayout {
+                    spacing: 8px;
+                    for col in root.palette: modal-swatch-ta := TouchArea {
+                        width: 26px; height: 26px;
+                        Rectangle {
+                            border-radius: 7px;
+                            background: col;
+                            border-width: 2px;
+                            border-color: col == root.color-value
+                                ? #FFFFFF.with-alpha(0.85)
+                                : transparent;
+                        }
+                        clicked => { root.color-value = col; }
+                    }
+                }
+
+                HorizontalLayout {
+                    spacing: 8px;
+
+                    // Delete — first click arms a "Confirm Delete?" state.
+                    Rectangle {
+                        height: 34px;
+                        border-radius: Theme.radius-btn;
+                        background: root.confirming-delete
+                            ? #e01b24
+                            : (del-ta.has-hover ? Theme.border.with-alpha(0.5) : transparent);
+                        border-width: root.confirming-delete ? 0 : 1px;
+                        border-color: Theme.border;
+                        animate background { duration: 100ms; }
+                        HorizontalLayout {
+                            padding-left: 14px; padding-right: 14px;
+                            alignment: center;
+                            Text {
+                                text: root.confirming-delete ? "Confirm Delete?" : "Delete";
+                                color: root.confirming-delete ? #FFFFFF : Theme.ink-2;
+                                font-size: 13px; font-weight: 600;
+                                vertical-alignment: center;
+                            }
+                        }
+                        del-ta := TouchArea {
+                            clicked => {
+                                if root.confirming-delete {
+                                    root.confirming-delete = false;
+                                    root.delete();
+                                } else {
+                                    root.confirming-delete = true;
+                                }
+                            }
+                        }
+                    }
+
+                    Rectangle { horizontal-stretch: 1; }
+
+                    Rectangle {
+                        height: 34px;
+                        border-radius: Theme.radius-btn;
+                        border-width: 1px;
+                        border-color: Theme.border;
+                        background: modal-cancel-ta.has-hover
+                            ? Theme.border.with-alpha(0.5)
+                            : transparent;
+                        HorizontalLayout {
+                            padding-left: 16px; padding-right: 16px;
+                            alignment: center;
+                            Text {
+                                text: "Cancel";
+                                color: Theme.ink-2;
+                                font-size: 13px; font-weight: 600;
+                                vertical-alignment: center;
+                            }
+                        }
+                        modal-cancel-ta := TouchArea {
+                            clicked => {
+                                root.confirming-delete = false;
+                                root.cancel();
+                            }
+                        }
+                    }
+
+                    Rectangle {
+                        height: 34px;
+                        border-radius: Theme.radius-btn;
+                        background: root.name-value != "" ? Theme.accent : Theme.field;
+                        border-width: root.name-value != "" ? 0 : 1px;
+                        border-color: Theme.border;
+                        HorizontalLayout {
+                            padding-left: 18px; padding-right: 18px;
+                            alignment: center;
+                            Text {
+                                text: "Save";
+                                color: root.name-value != "" ? #FFFFFF : Theme.ink-3;
+                                font-size: 13px; font-weight: 600;
+                                vertical-alignment: center;
+                            }
+                        }
+                        modal-save-ta := TouchArea {
+                            enabled: root.name-value != "";
+                            clicked => {
+                                root.confirming-delete = false;
+                                root.save(root.name-value, root.color-value);
+                            }
+                        }
+                    }
+                }
+            }
         }
     }
 }

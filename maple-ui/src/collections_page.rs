@@ -6,17 +6,23 @@
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 
-use slint::{Image, ModelRc, Rgb8Pixel, SharedPixelBuffer, SharedString, VecModel};
+use slint::{ComponentHandle, Image, Model, ModelRc, Rgb8Pixel, SharedPixelBuffer, SharedString, VecModel};
 
 use maple_db::{SearchQuery, ThumbnailCache};
 
+use crate::rep_crop::{self, CropCache};
 use crate::services::collections::{self, load_entries};
 use crate::thumbnail;
-use crate::{AppWindow, CollectionEntry, ThumbItem};
+use crate::transforms::hex_to_color;
+use crate::{AppWindow, CollectionEntry, CollectionGalleryItem, ThumbItem};
 
 /// `(rgb_bytes_w_h, filename, image_id)` — Send-safe thumbnail payload
 /// produced off the main thread, consumed by `upgrade_in_event_loop`.
 type RawThumb = (Option<(Vec<u8>, u32, u32)>, String, i32);
+
+/// Cover-crop render size — matches the People page's `CROP_PX` so both
+/// galleries share one visual scale.
+const COVER_PX: u32 = 120;
 
 // ── Public API ────────────────────────────────────────────────────
 
@@ -37,6 +43,99 @@ pub fn reload_keep_sel(window: &AppWindow, db: &Arc<Mutex<maple_db::Database>>) 
     let sel_id = window.get_collections_selected_id();
     if sel_id >= 0 {
         push_detail(window, db, sel_id);
+    }
+}
+
+/// Reload the gallery grid (People-page-style cards with a computed cover
+/// image) and kick off async cover renders for any collection whose cover
+/// isn't already in `crop_cache`.
+///
+/// Must be called from the Slint event-loop thread. Mirrors
+/// `PeoplePage::load` (`people_page.rs`) — see [`rep_crop`] for the shared
+/// decode/cache logic.
+pub fn load_gallery(
+    window: &AppWindow,
+    db: &Arc<Mutex<maple_db::Database>>,
+    cache: &Arc<ThumbnailCache>,
+    quality: u8,
+    crop_cache: &CropCache,
+) {
+    let colls = collections::load_all_with_representatives(db);
+
+    let items: Vec<CollectionGalleryItem> = colls
+        .iter()
+        .map(|c| {
+            let cached = crop_cache.lock().ok().and_then(|cc| {
+                cc.get(&c.id)
+                    .and_then(|(rep_id, pixels)| (Some(*rep_id) == c.image_id).then(|| pixels.clone()))
+            });
+            let (cover_image, cover_loaded) = match cached {
+                Some(pixels) => (rep_crop::image_from_rgb(&pixels, COVER_PX), true),
+                None => (Image::default(), false),
+            };
+            CollectionGalleryItem {
+                id: c.id as i32,
+                name: SharedString::from(c.name.as_str()),
+                color: hex_to_color(&c.color),
+                image_count: c.image_count as i32,
+                cover_image,
+                cover_loaded,
+            }
+        })
+        .collect();
+
+    let model = ModelRc::from(Rc::new(VecModel::from(items)));
+    window.set_collections_gallery_items(model);
+
+    let w = window.as_weak();
+    for (idx, coll) in colls.into_iter().enumerate() {
+        let (Some(path), Some(image_id)) = (coll.image_path, coll.image_id) else {
+            continue;
+        };
+        let already_cached = crop_cache.lock().ok().is_some_and(|cc| {
+            cc.get(&coll.id).is_some_and(|(cached_id, _)| *cached_id == image_id)
+        });
+        if already_cached {
+            continue;
+        }
+
+        let w2 = w.clone();
+        let expected_id = coll.id as i32;
+        let coll_id = coll.id;
+        let crop_cache = crop_cache.clone();
+        let cache = cache.clone();
+        std::thread::spawn(move || {
+            let redb_cached = cache.get_cover(coll_id);
+            let cache_for_store = cache.clone();
+            let Ok(pixels) = rep_crop::extract_and_cache(
+                &path,
+                None,
+                COVER_PX,
+                quality,
+                redb_cached,
+                |webp| {
+                    if let Err(e) = cache_for_store.insert_cover(coll_id, webp) {
+                        tracing::warn!("insert_cover {coll_id}: {e}");
+                    }
+                },
+            ) else {
+                return;
+            };
+            let _ = w2.upgrade_in_event_loop(move |win| {
+                let pixels = Arc::new(pixels);
+                if let Ok(mut c) = crop_cache.lock() {
+                    c.insert(coll_id, (image_id, pixels.clone()));
+                }
+                let model = win.get_collections_gallery_items();
+                if let Some(mut item) = model.row_data(idx) {
+                    if item.id == expected_id {
+                        item.cover_image = rep_crop::image_from_rgb(&pixels, COVER_PX);
+                        item.cover_loaded = true;
+                        model.set_row_data(idx, item);
+                    }
+                }
+            });
+        });
     }
 }
 
@@ -120,6 +219,7 @@ pub fn load_thumbs(
                         unsupported: !loaded,
                         stack_size: 0,
                         score: SharedString::default(),
+                        selected: false,
                     }
                 })
                 .collect();

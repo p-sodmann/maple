@@ -189,13 +189,7 @@ fn build(db: Arc<Mutex<maple_db::Database>>) -> Result<Detail, slint::PlatformEr
                 Some(rec) => rec.id,
                 None => return,
             };
-            if let Ok(d) = db.lock() {
-                if let Err(e) = d.remove_image_from_collection(coll_id as i64, image_id) {
-                    tracing::warn!(
-                        "Failed to remove image {image_id} from collection {coll_id}: {e}"
-                    );
-                }
-            }
+            crate::services::collections::remove_image_from_collection(&db, coll_id as i64, image_id);
             if let Some(w) = w.upgrade() {
                 w.set_collection_chips(load_chips(&db, image_id));
             }
@@ -224,11 +218,8 @@ fn build(db: Arc<Mutex<maple_db::Database>>) -> Result<Detail, slint::PlatformEr
                 Some(rec) => rec.id,
                 None => return,
             };
-            if let Ok(guard) = db.lock() {
-                if let Err(e) = guard.add_image_to_collection(coll_id as i64, image_id) {
-                    tracing::warn!("add_image_to_collection {image_id} → {coll_id}: {e}");
-                    return;
-                }
+            if !crate::services::collections::add_image_to_collection(&db, coll_id as i64, image_id) {
+                return;
             }
             if let Some(w) = w.upgrade() {
                 w.set_collection_chips(load_chips(&db, image_id));

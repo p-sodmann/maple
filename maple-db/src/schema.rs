@@ -14,6 +14,8 @@
 //!   13 → 14: parent_id column on collections (hierarchy)
 //!   14 → 15: image_exif_tags table (comprehensive per-image EXIF tag/value
 //!            pairs) + exif_extracted column (explicit extraction-state gate)
+//!   15 → 16: centroid_embedding + representative_image_id columns on
+//!            collections (computed cover image, mirrors persons' V13)
 
 use rusqlite::Connection;
 
@@ -358,6 +360,24 @@ const V15: &str = "
 const V15_COLUMN: &str =
     "ALTER TABLE images ADD COLUMN exif_extracted INTEGER NOT NULL DEFAULT 0";
 
+// ── V16: collection centroids + representative (cover) images ──────
+//
+// Mirrors V13 for persons, over whole-image DINOv2 embeddings
+// (`image_hashes`) instead of face embeddings:
+//   `centroid_embedding` — the mean of the collection's member images'
+//     embeddings (L2-normalised, updated after every membership change).
+//   `representative_image_id` — the member image whose embedding is closest
+//     to the centroid; used as the cover on the Collections gallery. Falls
+//     back to the most-recently-added member when no member has an embedding
+//     yet (background hasher still running) — see
+//     `Database::update_collection_representative`.
+
+const V16_CENTROID: &str =
+    "ALTER TABLE collections ADD COLUMN centroid_embedding BLOB";
+const V16_REP: &str =
+    "ALTER TABLE collections ADD COLUMN representative_image_id INTEGER \
+     REFERENCES images(id) ON DELETE SET NULL";
+
 // ── Migration runner ─────────────────────────────────────────────
 
 /// Apply all pending schema migrations to `conn`.
@@ -492,6 +512,17 @@ pub fn ensure_schema(conn: &Connection) -> anyhow::Result<()> {
             }
         }
         conn.execute_batch("PRAGMA user_version = 15")?;
+    }
+
+    if version < 16 {
+        for sql in &[V16_CENTROID, V16_REP] {
+            if let Err(e) = conn.execute_batch(sql) {
+                if !e.to_string().to_lowercase().contains("duplicate column") {
+                    return Err(e.into());
+                }
+            }
+        }
+        conn.execute_batch("PRAGMA user_version = 16")?;
     }
 
     Ok(())

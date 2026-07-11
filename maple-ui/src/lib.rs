@@ -4,7 +4,8 @@
 //! in AppWindow.  Secondary windows (detail, settings, collections, face-tag,
 //! import browser) are opened as separate OS windows from callbacks.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
+use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -27,6 +28,7 @@ mod image_loader;
 mod import;
 mod path_template_window;
 mod people_page;
+mod rep_crop;
 mod services;
 mod settings_window;
 pub mod thumbnail;
@@ -92,10 +94,40 @@ pub fn run() -> anyhow::Result<()> {
     // filter / …) so the date-view toggle can reload with it unchanged.
     let current_query: Rc<RefCell<SearchQuery>> = Rc::new(RefCell::new(SearchQuery::default()));
 
+    // The collection select-mode is currently "editing" — set by following a
+    // gallery card into a filtered Library view, or by clicking a sidebar
+    // dot while already in select-mode. Drives both the checkbox sync in
+    // `apply_marquee`/`apply_membership` and the sidebar/gallery highlight
+    // (`library-active-collection-id`). `None` outside select-mode or before
+    // a target has been picked.
+    let select_target: Rc<Cell<Option<i64>>> = Rc::new(Cell::new(None));
+
+    // Re-applies the active select-target's membership after a "same
+    // context" grid reload (date-view toggle, `grid::request_reload` from
+    // rotation/restructure) — those calls reload with the *same* query, not
+    // a context switch, so unlike navigation they must not silently drop an
+    // in-progress selection. No-op when select-mode is off or has no target.
+    let resync_selection: Rc<dyn Fn()> = {
+        let db = db.clone();
+        let grid = grid.clone();
+        let select_target = select_target.clone();
+        let w = window.as_weak();
+        Rc::new(move || {
+            let Some(id) = select_target.get() else { return };
+            let Some(win) = w.upgrade() else { return };
+            if !win.get_library_select_mode() {
+                return;
+            }
+            let member_ids = services::collections::member_ids(&db, id);
+            let n = grid.apply_membership(&member_ids);
+            win.set_library_selected_count(n);
+        })
+    };
+
     // Let other windows (rotation, library restructure, …) request a grid
     // reload without needing `grid`/`current_query` threaded through their
     // own constructors — see `grid::request_reload`.
-    grid::register(grid.clone(), current_query.clone());
+    grid::register(grid.clone(), current_query.clone(), resync_selection.clone());
 
     // Library is the default page — load immediately.
     grid.load(SearchQuery::default());
@@ -109,15 +141,77 @@ pub fn run() -> anyhow::Result<()> {
     let coll_records: Arc<Mutex<Vec<maple_db::LibraryImage>>> =
         Arc::new(Mutex::new(Vec::new()));
 
-    // Populate sidebar immediately (so dots show even before navigating).
+    // In-memory memoization of gallery cover crops, mirroring the People
+    // page's own `CropCache` (see `rep_crop`) — separate instance since
+    // collections and persons are keyed independently.
+    let coll_crop_cache: rep_crop::CropCache = Arc::new(Mutex::new(HashMap::new()));
+
+    // Populate sidebar + gallery immediately (so dots/cards show even before navigating).
     collections_page::reload(&window, &db);
+    collections_page::load_gallery(&window, &db, &cache, coll_thumb_quality, &coll_crop_cache);
 
     window.on_collections_page_shown({
         let db = db.clone();
+        let cache = cache.clone();
+        let coll_crop_cache = coll_crop_cache.clone();
         let w = window.as_weak();
         move || {
             if let Some(win) = w.upgrade() {
                 collections_page::reload(&win, &db);
+                collections_page::load_gallery(&win, &db, &cache, coll_thumb_quality, &coll_crop_cache);
+            }
+        }
+    });
+
+    window.on_collections_activated({
+        let grid = grid.clone();
+        let w = window.as_weak();
+        let current_query = current_query.clone();
+        let select_target = select_target.clone();
+        move |collection_id, name| {
+            let q = SearchQuery::default().with_collection(collection_id as i64);
+            *current_query.borrow_mut() = q.clone();
+            grid.load(q);
+            select_target.set(Some(collection_id as i64));
+            if let Some(win) = w.upgrade() {
+                win.set_library_filter_name(name);
+                win.set_library_active_collection_id(collection_id);
+                win.set_page(crate::Page::Library);
+            }
+        }
+    });
+
+    window.on_collections_edit_save({
+        let db = db.clone();
+        let cache = cache.clone();
+        let coll_crop_cache = coll_crop_cache.clone();
+        let w = window.as_weak();
+        move |id, name, color| {
+            let name = name.trim().to_string();
+            if name.is_empty() {
+                return;
+            }
+            let hex = format!("#{:02x}{:02x}{:02x}", color.red(), color.green(), color.blue());
+            services::collections::rename_collection(&db, id as i64, &name);
+            services::collections::set_collection_color(&db, id as i64, &hex);
+            if let Some(win) = w.upgrade() {
+                collections_page::reload_keep_sel(&win, &db);
+                collections_page::load_gallery(&win, &db, &cache, coll_thumb_quality, &coll_crop_cache);
+            }
+        }
+    });
+
+    window.on_collections_edit_delete({
+        let db = db.clone();
+        let cache = cache.clone();
+        let coll_crop_cache = coll_crop_cache.clone();
+        let w = window.as_weak();
+        move |id| {
+            services::collections::delete_collection(&db, &cache, id as i64);
+            if let Some(win) = w.upgrade() {
+                collections_page::reload(&win, &db);
+                collections_page::clear_detail(&win);
+                collections_page::load_gallery(&win, &db, &cache, coll_thumb_quality, &coll_crop_cache);
             }
         }
     });
@@ -162,6 +256,8 @@ pub fn run() -> anyhow::Result<()> {
 
     window.on_collections_create({
         let db = db.clone();
+        let cache = cache.clone();
+        let coll_crop_cache = coll_crop_cache.clone();
         let w = window.as_weak();
         move |name, color, parent_id| {
             let name = name.trim().to_string();
@@ -176,24 +272,30 @@ pub fn run() -> anyhow::Result<()> {
             services::collections::create_collection(&db, &name, &hex, pid);
             if let Some(win) = w.upgrade() {
                 collections_page::reload(&win, &db);
+                collections_page::load_gallery(&win, &db, &cache, coll_thumb_quality, &coll_crop_cache);
             }
         }
     });
 
     window.on_collections_delete({
         let db = db.clone();
+        let cache = cache.clone();
+        let coll_crop_cache = coll_crop_cache.clone();
         let w = window.as_weak();
         move |id| {
-            services::collections::delete_collection(&db, id as i64);
+            services::collections::delete_collection(&db, &cache, id as i64);
             if let Some(win) = w.upgrade() {
                 collections_page::reload(&win, &db);
                 collections_page::clear_detail(&win);
+                collections_page::load_gallery(&win, &db, &cache, coll_thumb_quality, &coll_crop_cache);
             }
         }
     });
 
     window.on_collections_rename({
         let db = db.clone();
+        let cache = cache.clone();
+        let coll_crop_cache = coll_crop_cache.clone();
         let w = window.as_weak();
         move |id, name| {
             let name = name.trim().to_string();
@@ -201,12 +303,13 @@ pub fn run() -> anyhow::Result<()> {
             services::collections::rename_collection(&db, id as i64, &name);
             if let Some(win) = w.upgrade() {
                 collections_page::reload_keep_sel(&win, &db);
+                collections_page::load_gallery(&win, &db, &cache, coll_thumb_quality, &coll_crop_cache);
             }
         }
     });
 
     // ── People page ────────────────────────────────────────────────
-    let people = people_page::PeoplePage::new(db.clone());
+    let people = people_page::PeoplePage::new(db.clone(), cache.clone(), coll_thumb_quality);
     window.set_people_items(people.model());
 
     window.on_people_page_shown({
@@ -225,13 +328,46 @@ pub fn run() -> anyhow::Result<()> {
         let grid = grid.clone();
         let w = window.as_weak();
         let current_query = current_query.clone();
+        let select_target = select_target.clone();
         move |person_id, name| {
             let q = SearchQuery::default().with_person(person_id as i64);
             *current_query.borrow_mut() = q.clone();
             grid.load(q);
+            select_target.set(None);
             if let Some(win) = w.upgrade() {
                 win.set_library_filter_name(name);
+                win.set_library_active_collection_id(-1);
                 win.set_page(crate::Page::Library);
+            }
+        }
+    });
+
+    window.on_people_edit_save({
+        let db = db.clone();
+        let people = people.clone();
+        let w = window.as_weak();
+        move |person_id, name| {
+            let name = name.trim().to_string();
+            if name.is_empty() {
+                return;
+            }
+            services::faces::rename_person(&db, person_id as i64, &name);
+            if let Some(win) = w.upgrade() {
+                people.load(win.as_weak());
+            }
+        }
+    });
+
+    window.on_people_edit_delete({
+        let db = db.clone();
+        let cache = cache.clone();
+        let people = people.clone();
+        let w = window.as_weak();
+        move |person_id| {
+            services::faces::delete_person(&db, &cache, person_id as i64);
+            if let Some(win) = w.upgrade() {
+                win.set_people_untagged_count(people.untagged_count() as i32);
+                people.load(win.as_weak());
             }
         }
     });
@@ -254,13 +390,16 @@ pub fn run() -> anyhow::Result<()> {
     window.on_library_shown({
         let grid = grid.clone();
         let current_query = current_query.clone();
+        let select_target = select_target.clone();
         let w = window.as_weak();
         move || {
             let q = SearchQuery::default();
             *current_query.borrow_mut() = q.clone();
             grid.load(q);
+            select_target.set(None);
             if let Some(win) = w.upgrade() {
                 win.set_library_filter_name(SharedString::new());
+                win.set_library_active_collection_id(-1);
             }
         }
     });
@@ -268,13 +407,16 @@ pub fn run() -> anyhow::Result<()> {
     window.on_library_filter_cleared({
         let grid = grid.clone();
         let current_query = current_query.clone();
+        let select_target = select_target.clone();
         let w = window.as_weak();
         move || {
             let q = SearchQuery::default();
             *current_query.borrow_mut() = q.clone();
             grid.load(q);
+            select_target.set(None);
             if let Some(win) = w.upgrade() {
                 win.set_library_filter_name(SharedString::new());
+                win.set_library_active_collection_id(-1);
             }
         }
     });
@@ -284,13 +426,16 @@ pub fn run() -> anyhow::Result<()> {
         let grid = grid.clone();
         let search_debounce = search_debounce.clone();
         let current_query = current_query.clone();
+        let select_target = select_target.clone();
         let w = window.as_weak();
         move |text| {
             let grid = grid.clone();
             let current_query = current_query.clone();
             let text = text.to_string();
+            select_target.set(None);
             if let Some(win) = w.upgrade() {
                 win.set_library_filter_name(SharedString::new());
+                win.set_library_active_collection_id(-1);
             }
             let timer = Timer::default();
             timer.start(
@@ -318,6 +463,92 @@ pub fn run() -> anyhow::Result<()> {
             if (idx as usize) < snapshot.len() {
                 let is_dark = w.upgrade().map(|w| w.get_dark()).unwrap_or(false);
                 detail::open(snapshot, idx as usize, db.clone(), is_dark);
+            }
+        }
+    });
+
+    // ── Library mass-select (sidebar "Add Images" toggle → collection dots) ──
+    //
+    // Entering select-mode doesn't require a target collection — you can
+    // just tick photos, then click a sidebar dot to add them (handled
+    // below). But if a target is already set (from following a gallery card
+    // into a filtered view, or a previous dot click this session), checkbox
+    // state is immediately synced to that collection's real membership so
+    // deselecting one is a removal, matching a freshly-clicked dot.
+    window.on_toggle_select_mode({
+        let db = db.clone();
+        let grid = grid.clone();
+        let select_target = select_target.clone();
+        let cache = cache.clone();
+        let coll_crop_cache = coll_crop_cache.clone();
+        let w = window.as_weak();
+        move || {
+            let Some(win) = w.upgrade() else { return };
+            let on = !win.get_library_select_mode();
+            win.set_library_select_mode(on);
+            if on {
+                win.set_page(crate::Page::Library);
+                let n = match select_target.get() {
+                    Some(id) => {
+                        let member_ids = services::collections::member_ids(&db, id);
+                        grid.apply_membership(&member_ids)
+                    }
+                    None => grid.selected_ids().len() as i32,
+                };
+                win.set_library_selected_count(n);
+            } else {
+                grid.clear_selection();
+                select_target.set(None);
+                win.set_library_selected_count(0);
+                win.set_library_active_collection_id(-1);
+                // Batch-refresh sidebar counts + gallery covers now that the
+                // session's incremental add/removes (each already committed
+                // live, see apply_marquee) are done.
+                collections_page::reload(&win, &db);
+                collections_page::load_gallery(&win, &db, &cache, coll_thumb_quality, &coll_crop_cache);
+            }
+        }
+    });
+
+    window.on_library_marquee_select({
+        let db = db.clone();
+        let cache = cache.clone();
+        let coll_crop_cache = coll_crop_cache.clone();
+        let grid = grid.clone();
+        let select_target = select_target.clone();
+        let w = window.as_weak();
+        move |base, count, x0, y0, x1, y1, columns| {
+            let target = select_target.get();
+            let n = grid.apply_marquee(base, count, (x0, y0, x1, y1), columns, target);
+            if let Some(win) = w.upgrade() {
+                win.set_library_selected_count(n);
+                // Live-refresh the sidebar dot's count + gallery card cover
+                // right after each add/remove, not just on toggle-off.
+                if target.is_some() {
+                    collections_page::reload(&win, &db);
+                    collections_page::load_gallery(&win, &db, &cache, coll_thumb_quality, &coll_crop_cache);
+                }
+            }
+        }
+    });
+
+    // Sidebar dot clicked while in select-mode: make that collection the
+    // editing target — sync checkboxes to its real membership (most tiles
+    // in a general/unfiltered view won't be members) and highlight the dot.
+    // From here every tap/drag live-adds/removes via `apply_marquee`.
+    window.on_collections_set_select_target({
+        let db = db.clone();
+        let grid = grid.clone();
+        let select_target = select_target.clone();
+        let w = window.as_weak();
+        move |collection_id| {
+            let collection_id = collection_id as i64;
+            let member_ids = services::collections::member_ids(&db, collection_id);
+            let n = grid.apply_membership(&member_ids);
+            select_target.set(Some(collection_id));
+            if let Some(win) = w.upgrade() {
+                win.set_library_selected_count(n);
+                win.set_library_active_collection_id(collection_id as i32);
             }
         }
     });
@@ -456,12 +687,14 @@ pub fn run() -> anyhow::Result<()> {
         let w = window.as_weak();
         let grid = grid.clone();
         let current_query = current_query.clone();
+        let resync_selection = resync_selection.clone();
         move || {
             let Some(w) = w.upgrade() else { return };
             let on = !w.get_date_view_on();
             w.set_date_view_on(on);
             grid.set_date_view(on);
             grid.load(current_query.borrow().clone());
+            resync_selection();
         }
     });
 

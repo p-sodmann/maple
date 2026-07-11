@@ -69,6 +69,24 @@ pub fn generate_thumbnail(path: &Path, max_size: u32, quality: u8) -> anyhow::Re
     Ok(encode_webp_rgb(&rgb, w, h, quality))
 }
 
+/// Decode `path`, crop to the largest centred square, and resize to
+/// `out_px × out_px` RGB pixels.
+///
+/// Used for representative "cover" crops (e.g. a Collection's central image)
+/// where — unlike [`render_to_rgb`] — the output must be square to match the
+/// round/rounded-square tile it's rendered into, and there's no face bbox to
+/// crop around (see [`crate::face_crop::extract_crop`] for that case).
+pub fn center_square_crop(path: &Path, out_px: u32) -> anyhow::Result<Vec<u8>> {
+    let rgb = maple_import::decode_image(path)?.into_rgb8();
+    let (w, h) = rgb.dimensions();
+    let side = w.min(h).max(1);
+    let x = (w - side) / 2;
+    let y = (h - side) / 2;
+    let cropped = image::imageops::crop_imm(&rgb, x, y, side, side).to_image();
+    let resized = image::imageops::resize(&cropped, out_px, out_px, image::imageops::FilterType::Lanczos3);
+    Ok(resized.into_raw())
+}
+
 // ── Internals ─────────────────────────────────────────────────────
 
 /// Compute output dimensions preserving aspect ratio.
@@ -133,6 +151,19 @@ mod tests {
         let (_rgb, w, h) = render_to_rgb(&test_png_path(&dir), 100).unwrap();
         assert_eq!(w, 100);
         assert_eq!(h, 50);
+    }
+
+    #[test]
+    fn center_square_crop_produces_requested_square() {
+        let dir = create_test_png(800, 400);
+        let pixels = center_square_crop(&test_png_path(&dir), 64).unwrap();
+        assert_eq!(pixels.len(), (64 * 64 * 3) as usize);
+    }
+
+    #[test]
+    fn center_square_crop_bad_path_errors() {
+        let result = center_square_crop(Path::new("/nonexistent/photo.jpg"), 64);
+        assert!(result.is_err());
     }
 
     #[test]

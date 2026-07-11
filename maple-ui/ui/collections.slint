@@ -4,7 +4,7 @@
 // CollectionsPage   — inline two-pane view embedded in AppWindow.
 
 import { Theme } from "theme.slint";
-import { FlatButton } from "widgets.slint";
+import { FlatButton, RepTile, EditEntityModal } from "widgets.slint";
 import { LineEdit, ScrollView } from "std-widgets.slint";
 import { ThumbItem } from "library.slint";
 
@@ -15,6 +15,18 @@ export struct CollectionEntry {
     image-count: int,
     parent-id: int,   // -1 = top-level
     depth: int,       // indentation level in the tree
+}
+
+// One card in the Collections gallery — the People-page equivalent for
+// collections, with a computed "central" cover image (see
+// `Database::update_collection_representative`) instead of a face crop.
+export struct CollectionGalleryItem {
+    id: int,
+    name: string,
+    color: color,
+    image-count: int,
+    cover-image: image,
+    cover-loaded: bool,
 }
 
 // ── Pop-up window (used by the detail window's add-to-collection flow) ──────
@@ -222,12 +234,18 @@ export component CollectionsPage inherits Rectangle {
 
     // ── Data pushed from Rust ──────────────────────────────────────
     in property <[CollectionEntry]> collections;
+    in property <[CollectionGalleryItem]> gallery-items;
+    // Id of the collection the Library grid is currently filtered to (-1 =
+    // none) — highlights that card so it's clear which collection you're
+    // browsing after following it into the Library view.
+    in property <int> active-collection-id: -1;
     in property <string>  sel-name;
     in property <color>   sel-color: #B5543E;
     in property <int>     sel-count;
     in property <[ThumbItem]> thumbs;
 
     // ── Local UI state ─────────────────────────────────────────────
+    in-out property <bool>   gallery-mode:         true;
     in-out property <int>    selected-id:          -1;
     in-out property <bool>   creating:             false;
     in-out property <string> new-name:             "";
@@ -236,6 +254,7 @@ export component CollectionsPage inherits Rectangle {
     in-out property <string> rename-val:           "";
     in-out property <int>    creating-parent-id:   -1;
     in-out property <string> creating-parent-name: "";
+    property <int> editing-id: -1;
 
     in property <string> sel-parent-name: "";
 
@@ -245,6 +264,9 @@ export component CollectionsPage inherits Rectangle {
     callback rename-collection(int, string);
     callback collection-selected(int);
     callback open-image(int);  // fires with DB image id when a thumbnail is clicked
+    callback collection-activated(int, string);      // gallery card click → filter Library
+    callback collection-edit-save(int, string, color);
+    callback collection-edit-delete(int);
 
     // Thumbnail grid constants (root-level so for loop can reference them).
     property <float>  tcols: 4;
@@ -257,7 +279,157 @@ export component CollectionsPage inherits Rectangle {
         #B5543E, #6E8B6F, #C29A3E, #5B7C99, #8A6BA8, #A05C5C,
     ];
 
-    HorizontalLayout {
+    // Gallery grid constants.
+    property <length> gcell: 120px;
+    property <length> ggap:  Theme.gap;
+    property <length> gpad:  Theme.pad;
+    property <length> gtile-h: root.gcell + 32px;
+    property <length> gpitch-x: root.gcell + root.ggap;
+    property <length> gpitch-y: root.gtile-h + root.ggap;
+    property <float>  gcolumns: Math.max(1, Math.floor((root.width - 2 * root.gpad + root.ggap) / root.gpitch-x));
+    property <float>  grows: Math.ceil(root.gallery-items.length / root.gcolumns);
+
+    // ══ GALLERY (default landing view) ═════════════════════════════
+    if root.gallery-mode: VerticalLayout {
+        spacing: 0;
+
+        Rectangle {
+            height: 72px;
+            HorizontalLayout {
+                padding-left: 24px;
+                padding-right: 24px;
+                padding-top: 22px;
+                padding-bottom: 12px;
+                spacing: 12px;
+
+                VerticalLayout {
+                    spacing: 4px;
+                    alignment: center;
+                    horizontal-stretch: 1;
+                    Text {
+                        text: "Collections";
+                        color: Theme.ink;
+                        font-size: 22px;
+                        font-weight: 700;
+                        letter-spacing: -0.2px;
+                    }
+                    Text {
+                        text: root.collections.length == 1
+                            ? "1 collection"
+                            : root.collections.length + " collections";
+                        color: Theme.ink-3;
+                        font-size: 12px;
+                        font-weight: 500;
+                    }
+                }
+
+                FlatButton {
+                    text: "Manage";
+                    clicked => { root.gallery-mode = false; }
+                }
+
+                Rectangle {
+                    width: 72px;
+                    height: 34px;
+                    y: (parent.height - self.height) / 2;
+                    border-radius: Theme.radius-btn;
+                    background: gnew-ta.has-hover ? Theme.accent.brighter(0.08) : Theme.accent;
+                    animate background { duration: 100ms; }
+                    HorizontalLayout {
+                        padding-left: 10px; padding-right: 12px;
+                        spacing: 6px; alignment: center;
+                        Text {
+                            text: "New";
+                            color: #FFFFFF;
+                            font-size: 13px; font-weight: 600;
+                            vertical-alignment: center;
+                        }
+                    }
+                    gnew-ta := TouchArea {
+                        clicked => {
+                            root.creating = true;
+                            root.gallery-mode = false;
+                            root.renaming = false;
+                            root.new-name = "";
+                            root.new-color = #B5543E;
+                            root.creating-parent-id = -1;
+                            root.creating-parent-name = "";
+                        }
+                    }
+                }
+            }
+        }
+
+        if root.gallery-items.length == 0: Rectangle {
+            vertical-stretch: 1;
+            VerticalLayout {
+                alignment: center;
+                spacing: 8px;
+                padding: 40px;
+                Text {
+                    text: "No collections yet";
+                    color: Theme.ink;
+                    font-size: 15px;
+                    font-weight: 600;
+                    horizontal-alignment: center;
+                }
+                Text {
+                    text: "Create one to start organising your photos.";
+                    color: Theme.ink-3;
+                    font-size: 13px;
+                    font-weight: 500;
+                    horizontal-alignment: center;
+                    wrap: word-wrap;
+                }
+            }
+        }
+
+        if root.gallery-items.length > 0: ScrollView {
+            vertical-stretch: 1;
+            viewport-width: self.visible-width;
+            viewport-height: root.grows * root.gpitch-y + root.gpad;
+
+            for coll[idx] in root.gallery-items: RepTile {
+                property <float> grid-col: Math.mod(idx, root.gcolumns);
+                property <float> grid-row: Math.floor(idx / root.gcolumns);
+                x: root.gpad + grid-col * root.gpitch-x;
+                y: root.gpad + grid-row * root.gpitch-y;
+                photo-size: root.gcell;
+                tile-image: coll.cover-image;
+                loaded: coll.cover-loaded;
+                label: coll.name;
+                sub-label: coll.image-count == 1 ? "1 photo" : coll.image-count + " photos";
+                accent: coll.color;
+                shape-round: false;
+                active: coll.id == root.active-collection-id;
+                activated => { root.collection-activated(coll.id, coll.name); }
+                edit-clicked => {
+                    edit-modal.name-value = coll.name;
+                    edit-modal.color-value = coll.color;
+                    edit-modal.confirming-delete = false;
+                    root.editing-id = coll.id;
+                }
+            }
+        }
+    }
+
+    edit-modal := EditEntityModal {
+        open: root.editing-id >= 0;
+        title: "Edit Collection";
+        show-color: true;
+        save(name, color) => {
+            root.collection-edit-save(root.editing-id, name, color);
+            root.editing-id = -1;
+        }
+        delete => {
+            root.collection-edit-delete(root.editing-id);
+            root.editing-id = -1;
+        }
+        cancel => { root.editing-id = -1; }
+    }
+
+    // ══ MANAGE (two-pane list/detail — hierarchy, rename, delete) ═══
+    if !root.gallery-mode: HorizontalLayout {
         spacing: 0;
 
         // ══ LEFT PANE (392 px) ════════════════════════════════════
@@ -307,6 +479,12 @@ export component CollectionsPage inherits Rectangle {
                                 font-size: 12px;
                                 font-weight: 500;
                             }
+                        }
+
+                        // "Gallery" back-button
+                        FlatButton {
+                            text: "Gallery";
+                            clicked => { root.gallery-mode = true; }
                         }
 
                         // "New" button

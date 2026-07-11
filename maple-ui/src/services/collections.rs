@@ -1,10 +1,12 @@
 //! Collection queries — DB access + data-shape composition for the
 //! Collections page and the detail-window add-to-collection picker.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
 use slint::SharedString;
+
+use maple_db::SearchQuery;
 
 use crate::transforms::hex_to_color;
 use crate::{CollectionChip, CollectionEntry};
@@ -84,11 +86,88 @@ pub fn rename_collection(db: &Arc<Mutex<maple_db::Database>>, id: i64, name: &st
         .is_some()
 }
 
-pub fn delete_collection(db: &Arc<Mutex<maple_db::Database>>, id: i64) -> bool {
+pub fn set_collection_color(db: &Arc<Mutex<maple_db::Database>>, id: i64, hex_color: &str) -> bool {
     db.lock()
         .ok()
-        .and_then(|g| g.delete_collection(id).ok())
+        .and_then(|g| g.set_collection_color(id, hex_color).ok())
         .is_some()
+}
+
+/// Delete a collection and best-effort evict its cached cover crop.
+pub fn delete_collection(
+    db: &Arc<Mutex<maple_db::Database>>,
+    cache: &maple_db::ThumbnailCache,
+    id: i64,
+) -> bool {
+    let ok = db
+        .lock()
+        .ok()
+        .and_then(|g| g.delete_collection(id).ok())
+        .is_some();
+    if ok {
+        if let Err(e) = cache.remove_cover(id) {
+            tracing::warn!("remove_cover {id}: {e}");
+        }
+    }
+    ok
+}
+
+/// Add one image to a collection and refresh its representative cover.
+/// Returns `false` on DB error (best-effort).
+pub fn add_image_to_collection(
+    db: &Arc<Mutex<maple_db::Database>>,
+    collection_id: i64,
+    image_id: i64,
+) -> bool {
+    let Ok(g) = db.lock() else { return false };
+    if let Err(e) = g.add_image_to_collection(collection_id, image_id) {
+        tracing::warn!("add_image_to_collection {image_id} -> {collection_id}: {e}");
+        return false;
+    }
+    if let Err(e) = g.update_collection_representative(collection_id) {
+        tracing::warn!("update_collection_representative {collection_id}: {e}");
+    }
+    true
+}
+
+/// Remove one image from a collection and refresh its representative cover.
+/// Returns `false` on DB error (best-effort).
+pub fn remove_image_from_collection(
+    db: &Arc<Mutex<maple_db::Database>>,
+    collection_id: i64,
+    image_id: i64,
+) -> bool {
+    let Ok(g) = db.lock() else { return false };
+    if let Err(e) = g.remove_image_from_collection(collection_id, image_id) {
+        tracing::warn!("remove_image_from_collection {image_id} <- {collection_id}: {e}");
+        return false;
+    }
+    if let Err(e) = g.update_collection_representative(collection_id) {
+        tracing::warn!("update_collection_representative {collection_id}: {e}");
+    }
+    true
+}
+
+/// Every image id currently in `collection_id`. Used to sync select-mode
+/// checkboxes to real membership when a sidebar dot becomes the "editing
+/// target" (see `grid::apply_membership`).
+pub fn member_ids(db: &Arc<Mutex<maple_db::Database>>, collection_id: i64) -> HashSet<i64> {
+    db.lock()
+        .ok()
+        .and_then(|g| g.search_images(&SearchQuery::default().with_collection(collection_id)).ok())
+        .map(|imgs| imgs.into_iter().map(|i| i.id).collect())
+        .unwrap_or_default()
+}
+
+/// Load every collection with its representative cover-image path (People-
+/// page equivalent for the Collections gallery).
+pub fn load_all_with_representatives(
+    db: &Arc<Mutex<maple_db::Database>>,
+) -> Vec<maple_db::CollectionWithRep> {
+    db.lock()
+        .ok()
+        .and_then(|g| g.all_collections_with_representatives().ok())
+        .unwrap_or_default()
 }
 
 /// DFS-flatten the collection tree into a display list with depth info.

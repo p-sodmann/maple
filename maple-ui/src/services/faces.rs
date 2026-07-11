@@ -84,3 +84,30 @@ pub fn insert_face(db: &Arc<Mutex<maple_db::Database>>, image_id: i64, bbox: [f3
         .map_err(|e| tracing::warn!("insert_face image={image_id}: {e}"))
         .ok()
 }
+
+/// Rename a person. Returns `false` on DB error (best-effort).
+pub fn rename_person(db: &Arc<Mutex<maple_db::Database>>, id: i64, name: &str) -> bool {
+    db.lock().ok().and_then(|g| g.rename_person(id, name).ok()).is_some()
+}
+
+/// Delete a person and best-effort evict their cached representative face
+/// crop (looked up before the row disappears).
+pub fn delete_person(db: &Arc<Mutex<maple_db::Database>>, cache: &maple_db::ThumbnailCache, id: i64) -> bool {
+    let Ok(guard) = db.lock() else { return false };
+    let face_id = guard
+        .all_persons_with_representatives()
+        .unwrap_or_default()
+        .into_iter()
+        .find(|p| p.id == id)
+        .and_then(|p| p.face_id);
+    let ok = guard.delete_person(id).is_ok();
+    drop(guard);
+    if ok {
+        if let Some(fid) = face_id {
+            if let Err(e) = cache.remove_face_crop(fid) {
+                tracing::warn!("remove_face_crop {fid}: {e}");
+            }
+        }
+    }
+    ok
+}

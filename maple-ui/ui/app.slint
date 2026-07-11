@@ -9,7 +9,7 @@ import { ImportPage, ImportLocation } from "import.slint";
 import { DetailWindow, CollectionChip, FaceBox, FacePersonSuggestion } from "detail.slint";
 import { ImportWindow, ImportItem } from "import.slint";
 import { SettingsWindow } from "settings.slint";
-import { CollectionsWindow, CollectionEntry, CollectionsPage } from "collections.slint";
+import { CollectionsWindow, CollectionEntry, CollectionsPage, CollectionGalleryItem } from "collections.slint";
 import { FaceTagWindow } from "face_tag.slint";
 import { PeoplePage, PersonItem } from "people.slint";
 import { DebugCompareWindow } from "debug_compare.slint";
@@ -145,13 +145,18 @@ component CollectionDot inherits Rectangle {
     in property <string> label;
     in property <string> count;
     in property <bool>   active: false;
+    // While true, this dot acts as an "add selection here" drop target
+    // instead of a navigation link — see the sidebar's select-mode wiring.
+    in property <bool>   drop-target: false;
     callback clicked;
 
     height: 32px;
     border-radius: 8px;
     background: root.active
         ? Theme.accent-tint
-        : (dot-ta.has-hover ? Theme.border.with-alpha(0.4) : transparent);
+        : (dot-ta.has-hover
+            ? (root.drop-target ? Theme.accent.with-alpha(0.18) : Theme.border.with-alpha(0.4))
+            : transparent);
     animate background { duration: 80ms; }
 
     HorizontalLayout {
@@ -183,6 +188,38 @@ component CollectionDot inherits Rectangle {
     }
 
     dot-ta := TouchArea { clicked => { root.clicked(); } }
+}
+
+// ── Mass-select toggle (sidebar, next to the collections list) ─────
+
+component SelectToggle inherits Rectangle {
+    in property <bool> active: false;
+    in property <int>  count: 0;
+    callback clicked;
+
+    height: 24px;
+    border-radius: 7px;
+    background: root.active
+        ? Theme.accent
+        : (ta.has-hover ? Theme.accent : Theme.accent-tint);
+    animate background { duration: 80ms; }
+
+    HorizontalLayout {
+        padding-left: 9px;
+        padding-right: 9px;
+        alignment: center;
+        Text {
+            text: root.active
+                ? (root.count > 0 ? root.count + " Selected" : "Selecting…")
+                : "Add Images";
+            color: root.active || ta.has-hover ? #FFFFFF : Theme.accent-text;
+            font-size: 11px;
+            font-weight: 700;
+            vertical-alignment: center;
+        }
+    }
+
+    ta := TouchArea { clicked => { root.clicked(); } }
 }
 
 // ── Top-bar toggle switch ──────────────────────────────────────────
@@ -287,9 +324,22 @@ export component AppWindow inherits Window {
     in property <int>               collections-sel-count:       0;
     in property <string>            collections-sel-parent-name: "";
     in property <[ThumbItem]>       collections-thumbs:      [];
+    in property <[CollectionGalleryItem]> collections-gallery-items: [];
 
     // Sidebar dots (top-level collections, shown below nav).
     in property <[CollectionEntry]> sidebar-collections: [];
+
+    // ── Library mass-select (sidebar "Select" toggle) ──────────────
+    // While true, the grid captures click/drag for selection instead of
+    // opening the detail viewer, and sidebar collection dots become "add
+    // selection here" targets instead of navigation links.
+    in-out property <bool> library-select-mode: false;
+    in property <int>      library-selected-count: 0;
+
+    // Id of the collection the Library grid is currently filtered to, via a
+    // Collections gallery card (-1 = not filtered to a single collection).
+    // Highlights the matching sidebar dot and gallery card.
+    in property <int> library-active-collection-id: -1;
 
     // ── AI / faces toggle state (library top-bar) ─────────────────
     in-out property <bool> ai-on:    false;
@@ -302,6 +352,12 @@ export component AppWindow inherits Window {
     callback library-search-changed(string);
     callback library-activated(int);
     callback library-filter-cleared;
+    callback toggle-select-mode;
+    callback library-marquee-select(int, int, length, length, length, length, float);
+    // Sidebar dot clicked while in select-mode: make that collection the
+    // "editing target" — checkboxes sync to its real membership, and every
+    // tap/drag from then on live-adds/removes against it.
+    callback collections-set-select-target(int);
 
     callback import-page-shown;
     callback import-browse;
@@ -313,6 +369,8 @@ export component AppWindow inherits Window {
     callback people-page-shown;
     callback people-person-activated(int, string);  // person_id, name → filter library
     callback people-tag-faces;
+    callback people-edit-save(int, string);
+    callback people-edit-delete(int);
 
     callback collections-page-shown;
     callback collections-select(int);
@@ -320,6 +378,9 @@ export component AppWindow inherits Window {
     callback collections-delete(int);
     callback collections-rename(int, string);
     callback collections-open-image(int);
+    callback collections-activated(int, string);
+    callback collections-edit-save(int, string, color);
+    callback collections-edit-delete(int);
 
     callback toggle-ai;
     callback toggle-faces;
@@ -433,25 +494,40 @@ export component AppWindow inherits Window {
 
                 // ── Collections list ──────────────────────────────
                 if root.sidebar-collections.length > 0: Rectangle { height: 12px; }
-                if root.sidebar-collections.length > 0: Text {
-                    text: "COLLECTIONS";
-                    color: Theme.ink-3;
-                    font-size: 11px;
-                    font-weight: 600;
-                    letter-spacing: 0.7px;
-                    height: 18px;
+                if root.sidebar-collections.length > 0: HorizontalLayout {
+                    height: 24px;
+                    Text {
+                        text: "COLLECTIONS";
+                        color: Theme.ink-3;
+                        font-size: 11px;
+                        font-weight: 600;
+                        letter-spacing: 0.7px;
+                        vertical-alignment: center;
+                    }
+                    Rectangle { horizontal-stretch: 1; }
+                    SelectToggle {
+                        active: root.library-select-mode;
+                        count: root.library-selected-count;
+                        clicked => { root.toggle-select-mode(); }
+                    }
                 }
                 for coll in root.sidebar-collections: CollectionDot {
                     dot-color: coll.color;
                     label: coll.name;
                     count: coll.image-count + "";
-                    active: root.page == Page.collections
-                        && root.collections-selected-id == coll.id;
+                    active: (root.page == Page.collections
+                        && root.collections-selected-id == coll.id)
+                        || root.library-active-collection-id == coll.id;
+                    drop-target: root.library-select-mode;
                     clicked => {
-                        root.page = Page.collections;
-                        root.collections-selected-id = coll.id;
-                        root.collections-page-shown();
-                        root.collections-select(coll.id);
+                        if (root.library-select-mode) {
+                            root.collections-set-select-target(coll.id);
+                        } else {
+                            root.page = Page.collections;
+                            root.collections-selected-id = coll.id;
+                            root.collections-page-shown();
+                            root.collections-select(coll.id);
+                        }
                     }
                 }
 
@@ -840,8 +916,12 @@ export component AppWindow inherits Window {
                 date-groups: root.library-date-groups;
                 date-view: root.date-view-on;
                 cell-size: root.library-cell-size;
+                select-mode: root.library-select-mode;
                 search-changed(t) => { root.library-search-changed(t); }
                 activated(i)      => { root.library-activated(i); }
+                select-drag(b, c, x0, y0, x1, y1, cols) => {
+                    root.library-marquee-select(b, c, x0, y0, x1, y1, cols);
+                }
             }
 
 
@@ -864,6 +944,8 @@ export component AppWindow inherits Window {
                 untagged-count: root.people-untagged-count;
                 person-activated(id, name) => { root.people-person-activated(id, name); }
                 tag-faces-clicked    => { root.people-tag-faces(); }
+                person-edit-save(id, name) => { root.people-edit-save(id, name); }
+                person-edit-delete(id)     => { root.people-edit-delete(id); }
             }
 
             if root.page == Page.collections: CollectionsPage {
@@ -875,11 +957,16 @@ export component AppWindow inherits Window {
                 sel-count: root.collections-sel-count;
                 sel-parent-name: root.collections-sel-parent-name;
                 thumbs: root.collections-thumbs;
+                gallery-items: root.collections-gallery-items;
+                active-collection-id: root.library-active-collection-id;
                 collection-selected(id) => { root.collections-select(id); }
                 create-collection(name, color, pid) => { root.collections-create(name, color, pid); }
                 delete-collection(id) => { root.collections-delete(id); }
                 rename-collection(id, name) => { root.collections-rename(id, name); }
                 open-image(id) => { root.collections-open-image(id); }
+                collection-activated(id, name) => { root.collections-activated(id, name); }
+                collection-edit-save(id, name, color) => { root.collections-edit-save(id, name, color); }
+                collection-edit-delete(id) => { root.collections-edit-delete(id); }
             }
         }
     }

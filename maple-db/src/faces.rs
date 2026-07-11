@@ -227,6 +227,25 @@ impl Database {
         Ok((faces, persons))
     }
 
+    /// Rename an existing person.
+    pub fn rename_person(&self, id: i64, name: &str) -> anyhow::Result<()> {
+        self.conn
+            .execute("UPDATE persons SET name = ?1 WHERE id = ?2", params![name, id])?;
+        Ok(())
+    }
+
+    /// Delete a person. Their face detections are un-assigned (`person_id`
+    /// set to `NULL`) rather than deleted, so the photos and detected
+    /// bounding boxes remain — only the name association is removed.
+    pub fn delete_person(&self, id: i64) -> anyhow::Result<()> {
+        self.conn.execute(
+            "UPDATE face_detections SET person_id = NULL WHERE person_id = ?1",
+            params![id],
+        )?;
+        self.conn.execute("DELETE FROM persons WHERE id = ?1", params![id])?;
+        Ok(())
+    }
+
     /// Insert or retrieve a person by name.  Returns the person's `id`.
     pub fn upsert_person(&self, name: &str) -> anyhow::Result<i64> {
         let now = SystemTime::now()
@@ -473,45 +492,8 @@ impl Database {
             .map(|(id, blob)| (id, blob_to_embedding(&blob)))
             .collect();
 
-        if faces.is_empty() {
-            self.conn.execute(
-                "UPDATE persons SET centroid_embedding = NULL, representative_face_id = NULL \
-                 WHERE id = ?1",
-                params![person_id],
-            )?;
-            return Ok(());
-        }
-
-        // Compute the mean embedding.
-        let dim = faces[0].1.len();
-        let mut centroid = vec![0f32; dim];
-        for (_, emb) in &faces {
-            for (c, v) in centroid.iter_mut().zip(emb.iter()) {
-                *c += v;
-            }
-        }
-        let n = faces.len() as f32;
-        for c in &mut centroid {
-            *c /= n;
-        }
-
-        // L2-normalise the centroid so cosine similarity still works.
-        let norm: f32 = centroid.iter().map(|v| v * v).sum::<f32>().sqrt().max(1e-9);
-        for c in &mut centroid {
-            *c /= norm;
-        }
-
-        // Pick the face closest to the centroid.
-        let best_id = faces
-            .iter()
-            .max_by(|(_, a), (_, b)| {
-                cosine_similarity(a, &centroid)
-                    .partial_cmp(&cosine_similarity(b, &centroid))
-                    .unwrap_or(std::cmp::Ordering::Equal)
-            })
-            .map(|(id, _)| *id);
-
-        let centroid_blob = embedding_to_blob(&centroid);
+        let (centroid, best_id) = crate::embedding::centroid_and_nearest(&faces);
+        let centroid_blob = centroid.as_deref().map(embedding_to_blob);
         self.conn.execute(
             "UPDATE persons SET centroid_embedding = ?1, representative_face_id = ?2 WHERE id = ?3",
             params![centroid_blob, best_id, person_id],
@@ -598,4 +580,97 @@ pub(crate) fn blob_to_embedding(blob: &[u8]) -> Vec<f32> {
     blob.chunks_exact(4)
         .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
         .collect()
+}
+
+// ── Tests ───────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    fn tmp_db() -> (tempfile::TempDir, Database) {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open(&dir.path().join("library.db")).unwrap();
+        (dir, db)
+    }
+
+    fn insert_image(db: &Database, name: &str) -> i64 {
+        let path = PathBuf::from(format!("/photos/{name}"));
+        db.insert_image(&path, &[0u8; 32], 1024).unwrap();
+        db.image_id_for_path(&path).unwrap().unwrap()
+    }
+
+    fn norm_vec(v: Vec<f32>) -> Vec<f32> {
+        let n: f32 = v.iter().map(|x| x * x).sum::<f32>().sqrt().max(1e-9);
+        v.into_iter().map(|x| x / n).collect()
+    }
+
+    #[test]
+    fn rename_person_updates_name() {
+        let (_dir, db) = tmp_db();
+        let pid = db.upsert_person("Alice").unwrap();
+        db.rename_person(pid, "Alicia").unwrap();
+        assert_eq!(db.person_name(pid).unwrap(), Some("Alicia".to_string()));
+    }
+
+    #[test]
+    fn delete_person_unassigns_faces_but_keeps_detections() {
+        let (_dir, db) = tmp_db();
+        let pid = db.upsert_person("Bob").unwrap();
+        let img = insert_image(&db, "a.jpg");
+        let face_id = db
+            .insert_face_detection(img, [0.0, 0.0, 1.0, 1.0], &[1.0, 0.0], 0.9)
+            .unwrap();
+        db.assign_face_to_person(face_id, Some(pid)).unwrap();
+
+        db.delete_person(pid).unwrap();
+
+        assert_eq!(db.person_name(pid).unwrap(), None);
+        let faces = db.faces_for_image(img).unwrap();
+        assert_eq!(faces.len(), 1);
+        assert_eq!(faces[0].person_id, None);
+    }
+
+    #[test]
+    fn update_person_representative_picks_nearest_to_centroid() {
+        let (_dir, db) = tmp_db();
+        let pid = db.upsert_person("Carol").unwrap();
+        let img = insert_image(&db, "b.jpg");
+
+        let f1 = db
+            .insert_face_detection(img, [0.0, 0.0, 0.1, 0.1], &norm_vec(vec![1.0, 0.0]), 0.9)
+            .unwrap();
+        let f2 = db
+            .insert_face_detection(img, [0.1, 0.1, 0.2, 0.2], &norm_vec(vec![0.0, 1.0]), 0.9)
+            .unwrap();
+        let f3 = db
+            .insert_face_detection(
+                img,
+                [0.2, 0.2, 0.3, 0.3],
+                &norm_vec(vec![0.9, 0.436]),
+                0.9,
+            )
+            .unwrap();
+        for f in [f1, f2, f3] {
+            db.assign_face_to_person(f, Some(pid)).unwrap();
+        }
+
+        db.update_person_representative(pid).unwrap();
+
+        let reps = db.all_persons_with_representatives().unwrap();
+        let rep = reps.iter().find(|p| p.id == pid).unwrap();
+        assert_eq!(rep.face_id, Some(f3));
+    }
+
+    #[test]
+    fn update_person_representative_clears_when_no_faces() {
+        let (_dir, db) = tmp_db();
+        let pid = db.upsert_person("Dave").unwrap();
+        db.update_person_representative(pid).unwrap();
+        let reps = db.all_persons_with_representatives().unwrap();
+        let rep = reps.iter().find(|p| p.id == pid).unwrap();
+        assert_eq!(rep.face_id, None);
+        assert_eq!(rep.image_path, None);
+    }
 }
