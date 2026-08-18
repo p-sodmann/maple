@@ -5,14 +5,20 @@
 //! * `seen_imported.bin` — images copied to the destination.
 //! * `seen_rejected.bin` — images explicitly skipped by the user.
 //!
-//! Each uses a bloom filter for O(1) probabilistic membership queries backed
-//! by full 32-byte BLAKE3 content hashes persisted to disk.
+//! Each stores the full 32-byte BLAKE3 content hashes of its members, both in
+//! memory and on disk.
 //!
-//! A negative query ("definitely not seen") is always correct.
-//! A positive query ("probably seen") has an extremely low false-positive
-//! rate — storing the full BLAKE3 hash means collisions are cryptographically
-//! implausible (2⁻²⁵⁶ per pair).
+//! Membership queries are **exact** in both directions: [`SeenSet::contains`]
+//! answers from the hash set itself, so the only way two distinct images can
+//! collide is a genuine BLAKE3 collision (2⁻²⁵⁶ per pair).
+//!
+//! A bloom filter sits in front of the hash set purely as a fast-reject stage:
+//! all-bits-set is a *maybe*, which is then confirmed against the hash set; a
+//! single clear bit is a definitive "not present" and short-circuits before any
+//! 32-byte comparison happens. It is a cache-friendly early-out, not a
+//! correctness mechanism — the hash set alone is already O(1).
 
+use std::collections::HashSet;
 use std::path::Path;
 
 /// Number of hash functions for the bloom filter.
@@ -26,12 +32,14 @@ const VERSION: u32 = 1;
 
 /// Persistent set keyed by full 32-byte BLAKE3 content hashes.
 pub struct SeenSet {
-    /// Bloom filter bit array.
+    /// Bloom filter bit array — a fast-reject stage in front of `hashes`.
     bits: Vec<u64>,
     /// Number of usable bits (`bits.len() * 64`).
     num_bits: usize,
-    /// Full 32-byte BLAKE3 hashes stored for persistence.
-    hashes: Vec<[u8; 32]>,
+    /// The authoritative membership set. Also what gets persisted; the
+    /// hashes carry no meaningful order, so one container serves both roles
+    /// and there is no second copy that could drift out of sync.
+    hashes: HashSet<[u8; 32]>,
 }
 
 impl SeenSet {
@@ -46,7 +54,7 @@ impl SeenSet {
         Self {
             bits: vec![0u64; words],
             num_bits: words * 64,
-            hashes: Vec::with_capacity(expected),
+            hashes: HashSet::with_capacity(expected),
         }
     }
 
@@ -94,8 +102,13 @@ impl SeenSet {
     // ── Core API ────────────────────────────────────────────────
 
     /// Insert a full 32-byte BLAKE3 content hash.
+    ///
+    /// Inserting the same hash twice is a no-op: the set stores each hash
+    /// once, so [`Self::len`] counts distinct images.
     pub fn insert(&mut self, hash: &[u8; 32]) {
-        self.hashes.push(*hash);
+        if !self.hashes.insert(*hash) {
+            return;
+        }
         // Resize the bloom filter if the load factor is getting too high.
         if self.hashes.len() * 10 > self.num_bits {
             self.rebuild_bloom();
@@ -104,22 +117,14 @@ impl SeenSet {
         }
     }
 
-    /// Check if a hash is probably in the set.
+    /// Check whether a hash is in the set. **Exact** in both directions.
     ///
-    /// `false` → **definitely** not seen.
-    /// `true`  → **probably** seen (negligible false-positive rate given the
-    ///           full 32-byte hash; bloom filter error is well below 1%).
-    pub fn probably_contains(&self, hash: &[u8; 32]) -> bool {
-        if self.num_bits == 0 {
-            return false;
-        }
-        for i in 0..K {
-            let pos = bloom_pos(hash, i, self.num_bits);
-            if self.bits[pos / 64] & (1u64 << (pos % 64)) == 0 {
-                return false;
-            }
-        }
-        true
+    /// The bloom filter answers first: if it says "not present" that is
+    /// definitive and we return immediately. A bloom *maybe* — which includes
+    /// its false positives (up to ~1 %) — is then confirmed against the stored
+    /// hashes, so a `true` result means this exact 32-byte hash was inserted.
+    pub fn contains(&self, hash: &[u8; 32]) -> bool {
+        self.bloom_maybe_contains(hash) && self.hashes.contains(hash)
     }
 
     /// Number of hashes stored.
@@ -133,6 +138,23 @@ impl SeenSet {
 
     // ── Internals ───────────────────────────────────────────────
 
+    /// Bloom fast-reject stage.
+    ///
+    /// `false` → definitely not in the set. `true` → maybe; the caller must
+    /// confirm against `hashes`.
+    fn bloom_maybe_contains(&self, hash: &[u8; 32]) -> bool {
+        if self.num_bits == 0 {
+            return false;
+        }
+        for i in 0..K {
+            let pos = bloom_pos(hash, i, self.num_bits);
+            if self.bits[pos / 64] & (1u64 << (pos % 64)) == 0 {
+                return false;
+            }
+        }
+        true
+    }
+
     fn bloom_insert(&mut self, hash: &[u8; 32]) {
         for i in 0..K {
             let pos = bloom_pos(hash, i, self.num_bits);
@@ -143,23 +165,33 @@ impl SeenSet {
     fn rebuild_bloom(&mut self) {
         let num_bits = optimal_bits(self.hashes.len()).max(MIN_BITS);
         let words = num_bits.div_ceil(64);
-        self.bits = vec![0u64; words];
-        self.num_bits = words * 64;
-        for i in 0..self.hashes.len() {
-            let h = self.hashes[i];
-            self.bloom_insert(&h);
+        let num_bits = words * 64;
+        let mut bits = vec![0u64; words];
+        for h in &self.hashes {
+            for i in 0..K {
+                let pos = bloom_pos(h, i, num_bits);
+                bits[pos / 64] |= 1u64 << (pos % 64);
+            }
         }
+        self.bits = bits;
+        self.num_bits = num_bits;
     }
 
     /// Binary format: `version(u32 LE) | count(u32 LE) | hashes(count × 32 bytes)`.
     ///
     /// Storage: 8 B header + 32 B/image.  100 k images ≈ 3.2 MB.
+    ///
+    /// Hashes are written in sorted order. Their order carries no meaning, but
+    /// `HashSet` iteration is arbitrary, and sorting keeps the file byte-stable
+    /// across saves of the same content.
     fn to_bytes(&self) -> Vec<u8> {
         let count = self.hashes.len() as u32;
+        let mut sorted: Vec<&[u8; 32]> = self.hashes.iter().collect();
+        sorted.sort_unstable();
         let mut buf = Vec::with_capacity(8 + self.hashes.len() * 32);
         buf.extend_from_slice(&VERSION.to_le_bytes());
         buf.extend_from_slice(&count.to_le_bytes());
-        for h in &self.hashes {
+        for h in sorted {
             buf.extend_from_slice(h);
         }
         buf
@@ -177,11 +209,11 @@ impl SeenSet {
         if data.len() < 8 + count * 32 {
             return Self::new();
         }
-        let mut hashes = Vec::with_capacity(count);
+        let mut hashes = HashSet::with_capacity(count);
         for i in 0..count {
             let off = 8 + i * 32;
             let h: [u8; 32] = data[off..off + 32].try_into().unwrap();
-            hashes.push(h);
+            hashes.insert(h);
         }
         let mut set = Self {
             bits: Vec::new(),
@@ -201,7 +233,12 @@ impl Default for SeenSet {
 
 // ── Bloom filter math ────────────────────────────────────────────
 
-/// Optimal number of bits for `n` items at ~1 % false-positive rate.
+/// Bits for `n` items targeting a ~1 % bloom false-positive rate.
+///
+/// Rounding up to a power of two means the realised rate is usually better
+/// than the target — it swings between ~0.06 % just after a resize and ~1 %
+/// just before the next one. Either way it only costs a wasted hash-set
+/// lookup; [`SeenSet::contains`] is exact regardless.
 fn optimal_bits(n: usize) -> usize {
     if n == 0 {
         return MIN_BITS;
@@ -244,31 +281,103 @@ mod tests {
         h
     }
 
+    /// Replace the bloom filter with one whose bits are all set, so the
+    /// fast-reject stage answers "maybe" for *every* hash. Membership then
+    /// rests entirely on the exact hash set — a deterministic worst case,
+    /// rather than waiting for a bloom collision to happen by chance.
+    fn saturate_bloom(set: &mut SeenSet) {
+        set.bits = vec![u64::MAX; 1];
+        set.num_bits = 64;
+    }
+
     #[test]
     fn insert_and_query() {
         let mut set = SeenSet::new();
         let h = fake_hash(1);
-        assert!(!set.probably_contains(&h));
+        assert!(!set.contains(&h));
         set.insert(&h);
-        assert!(set.probably_contains(&h));
+        assert!(set.contains(&h));
         assert_eq!(set.len(), 1);
     }
 
     #[test]
-    fn negative_is_definite() {
+    fn exact_under_total_bloom_saturation() {
         let mut set = SeenSet::new();
         for i in 0..1000u64 {
             set.insert(&fake_hash(i));
         }
-        // Values we never inserted should (almost certainly) not match.
+        saturate_bloom(&mut set);
+
+        // Precondition: the fast-reject stage now rejects nothing, so every
+        // query below reaches the exact check.
+        for i in 100_000..101_000u64 {
+            assert!(set.bloom_maybe_contains(&fake_hash(i)));
+        }
+
+        // Not one of the never-inserted hashes may report as contained.
         let mut false_positives = 0;
         for i in 100_000..101_000u64 {
-            if set.probably_contains(&fake_hash(i)) {
+            if set.contains(&fake_hash(i)) {
                 false_positives += 1;
             }
         }
-        // ~1 % FP rate → expect ~10 out of 1000; allow generous margin.
-        assert!(false_positives < 50, "too many false positives: {false_positives}");
+        assert_eq!(false_positives, 0, "membership is not exact");
+
+        // Everything actually inserted still matches.
+        for i in 0..1000u64 {
+            assert!(set.contains(&fake_hash(i)));
+        }
+    }
+
+    #[test]
+    fn exactness_survives_roundtrip() {
+        let mut set = SeenSet::new();
+        for i in 0..500u64 {
+            set.insert(&fake_hash(i));
+        }
+
+        // `from_bytes` rebuilds the bloom from scratch; it must rebuild the
+        // exact index too.
+        let mut loaded = SeenSet::from_bytes(&set.to_bytes());
+        assert_eq!(loaded.len(), 500);
+        saturate_bloom(&mut loaded);
+
+        for i in 0..500u64 {
+            assert!(loaded.contains(&fake_hash(i)));
+        }
+        for i in 100_000..100_500u64 {
+            assert!(!loaded.contains(&fake_hash(i)));
+        }
+    }
+
+    #[test]
+    fn bloom_rejects_before_the_exact_check() {
+        let mut set = SeenSet::new();
+        for i in 0..1000u64 {
+            set.insert(&fake_hash(i));
+        }
+        // At the designed ~1 % rate the vast majority of non-members are
+        // rejected by the bloom alone, never touching the hash set.
+        let rejected = (100_000..101_000u64)
+            .filter(|i| !set.bloom_maybe_contains(&fake_hash(*i)))
+            .count();
+        assert!(rejected > 900, "bloom rejected only {rejected}/1000");
+    }
+
+    #[test]
+    fn duplicate_insert_is_deduped() {
+        let mut set = SeenSet::new();
+        let h = fake_hash(7);
+        set.insert(&h);
+        set.insert(&h);
+        set.insert(&h);
+        assert_eq!(set.len(), 1);
+        assert!(set.contains(&h));
+
+        // And the duplicates do not survive a save/load cycle either.
+        let loaded = SeenSet::from_bytes(&set.to_bytes());
+        assert_eq!(loaded.len(), 1);
+        assert!(loaded.contains(&h));
     }
 
     #[test]
@@ -285,10 +394,10 @@ mod tests {
         let loaded = SeenSet::from_bytes(&bytes);
 
         assert_eq!(loaded.len(), 3);
-        assert!(loaded.probably_contains(&h1));
-        assert!(loaded.probably_contains(&h2));
-        assert!(loaded.probably_contains(&h3));
-        assert!(!loaded.probably_contains(&fake_hash(999_999)));
+        assert!(loaded.contains(&h1));
+        assert!(loaded.contains(&h2));
+        assert!(loaded.contains(&h3));
+        assert!(!loaded.contains(&fake_hash(999_999)));
     }
 
     #[test]
@@ -302,8 +411,8 @@ mod tests {
         set.save_to(&path).unwrap();
 
         let loaded = SeenSet::load_from(&path);
-        assert!(loaded.probably_contains(&h));
-        assert!(!loaded.probably_contains(&fake_hash(999_999)));
+        assert!(loaded.contains(&h));
+        assert!(!loaded.contains(&fake_hash(999_999)));
     }
 
     #[test]

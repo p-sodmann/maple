@@ -427,10 +427,7 @@ fn spawn_scan_worker(
 
             let (hash, imported) = match maple_import::content_hash(&display_path) {
                 Ok(h) => {
-                    let imp = imported_set
-                        .lock()
-                        .map(|s| s.probably_contains(&h))
-                        .unwrap_or(false);
+                    let imp = imported_set.lock().map(|s| s.contains(&h)).unwrap_or(false);
                     (h, imp)
                 }
                 Err(_) => ([0u8; 32], false),
