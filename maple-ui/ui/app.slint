@@ -297,6 +297,10 @@ export component AppWindow inherits Window {
     // ── Library ──────────────────────────────────────────────────
     in property <[ThumbItem]>  library-items;
     in property <[DateGroup]>  library-date-groups;
+    // Rows the current library query matches in total. `library-items` only
+    // holds the pages loaded so far (endless scrolling), so the header count
+    // comes from here; -1 while the count query is still running.
+    in property <int>          library-total-count: -1;
     in-out property <bool>     date-view-on: false;
     in property <length>       library-cell-size: 160px;
     // Non-empty when the library grid is filtered to one person's photos
@@ -351,6 +355,7 @@ export component AppWindow inherits Window {
     callback library-shown;
     callback library-search-changed(string);
     callback library-activated(int);
+    callback library-request-more(int);
     callback library-filter-cleared;
     callback toggle-select-mode;
     callback library-marquee-select(int, int, length, length, length, length, float);
@@ -704,7 +709,9 @@ export component AppWindow inherits Window {
                                 vertical-alignment: center;
                             }
                             Text {
-                                text: root.library-items.length + " photos";
+                                text: (root.library-total-count >= 0
+                                    ? root.library-total-count
+                                    : root.library-items.length) + " photos";
                                 color: Theme.ink-3;
                                 font-size: 13px;
                                 font-weight: 500;
@@ -919,6 +926,7 @@ export component AppWindow inherits Window {
                 select-mode: root.library-select-mode;
                 search-changed(t) => { root.library-search-changed(t); }
                 activated(i)      => { root.library-activated(i); }
+                request-more(n)   => { root.library-request-more(n); }
                 select-drag(b, c, x0, y0, x1, y1, cols) => {
                     root.library-marquee-select(b, c, x0, y0, x1, y1, cols);
                 }

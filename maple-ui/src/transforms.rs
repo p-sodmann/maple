@@ -11,15 +11,25 @@ use slint::SharedString;
 use crate::date;
 use crate::{DateGroup, FaceBox, FacePersonSuggestion};
 
-/// Group `records` into contiguous same-day runs for the date-grouped view.
-/// Assumes `records` is already sorted so that same-day images are adjacent
-/// (see the `date_view` sort in `grid.rs::load()`); otherwise the same day
-/// may appear as multiple separate groups.
-pub fn build_date_groups(records: &[LibraryImage]) -> Vec<DateGroup> {
-    let mut groups: Vec<DateGroup> = Vec::new();
-    let mut current_day: Option<i64> = None;
+/// Group `records[from..]` into contiguous same-day runs for the
+/// date-grouped view, extending `groups`, which already covers
+/// `records[..from]`. Pass `from = 0` and an empty `groups` to group a whole
+/// list.
+///
+/// Assumes `records` is sorted so that same-day images are adjacent (the
+/// grid asks the DB for `SearchOrder::TakenDesc` in date view); otherwise
+/// the same day may appear as multiple separate groups.
+///
+/// A page boundary is not a day boundary: when a page continues the day the
+/// previous one ended on, its leading records grow that existing group
+/// instead of opening a second group for the same day, so every group stays
+/// one contiguous `start..start + count` slice of the accumulated list.
+pub fn append_date_groups(groups: &mut Vec<DateGroup>, records: &[LibraryImage], from: usize) {
+    // Day of the last already-grouped record — the day the appended page
+    // may be continuing.
+    let mut current_day = from.checked_sub(1).and_then(|i| records.get(i)).map(record_day);
 
-    for (i, rec) in records.iter().enumerate() {
+    for (i, rec) in records.iter().enumerate().skip(from) {
         let ts = rec.meta.taken_at.unwrap_or(rec.added_at);
         let day = date::day_number(ts);
         if current_day != Some(day) {
@@ -34,8 +44,10 @@ pub fn build_date_groups(records: &[LibraryImage]) -> Vec<DateGroup> {
             g.count += 1;
         }
     }
+}
 
-    groups
+fn record_day(rec: &LibraryImage) -> i64 {
+    date::day_number(rec.meta.taken_at.unwrap_or(rec.added_at))
 }
 
 /// Caption shown under a tile during search (empty when not a search hit).
@@ -281,6 +293,13 @@ mod tests {
         }
     }
 
+    /// Group a whole list in one go (the unpaged case).
+    fn build_date_groups(records: &[LibraryImage]) -> Vec<DateGroup> {
+        let mut groups = Vec::new();
+        append_date_groups(&mut groups, records, 0);
+        groups
+    }
+
     #[test]
     fn build_date_groups_splits_on_day_boundary() {
         // Two shots on day 0, one shot a full day later.
@@ -291,6 +310,66 @@ mod tests {
         assert_eq!(groups[0].count, 2);
         assert_eq!(groups[1].start, 2);
         assert_eq!(groups[1].count, 1);
+    }
+
+    #[test]
+    fn append_date_groups_continues_a_day_across_a_page_boundary() {
+        // Page 1 ends mid-day; page 2 opens with two more shots from that
+        // same day, then rolls over.
+        let page1 = vec![image_at(0, Some(0)), image_at(3600, Some(3600))];
+        let page2 = vec![image_at(7200, Some(7200)), image_at(90_000, Some(90_000))];
+
+        let mut records = page1.clone();
+        let mut groups = build_date_groups(&records);
+        assert_eq!(groups.len(), 1);
+
+        let from = records.len();
+        records.extend(page2);
+        append_date_groups(&mut groups, &records, from);
+
+        // The day-0 group grew rather than being duplicated.
+        assert_eq!(groups.len(), 2);
+        assert_eq!((groups[0].start, groups[0].count), (0, 3));
+        assert_eq!((groups[1].start, groups[1].count), (3, 1));
+        // Groups tile the accumulated list without gaps or overlap.
+        assert_eq!(groups.iter().map(|g| g.count).sum::<i32>(), records.len() as i32);
+    }
+
+    #[test]
+    fn append_date_groups_matches_a_full_rebuild() {
+        // Same records, delivered in three pages, must group identically to
+        // one unpaged listing.
+        let all: Vec<LibraryImage> = (0..9)
+            .map(|k: i64| {
+                // Three per day, three days.
+                let ts = (k / 3) * 86_400 + (k % 3) * 3600;
+                image_at(ts, Some(ts))
+            })
+            .collect();
+
+        let mut records = Vec::new();
+        let mut groups = Vec::new();
+        for page in all.chunks(2) {
+            let from = records.len();
+            records.extend_from_slice(page);
+            append_date_groups(&mut groups, &records, from);
+        }
+
+        let rebuilt = build_date_groups(&all);
+        let shape = |gs: &[DateGroup]| -> Vec<(String, i32, i32)> {
+            gs.iter().map(|g| (g.label.to_string(), g.start, g.count)).collect()
+        };
+        assert_eq!(shape(&groups), shape(&rebuilt));
+        assert_eq!(groups.len(), 3);
+    }
+
+    #[test]
+    fn append_date_groups_on_an_empty_page_changes_nothing() {
+        let records = vec![image_at(0, Some(0))];
+        let mut groups = build_date_groups(&records);
+        append_date_groups(&mut groups, &records, records.len());
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].count, 1);
     }
 
     #[test]

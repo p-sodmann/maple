@@ -1,19 +1,29 @@
 //! Library thumbnail grid controller (Slint).
 //!
-//! Mirrors the former GTK `LibraryGrid` (views/library/grid.rs):
-//!   1. A background thread queries the DB and sends `Records`.
-//!   2. Placeholder tiles fill the grid immediately.
+//! Mirrors the former GTK `LibraryGrid` (views/library/grid.rs), with the
+//! library loaded one page at a time instead of all at once:
+//!   1. A background thread queries one page of the DB and sends `Page`.
+//!   2. Placeholder tiles for that page are appended to the grid immediately.
 //!   3. Parallel thumbnail workers send `Thumb` messages; tiles are filled
 //!      in-place as decoded RGB arrives.
+//!   4. The view reports how far the user has scrolled (`request_more`), and
+//!      the next page is fetched before the viewport reaches the end.
 //!
-//! Each `load()` increments a generation counter; the `slint::Timer` poller
-//! discards messages from superseded loads, so rapid search changes never
-//! produce stale or interleaved grid content. This is the Slint analogue of the
-//! old `glib::timeout_add_local` poller — all background work still runs on
-//! `std::thread` + `std::sync::mpsc`, and only the UI-thread delivery changes.
+//! Pages only ever *append*: `records` and the tile model grow together at
+//! the tail, so a model row index is always the matching record's index —
+//! the invariant `apply_marquee`, `selected_ids`, `apply_membership` and the
+//! `activated(idx)` handler in `lib.rs` all rely on. Nothing is ever
+//! recycled or windowed out from under them.
+//!
+//! Each `load()` increments a generation counter and resets paging to page 0;
+//! the `slint::Timer` poller discards messages from superseded loads, so
+//! rapid search changes never produce stale or interleaved grid content. An
+//! append is *not* a new load and never bumps the generation. This is the
+//! Slint analogue of the old `glib::timeout_add_local` poller — all
+//! background work still runs on `std::thread` + `std::sync::mpsc`, and only
+//! the UI-thread delivery changes.
 
 use std::cell::{Cell, RefCell};
-use std::cmp::Reverse;
 use std::collections::HashSet;
 use std::rc::Rc;
 use std::sync::{mpsc, Arc, Mutex};
@@ -23,12 +33,13 @@ use slint::{
     Image, Model, ModelRc, Rgb8Pixel, SharedPixelBuffer, SharedString, Timer, TimerMode, VecModel,
 };
 
-use maple_db::{LibraryImage, SearchQuery, ThumbnailCache};
+use maple_db::{LibraryImage, SearchOrder, SearchQuery, ThumbnailCache};
 use maple_import::raw_preview_supported;
 
-use crate::services::images::search_library;
+use crate::paging::{PageCursor, PAGE_SIZE};
+use crate::services::images::{count_library, search_library};
 use crate::thumbnail;
-use crate::transforms::{build_date_groups, score_caption};
+use crate::transforms::{append_date_groups, score_caption};
 use crate::{DateGroup, ThumbItem};
 
 const POLL_MS: u64 = 32;
@@ -36,8 +47,15 @@ const POLL_MS: u64 = 32;
 // ── Worker messages ──────────────────────────────────────────────
 
 enum GridMsg {
-    /// Initial batch of DB results (establishes grid size).
-    Records(Vec<LibraryImage>),
+    /// One page of DB results, to be appended at `offset` (which always
+    /// equals the current record count — see `PageCursor`).
+    Page {
+        offset: usize,
+        records: Vec<LibraryImage>,
+    },
+    /// Row count of the whole (unpaged) result set, sent once per load.
+    /// `None` when the query has no countable total (hybrid search).
+    Total(Option<usize>),
     /// One thumbnail finished — carries decoded RGB pixels.
     Thumb {
         index: usize,
@@ -47,8 +65,8 @@ enum GridMsg {
     },
     /// Format recognised but preview extraction not yet implemented.
     Unsupported { index: usize },
-    /// All thumbnails have been generated.
-    Done,
+    /// Every thumbnail of one page has been generated.
+    PageDone,
 }
 
 // ── Public interface ─────────────────────────────────────────────
@@ -68,6 +86,24 @@ pub struct LibraryGrid {
     thumb_px: Rc<Cell<u32>>,
     date_view: Rc<Cell<bool>>,
     generation: Rc<Cell<u64>>,
+    /// Query of the current load, with its ordering already applied. Each
+    /// page re-uses it with a different `limit`/`offset`.
+    query: Rc<RefCell<SearchQuery>>,
+    /// Paging state for the current load — reset by `load()`, advanced by
+    /// `request_more()` and by each arriving page.
+    cursor: Rc<RefCell<PageCursor>>,
+    /// Sender for the current generation's pages. Workers from a superseded
+    /// load keep the old one, whose receiver `load()` has already dropped.
+    tx: Rc<RefCell<Option<mpsc::Sender<GridMsg>>>>,
+    rx: Rc<RefCell<Option<mpsc::Receiver<GridMsg>>>>,
+    /// Page workers that have not signalled `PageDone` yet. The poller runs
+    /// only while this is non-zero, so an idle grid costs no timer wakeups.
+    active_pages: Rc<Cell<usize>>,
+    polling: Rc<Cell<bool>>,
+    /// Notified with the unpaged row count of the current query (`None`
+    /// while unknown) — the header's photo count, which can no longer be
+    /// read off the loaded item count.
+    total_hook: TotalHook,
     /// Current poller; replaced (and thereby stopped) on each `load()`.
     timer: Rc<RefCell<Option<Timer>>>,
     /// When set, placeholder tiles are built pre-selected according to this
@@ -80,6 +116,8 @@ pub struct LibraryGrid {
 }
 
 type ReloadHook = Rc<dyn Fn()>;
+/// Sink for the current query's total row count (see `on_total_count`).
+type TotalHook = Rc<RefCell<Option<Rc<dyn Fn(Option<usize>)>>>>;
 
 thread_local! {
     /// The app's single `LibraryGrid` + its last-used query, registered once
@@ -139,6 +177,13 @@ impl LibraryGrid {
             thumb_px: Rc::new(Cell::new(thumb_px)),
             date_view: Rc::new(Cell::new(false)),
             generation: Rc::new(Cell::new(0)),
+            query: Rc::new(RefCell::new(SearchQuery::default())),
+            cursor: Rc::new(RefCell::new(PageCursor::default())),
+            tx: Rc::new(RefCell::new(None)),
+            rx: Rc::new(RefCell::new(None)),
+            active_pages: Rc::new(Cell::new(0)),
+            polling: Rc::new(Cell::new(false)),
+            total_hook: Rc::new(RefCell::new(None)),
             timer: Rc::new(RefCell::new(None)),
             pending_membership: Rc::new(RefCell::new(None)),
         }
@@ -174,9 +219,17 @@ impl LibraryGrid {
         self.date_view.set(on);
     }
 
+    /// Register the sink for the current query's total row count. Called
+    /// once, from `run()`; fires on every `load()` (with `None`, the count
+    /// not being known yet) and again when the count query returns.
+    pub fn on_total_count(&self, hook: impl Fn(Option<usize>) + 'static) {
+        *self.total_hook.borrow_mut() = Some(Rc::new(hook));
+    }
+
     /// Reload the grid from the database using `query`.
     ///
-    /// Clears the grid immediately and cancels any in-progress previous load.
+    /// Clears the grid immediately, cancels any in-progress previous load,
+    /// resets paging to page 0, and fetches the first page.
     pub fn load(&self, query: SearchQuery) {
         let gen = self.generation.get() + 1;
         self.generation.set(gen);
@@ -186,127 +239,230 @@ impl LibraryGrid {
         // call `apply_membership()` afterward, which re-arms
         // `pending_membership` for whatever batch arrives.
         *self.timer.borrow_mut() = None;
+        self.polling.set(false);
+        self.active_pages.set(0);
         *self.pending_membership.borrow_mut() = None;
         self.model.set_vec(Vec::<ThumbItem>::new());
+        self.date_groups.set_vec(Vec::<DateGroup>::new());
+        self.records.borrow_mut().clear();
+        self.cursor.borrow_mut().reset();
+        self.report_total(None);
 
+        // The ordering has to come from SQL. Sorting here would only ever
+        // sort one page within itself, and page 2 would then interleave
+        // wrongly with page 1 instead of continuing it.
+        let order =
+            if self.date_view.get() { SearchOrder::TakenDesc } else { SearchOrder::AddedDesc };
+        *self.query.borrow_mut() = query.with_order(order);
+
+        // A fresh channel per generation: pages still in flight from the
+        // superseded load keep sending into the old one, whose receiver is
+        // dropped right here, so their rows can never reach this grid.
+        let (tx, rx) = mpsc::channel::<GridMsg>();
+        *self.tx.borrow_mut() = Some(tx);
+        *self.rx.borrow_mut() = Some(rx);
+
+        self.fetch_next_page();
+    }
+
+    /// Ask the grid to have at least `rows` items loaded.
+    ///
+    /// Called from the view as it scrolls, with the item index the viewport
+    /// is approaching plus a prefetch lead (see `library.slint`). Cheap and
+    /// idempotent — it only raises a high-water mark and starts a fetch if
+    /// one is actually due.
+    pub fn request_more(&self, rows: i32) {
+        if rows <= 0 {
+            return;
+        }
+        self.cursor.borrow_mut().want(rows as usize);
+        self.fetch_next_page();
+    }
+
+    /// Spawn the worker for the next page, if one is due (nothing already in
+    /// flight, listing not exhausted, view wants more than is loaded).
+    fn fetch_next_page(&self) {
+        let Some(offset) = self.cursor.borrow_mut().take_next_offset() else {
+            return;
+        };
+        let Some(tx) = self.tx.borrow().clone() else {
+            return;
+        };
+
+        let gen = self.generation.get();
+        let query = self.query.borrow().clone().with_limit(PAGE_SIZE).with_offset(offset);
         let db = self.db.clone();
         let cache = self.cache.clone();
         let quality = self.quality;
         let thumb_px = self.thumb_px.get();
-        let date_view = self.date_view.get();
-        let (tx, rx) = mpsc::channel::<GridMsg>();
+        // The row count is a property of the query, not of the page.
+        let with_total = offset == 0;
+
+        self.active_pages.set(self.active_pages.get() + 1);
+        tracing::debug!("library page: offset {offset}, {PAGE_SIZE} rows");
 
         // ── Worker thread (unchanged threading model) ─────────────
         std::thread::spawn(move || {
-            let mut records = search_library(&db, &query);
+            let records = search_library(&db, &query);
 
-            // Re-sort into contiguous day groups (newest day first) so the
-            // date-grouped view can slice `start..start+count` per day.
-            if date_view {
-                records.sort_by_key(|r| Reverse(r.meta.taken_at.unwrap_or(r.added_at)));
+            if with_total {
+                let _ = tx.send(GridMsg::Total(count_library(&db, &query)));
             }
+            let page_len = records.len();
+            let _ = tx.send(GridMsg::Page { offset, records: records.clone() });
 
-            let _ = tx.send(GridMsg::Records(records.clone()));
+            if page_len > 0 {
+                let parallelism =
+                    std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
+                let chunk_size = (page_len / parallelism).max(1);
 
-            if records.is_empty() {
-                let _ = tx.send(GridMsg::Done);
-                return;
-            }
-
-            let parallelism = std::thread::available_parallelism()
-                .map(|n| n.get())
-                .unwrap_or(4);
-            let chunk_size = (records.len() / parallelism).max(1);
-
-            std::thread::scope(|scope| {
-                for (chunk_start, chunk) in records.chunks(chunk_size).enumerate() {
-                    let tx = tx.clone();
-                    let cache = cache.clone();
-                    scope.spawn(move || {
-                        for (i, rec) in chunk.iter().enumerate() {
-                            let index = chunk_start * chunk_size + i;
-                            match load_thumbnail(rec, thumb_px, quality, &cache) {
-                                Ok((rgb, width, height)) => {
-                                    let _ = tx.send(GridMsg::Thumb { index, rgb, width, height });
-                                }
-                                Err(e) => {
-                                    tracing::warn!("Thumbnail failed for {}: {e}", rec.path.display());
-                                    if !raw_preview_supported(&rec.path) {
-                                        let _ = tx.send(GridMsg::Unsupported { index });
+                std::thread::scope(|scope| {
+                    for (chunk_index, chunk) in records.chunks(chunk_size).enumerate() {
+                        let tx = tx.clone();
+                        let cache = cache.clone();
+                        scope.spawn(move || {
+                            for (i, rec) in chunk.iter().enumerate() {
+                                // Absolute row index: this page starts at
+                                // `offset` in the accumulated grid.
+                                let index = offset + chunk_index * chunk_size + i;
+                                match load_thumbnail(rec, thumb_px, quality, &cache) {
+                                    Ok((rgb, width, height)) => {
+                                        let _ =
+                                            tx.send(GridMsg::Thumb { index, rgb, width, height });
+                                    }
+                                    Err(e) => {
+                                        tracing::warn!(
+                                            "Thumbnail failed for {}: {e}",
+                                            rec.path.display()
+                                        );
+                                        if !raw_preview_supported(&rec.path) {
+                                            let _ = tx.send(GridMsg::Unsupported { index });
+                                        }
                                     }
                                 }
                             }
-                        }
-                    });
-                }
-            });
+                        });
+                    }
+                });
+            }
 
-            let _ = tx.send(GridMsg::Done);
+            let _ = tx.send(GridMsg::PageDone);
         });
 
-        // ── UI-thread poller (slint::Timer) ───────────────────────
+        self.start_poller(gen);
+    }
+
+    /// Start the UI-thread poller for generation `gen`, unless one is
+    /// already running. It stops itself once every page worker has finished,
+    /// and is restarted by the next `fetch_next_page()`.
+    fn start_poller(&self, gen: u64) {
+        if self.polling.get() {
+            return;
+        }
+        self.polling.set(true);
+
         let timer = Timer::default();
         let slot = self.timer.clone();
-        let model = self.model.clone();
-        let date_groups = self.date_groups.clone();
-        let records_ref = self.records.clone();
-        let generation = self.generation.clone();
-        let pending_membership = self.pending_membership.clone();
+        let grid = self.clone();
 
         timer.start(TimerMode::Repeated, Duration::from_millis(POLL_MS), move || {
-            // Superseded by a newer load → stop self.
-            if generation.get() != gen {
-                if let Some(t) = slot.borrow().as_ref() {
-                    t.stop();
-                }
+            // Superseded by a newer load → do nothing, ever. `load()` drops
+            // this timer (which stops it) before starting the replacement,
+            // so this is belt and braces; it deliberately does *not* stop
+            // `slot`, which by now holds the *new* load's poller.
+            if grid.generation.get() != gen {
                 return;
             }
 
-            while let Ok(msg) = rx.try_recv() {
+            loop {
+                let Some(msg) = grid.rx.borrow().as_ref().and_then(|rx| rx.try_recv().ok()) else {
+                    return;
+                };
                 match msg {
-                    GridMsg::Records(records) => {
-                        // Reads the *current* value, not a snapshot from when
-                        // `load()` was called — if `apply_membership()` armed
-                        // this after the background query had already
-                        // started, this still-arriving first batch comes in
-                        // with the right tiles pre-selected.
-                        let pending = pending_membership.borrow();
-                        let placeholders: Vec<ThumbItem> = records
-                            .iter()
-                            .map(|r| {
-                                let selected = pending.as_ref().is_some_and(|set| set.contains(&r.id));
-                                placeholder_item(r, selected)
-                            })
-                            .collect();
-                        drop(pending);
-                        date_groups.set_vec(build_date_groups(&records));
-                        *records_ref.borrow_mut() = records;
-                        model.set_vec(placeholders);
-                    }
+                    GridMsg::Page { offset, records } => grid.append_page(offset, records),
+                    GridMsg::Total(total) => grid.report_total(total),
                     GridMsg::Thumb { index, rgb, width, height } => {
-                        if let Some(mut item) = model.row_data(index) {
+                        if let Some(mut item) = grid.model.row_data(index) {
                             item.image = rgb_to_image(&rgb, width, height);
                             item.loaded = true;
-                            model.set_row_data(index, item);
+                            grid.model.set_row_data(index, item);
                         }
                     }
                     GridMsg::Unsupported { index } => {
-                        if let Some(mut item) = model.row_data(index) {
+                        if let Some(mut item) = grid.model.row_data(index) {
                             item.unsupported = true;
-                            model.set_row_data(index, item);
+                            grid.model.set_row_data(index, item);
                         }
                     }
-                    GridMsg::Done => {
-                        if let Some(t) = slot.borrow().as_ref() {
-                            t.stop();
+                    GridMsg::PageDone => {
+                        grid.active_pages.set(grid.active_pages.get().saturating_sub(1));
+                        if grid.active_pages.get() == 0 {
+                            if let Some(t) = slot.borrow().as_ref() {
+                                t.stop();
+                            }
+                            grid.polling.set(false);
+                            return;
                         }
-                        return;
                     }
                 }
             }
         });
 
         *self.timer.borrow_mut() = Some(timer);
+    }
+
+    /// Append one page's records and tiles at the tail, in lockstep.
+    fn append_page(&self, offset: usize, page: Vec<LibraryImage>) {
+        let mut records = self.records.borrow_mut();
+        if offset != records.len() {
+            // Unreachable: only one page is ever in flight, and the next is
+            // requested only once the previous has landed. Refuse to append
+            // rather than mis-map this page's thumbnails onto other tiles.
+            drop(records);
+            tracing::warn!(
+                "library page at offset {offset} does not continue the loaded rows — paging stopped"
+            );
+            self.cursor.borrow_mut().abandon();
+            return;
+        }
+
+        // Reads the *current* value, not a snapshot from when `load()` was
+        // called — if `apply_membership()` armed this after the background
+        // query had already started, this still-arriving page comes in with
+        // the right tiles pre-selected.
+        let pending = self.pending_membership.borrow();
+        let placeholders: Vec<ThumbItem> = page
+            .iter()
+            .map(|r| {
+                let selected = pending.as_ref().is_some_and(|set| set.contains(&r.id));
+                placeholder_item(r, selected)
+            })
+            .collect();
+        drop(pending);
+
+        let page_len = page.len();
+        records.extend(page);
+        // Day groups are recomputed from the accumulated records, not from
+        // the page alone: a page can continue the day the previous one
+        // ended on, and that group has to stay one contiguous run.
+        let mut groups: Vec<DateGroup> = self.date_groups.iter().collect();
+        append_date_groups(&mut groups, &records, offset);
+        drop(records);
+
+        self.model.extend(placeholders);
+        sync_date_groups(&self.date_groups, &groups);
+
+        self.cursor.borrow_mut().page_arrived(page_len);
+        // One `request_more` can span several pages (a long jump of the
+        // scrollbar, or a viewport taller than one page).
+        self.fetch_next_page();
+    }
+
+    fn report_total(&self, total: Option<usize>) {
+        let hook = self.total_hook.borrow().clone();
+        if let Some(hook) = hook {
+            hook(total);
+        }
     }
 
     /// Apply a select-mode gesture reported by `SelectOverlay` (library.slint)
@@ -483,6 +639,23 @@ impl LibraryGrid {
 }
 
 // ── Helpers ──────────────────────────────────────────────────────
+
+/// Bring the date-group model in line with `new`, touching as few rows as
+/// possible. Appending a page only ever grows the last existing group and
+/// adds groups after it; replacing the whole model would instead tear down
+/// and rebuild every tile in the date-grouped view on every page.
+fn sync_date_groups(model: &VecModel<DateGroup>, new: &[DateGroup]) {
+    for (i, group) in new.iter().enumerate() {
+        match model.row_data(i) {
+            Some(old) if old == *group => {}
+            Some(_) => model.set_row_data(i, group.clone()),
+            None => model.push(group.clone()),
+        }
+    }
+    while model.row_count() > new.len() {
+        model.remove(model.row_count() - 1);
+    }
+}
 
 /// Build the initial placeholder tile for a record (image filled in later).
 fn placeholder_item(rec: &LibraryImage, selected: bool) -> ThumbItem {

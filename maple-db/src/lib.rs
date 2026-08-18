@@ -32,7 +32,7 @@ pub use stacker::{cluster_embeddings, update_stacks};
 pub use face_detector::{spawn_face_tagger, DetectedFace, FaceDetector, FaceTagger};
 pub use faces::{best_person_match, best_person_matches, cosine_similarity, FaceDetection, Person, PersonWithRep};
 pub use metadata::{extract_all_exif_tags, extract_metadata, spawn_metadata_filler, ImageMetadata};
-pub use query::SearchQuery;
+pub use query::{SearchOrder, SearchQuery};
 pub use scanner::{set_scanner_paused, LibraryScanner};
 pub use thumb_cache::ThumbnailCache;
 pub use semantic::{spawn_sentence_embedder, split_sentences, SemanticEncoder, SentenceEmbedder};
@@ -651,7 +651,8 @@ impl Database {
 
     /// Search the library and return matching images with their metadata.
     ///
-    /// With no text filter: returns all present images, newest-first.
+    /// With no text filter: returns all present images, ordered by
+    /// `query.order`.
     /// With a text filter: each whitespace-delimited token must match at
     ///   least one of: filename, make, model, lens, any AI description, or
     ///   any assigned person name.
@@ -669,70 +670,73 @@ impl Database {
                     query.collection_id,
                 )
             }
-            (Some(text), None) => {
-                self.search_images_text(text, query.limit, query.offset, query.collection_id, query.person_id)
-            }
-            (None, _) => self.search_images_all(query.limit, query.offset, query.collection_id, query.person_id),
+            (Some(text), None) => self.search_images_text(
+                text,
+                query.limit,
+                query.offset,
+                query.collection_id,
+                query.person_id,
+                query.order,
+            ),
+            (None, _) => self.search_images_all(
+                query.limit,
+                query.offset,
+                query.collection_id,
+                query.person_id,
+                query.order,
+            ),
         }
     }
 
-    /// Return all present images, newest-first.
+    /// Total number of rows `query`'s filters match, ignoring its
+    /// `limit`/`offset` — the "N photos" figure for a paged listing.
+    ///
+    /// `None` for hybrid (semantic) queries: their result set is a merge of
+    /// a keyword page and a KNN result list, so there is no row count to be
+    /// had without running the merge itself.
+    pub fn count_images(&self, query: &SearchQuery) -> anyhow::Result<Option<usize>> {
+        if query.semantic_embedding.is_some() && query.text.is_some() {
+            return Ok(None);
+        }
+
+        let (from_where, params) = match &query.text {
+            Some(text) => match text_from_where(text, query.collection_id, query.person_id) {
+                Some(parts) => parts,
+                // No usable tokens — the row query returns nothing, so does this.
+                None => return Ok(Some(0)),
+            },
+            None => all_from_where(query.collection_id, query.person_id),
+        };
+        // The text query joins descriptions/faces and so can repeat a row per
+        // match; `DISTINCT` mirrors its `SELECT DISTINCT`.
+        let selector = if query.text.is_some() { "COUNT(DISTINCT i.id)" } else { "COUNT(*)" };
+        let sql = format!("{STACK_COVERS_CTE} SELECT {selector} {from_where}");
+
+        let mut stmt = self.conn.prepare(&sql)?;
+        let n: i64 = stmt.query_row(rusqlite::params_from_iter(params), |r| r.get(0))?;
+        Ok(Some(n.max(0) as usize))
+    }
+
+    /// Return all present images in `order`.
     fn search_images_all(
         &self,
         limit: Option<usize>,
         offset: Option<usize>,
         collection_id: Option<i64>,
         person_id: Option<i64>,
+        order: SearchOrder,
     ) -> anyhow::Result<Vec<LibraryImage>> {
         use rusqlite::types::Value;
 
         let limit = limit.unwrap_or(500) as i64;
         let offset = offset.unwrap_or(0) as i64;
 
-        let coll_clause = if collection_id.is_some() {
-            " AND i.id IN (SELECT image_id FROM collection_images WHERE collection_id = ?)"
-        } else {
-            ""
-        };
-        let person_clause = if person_id.is_some() {
-            " AND i.id IN (SELECT image_id FROM face_detections WHERE person_id = ?)"
-        } else {
-            ""
-        };
-
+        let (from_where, mut params) = all_from_where(collection_id, person_id);
+        let order_by = crate::query::order_by_sql(order);
         let sql = format!(
-            "WITH stack_covers AS (
-                 SELECT s.id                                    AS stack_id,
-                        COALESCE(s.cover_image_id, MIN(si.id)) AS cover_id,
-                        COUNT(*)                                AS stack_size
-                 FROM stacks s
-                 JOIN images si ON si.stack_id = s.id AND si.status = 'present'
-                 GROUP BY s.id
-             )
-             SELECT i.id, i.path, i.added_at, i.status,
-                    i.filename, i.taken_at, i.make, i.model, i.lens,
-                    i.focal_length, i.aperture, i.iso,
-                    i.width, i.height, i.orientation, i.raw_path, i.hash,
-                    i.stack_id,
-                    sc.stack_size
-             FROM images i
-             LEFT JOIN stack_covers sc ON sc.stack_id = i.stack_id
-             WHERE i.status = 'present'
-               AND (
-                 i.stack_id IS NULL
-                 OR i.id = sc.cover_id
-               ){coll_clause}{person_clause}
-             ORDER BY i.added_at DESC
-             LIMIT ? OFFSET ?"
+            "{STACK_COVERS_CTE} SELECT {IMAGE_COLUMNS} {from_where} {order_by} LIMIT ? OFFSET ?"
         );
 
-        let mut params: Vec<Value> = Vec::new();
-        if let Some(cid) = collection_id {
-            params.push(Value::Integer(cid));
-        }
-        if let Some(pid) = person_id {
-            params.push(Value::Integer(pid));
-        }
         params.push(Value::Integer(limit));
         params.push(Value::Integer(offset));
 
@@ -755,109 +759,25 @@ impl Database {
         offset: Option<usize>,
         collection_id: Option<i64>,
         person_id: Option<i64>,
+        order: SearchOrder,
     ) -> anyhow::Result<Vec<LibraryImage>> {
+        use rusqlite::types::Value;
+
         let limit = limit.unwrap_or(500) as i64;
         let offset = offset.unwrap_or(0) as i64;
 
-        let like_patterns: Vec<String> = text
-            .split_whitespace()
-            .map(|t| format!("%{}%", escape_like_token(t)))
-            .collect();
-
-        if like_patterns.is_empty() {
+        let Some((from_where, mut params)) = text_from_where(text, collection_id, person_id) else {
             return Ok(vec![]);
-        }
-
-        // Each token must match somewhere in the combined EXIF fields OR
-        // in any AI description OR in any assigned person name OR in any
-        // comprehensive EXIF tag value (shutter speed, GPS, flash, …).
-        let exif_expr =
-            "LOWER(COALESCE(i.filename,'') || ' ' || \
-                   COALESCE(i.make,'')     || ' ' || \
-                   COALESCE(i.model,'')    || ' ' || \
-                   COALESCE(i.lens,''))";
-        let ai_expr = "LOWER(COALESCE(ad.description,''))";
-        let person_expr = "LOWER(COALESCE(p.name,''))";
-        let exif_tags_expr = "EXISTS (SELECT 1 FROM image_exif_tags t \
-                               WHERE t.image_id = i.id AND LOWER(t.value) LIKE ? ESCAPE '\\')";
-
-        let token_conditions: String = like_patterns
-            .iter()
-            .map(|_| {
-                format!(
-                    "({exif_expr} LIKE ? ESCAPE '\\' \
-                      OR {ai_expr} LIKE ? ESCAPE '\\' \
-                      OR {person_expr} LIKE ? ESCAPE '\\' \
-                      OR {exif_tags_expr})"
-                )
-            })
-            .collect::<Vec<_>>()
-            .join(" AND ");
-
-        let coll_clause = if collection_id.is_some() {
-            " AND i.id IN (SELECT image_id FROM collection_images WHERE collection_id = ?)"
-        } else {
-            ""
-        };
-        let person_clause = if person_id.is_some() {
-            " AND i.id IN (SELECT image_id FROM face_detections WHERE person_id = ?)"
-        } else {
-            ""
         };
 
+        let order_by = crate::query::order_by_sql(order);
         let sql = format!(
-            "WITH stack_covers AS (
-                 SELECT s.id                                    AS stack_id,
-                        COALESCE(s.cover_image_id, MIN(si.id)) AS cover_id,
-                        COUNT(*)                                AS stack_size
-                 FROM stacks s
-                 JOIN images si ON si.stack_id = s.id AND si.status = 'present'
-                 GROUP BY s.id
-             )
-             SELECT DISTINCT i.id, i.path, i.added_at, i.status,
-                    i.filename, i.taken_at, i.make, i.model, i.lens,
-                    i.focal_length, i.aperture, i.iso,
-                    i.width, i.height, i.orientation, i.raw_path, i.hash,
-                    i.stack_id,
-                    sc.stack_size
-             FROM images i
-             LEFT JOIN stack_covers sc ON sc.stack_id = i.stack_id
-             LEFT JOIN ai_descriptions ad ON ad.image_id = i.id
-             LEFT JOIN face_detections fd ON fd.image_id = i.id
-             LEFT JOIN persons p ON p.id = fd.person_id
-             WHERE i.status = 'present'
-               AND {token_conditions}
-               AND (
-                 i.stack_id IS NULL
-                 OR i.id = sc.cover_id
-               ){coll_clause}{person_clause}
-             ORDER BY i.added_at DESC
-             LIMIT ? OFFSET ?"
+            "{STACK_COVERS_CTE} SELECT DISTINCT {IMAGE_COLUMNS} \
+             {from_where} {order_by} LIMIT ? OFFSET ?"
         );
 
-        // Each token pattern appears four times: EXIF, AI desc, person name, EXIF tags.
-        use rusqlite::types::Value;
-        let mut params: Vec<Value> = like_patterns
-            .into_iter()
-            .flat_map(|p| {
-                [
-                    Value::Text(p.clone()),
-                    Value::Text(p.clone()),
-                    Value::Text(p.clone()),
-                    Value::Text(p),
-                ]
-            })
-            .collect();
-        if let Some(cid) = collection_id {
-            params.push(Value::Integer(cid));
-        }
-        if let Some(pid) = person_id {
-            params.push(Value::Integer(pid));
-        }
-        let params: Vec<Value> = params
-            .into_iter()
-            .chain([Value::Integer(limit), Value::Integer(offset)])
-            .collect();
+        params.push(Value::Integer(limit));
+        params.push(Value::Integer(offset));
 
         let tokens: Vec<String> = text
             .split_whitespace()
@@ -1272,6 +1192,144 @@ fn escape_like_token(token: &str) -> String {
         .replace('_', "\\_")
 }
 
+// ── Listing SQL fragments ────────────────────────────────────────
+//
+// The row listing and its `COUNT(*)` twin must apply exactly the same
+// filters, or the "N photos" figure disagrees with what the grid can page
+// through.  Both are assembled from the fragments below rather than being
+// written out twice.
+
+/// Collapses each stack to its cover image and carries the stack's size.
+const STACK_COVERS_CTE: &str = "WITH stack_covers AS (
+         SELECT s.id                                    AS stack_id,
+                COALESCE(s.cover_image_id, MIN(si.id)) AS cover_id,
+                COUNT(*)                                AS stack_size
+         FROM stacks s
+         JOIN images si ON si.stack_id = s.id AND si.status = 'present'
+         GROUP BY s.id
+     )";
+
+/// Column list consumed by [`row_to_library_image`], in its expected order.
+const IMAGE_COLUMNS: &str = "i.id, i.path, i.added_at, i.status,
+            i.filename, i.taken_at, i.make, i.model, i.lens,
+            i.focal_length, i.aperture, i.iso,
+            i.width, i.height, i.orientation, i.raw_path, i.hash,
+            i.stack_id,
+            sc.stack_size";
+
+/// `AND` clauses (and their bound ids) for the optional collection/person
+/// filters, shared by the plain and text listings.
+fn filter_clauses(
+    collection_id: Option<i64>,
+    person_id: Option<i64>,
+) -> (String, Vec<rusqlite::types::Value>) {
+    use rusqlite::types::Value;
+
+    let mut sql = String::new();
+    let mut params = Vec::new();
+    if let Some(cid) = collection_id {
+        sql.push_str(" AND i.id IN (SELECT image_id FROM collection_images WHERE collection_id = ?)");
+        params.push(Value::Integer(cid));
+    }
+    if let Some(pid) = person_id {
+        sql.push_str(" AND i.id IN (SELECT image_id FROM face_detections WHERE person_id = ?)");
+        params.push(Value::Integer(pid));
+    }
+    (sql, params)
+}
+
+/// `FROM … WHERE …` for an unfiltered (no text) listing, plus its params.
+fn all_from_where(
+    collection_id: Option<i64>,
+    person_id: Option<i64>,
+) -> (String, Vec<rusqlite::types::Value>) {
+    let (extra, params) = filter_clauses(collection_id, person_id);
+    let sql = format!(
+        "FROM images i
+         LEFT JOIN stack_covers sc ON sc.stack_id = i.stack_id
+         WHERE i.status = 'present'
+           AND (
+             i.stack_id IS NULL
+             OR i.id = sc.cover_id
+           ){extra}"
+    );
+    (sql, params)
+}
+
+/// `FROM … WHERE …` for a text listing, plus its params. `None` when `text`
+/// holds no usable tokens (the caller returns an empty result).
+fn text_from_where(
+    text: &str,
+    collection_id: Option<i64>,
+    person_id: Option<i64>,
+) -> Option<(String, Vec<rusqlite::types::Value>)> {
+    use rusqlite::types::Value;
+
+    let like_patterns: Vec<String> = text
+        .split_whitespace()
+        .map(|t| format!("%{}%", escape_like_token(t)))
+        .collect();
+    if like_patterns.is_empty() {
+        return None;
+    }
+
+    // Each token must match somewhere in the combined EXIF fields OR
+    // in any AI description OR in any assigned person name OR in any
+    // comprehensive EXIF tag value (shutter speed, GPS, flash, …).
+    let exif_expr = "LOWER(COALESCE(i.filename,'') || ' ' || \
+               COALESCE(i.make,'')     || ' ' || \
+               COALESCE(i.model,'')    || ' ' || \
+               COALESCE(i.lens,''))";
+    let ai_expr = "LOWER(COALESCE(ad.description,''))";
+    let person_expr = "LOWER(COALESCE(p.name,''))";
+    let exif_tags_expr = "EXISTS (SELECT 1 FROM image_exif_tags t \
+                           WHERE t.image_id = i.id AND LOWER(t.value) LIKE ? ESCAPE '\\')";
+
+    let token_conditions: String = like_patterns
+        .iter()
+        .map(|_| {
+            format!(
+                "({exif_expr} LIKE ? ESCAPE '\\' \
+                  OR {ai_expr} LIKE ? ESCAPE '\\' \
+                  OR {person_expr} LIKE ? ESCAPE '\\' \
+                  OR {exif_tags_expr})"
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(" AND ");
+
+    let (extra, extra_params) = filter_clauses(collection_id, person_id);
+    let sql = format!(
+        "FROM images i
+         LEFT JOIN stack_covers sc ON sc.stack_id = i.stack_id
+         LEFT JOIN ai_descriptions ad ON ad.image_id = i.id
+         LEFT JOIN face_detections fd ON fd.image_id = i.id
+         LEFT JOIN persons p ON p.id = fd.person_id
+         WHERE i.status = 'present'
+           AND {token_conditions}
+           AND (
+             i.stack_id IS NULL
+             OR i.id = sc.cover_id
+           ){extra}"
+    );
+
+    // Each token pattern appears four times: EXIF, AI desc, person name, EXIF tags.
+    let params: Vec<Value> = like_patterns
+        .into_iter()
+        .flat_map(|p| {
+            [
+                Value::Text(p.clone()),
+                Value::Text(p.clone()),
+                Value::Text(p.clone()),
+                Value::Text(p),
+            ]
+        })
+        .chain(extra_params)
+        .collect();
+
+    Some((sql, params))
+}
+
 // ── Row-mapping helper ───────────────────────────────────────────
 
 fn row_to_library_image(row: &rusqlite::Row<'_>) -> rusqlite::Result<LibraryImage> {
@@ -1645,5 +1703,180 @@ mod tests {
         // new filename.
         let hits = db.search_images(&SearchQuery::default().with_text("photo")).unwrap();
         assert_eq!(hits.len(), 1);
+    }
+
+    // ── Paged listings ───────────────────────────────────────────
+    //
+    // The library grid pages through these queries, so what matters is that
+    // consecutive pages of the same query concatenate into exactly the
+    // unpaged result — no repeats, no gaps, ordering preserved.
+
+    /// Insert `n` images that all share one `added_at` second (the bulk
+    /// import case), with `taken_at` running *backwards* relative to id so
+    /// the two orderings are distinguishable. Returns their ids.
+    fn insert_burst(db: &Database, n: usize) -> Vec<i64> {
+        let mut ids = Vec::new();
+        for k in 0..n {
+            let path = PathBuf::from(format!("/photos/burst_{k:03}.jpg"));
+            db.insert_image(&path, &fake_hash(k as u8), 1024).unwrap();
+            let id = db.image_id_for_path(&path).unwrap().unwrap();
+            db.update_metadata(
+                id,
+                &ImageMetadata {
+                    filename: Some(format!("burst_{k:03}.jpg")),
+                    taken_at: Some(1_700_000_000 - k as i64 * 3600),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            ids.push(id);
+        }
+        ids
+    }
+
+    fn page_ids(db: &Database, query: &SearchQuery, page: usize, size: usize) -> Vec<i64> {
+        db.search_images(&query.clone().with_limit(size).with_offset(page * size))
+            .unwrap()
+            .iter()
+            .map(|i| i.id)
+            .collect()
+    }
+
+    #[test]
+    fn pages_concatenate_into_the_unpaged_listing() {
+        let (_dir, db) = tmp_db();
+        insert_burst(&db, 25);
+
+        let all: Vec<i64> = db
+            .search_images(&SearchQuery::default())
+            .unwrap()
+            .iter()
+            .map(|i| i.id)
+            .collect();
+        assert_eq!(all.len(), 25);
+
+        let mut paged = Vec::new();
+        for page in 0..3 {
+            paged.extend(page_ids(&db, &SearchQuery::default(), page, 10));
+        }
+        assert_eq!(paged, all);
+    }
+
+    #[test]
+    fn taken_order_pages_stay_in_date_order() {
+        let (_dir, db) = tmp_db();
+        insert_burst(&db, 25);
+
+        let q = SearchQuery::default().with_order(SearchOrder::TakenDesc);
+        let mut paged = Vec::new();
+        for page in 0..3 {
+            paged.extend(page_ids(&db, &q, page, 10));
+        }
+
+        // taken_at descends as the filename index ascends, so date order is
+        // the insertion order — the opposite of the default added_at order,
+        // which ties on the second and falls back to id DESC.
+        let expected: Vec<i64> = insert_burst_ids(&db);
+        assert_eq!(paged, expected);
+
+        let added: Vec<i64> = page_ids(&db, &SearchQuery::default(), 0, 25);
+        assert_ne!(added, expected);
+    }
+
+    /// Ids in ascending order — matches the `taken_at`-descending order
+    /// produced by `insert_burst`.
+    fn insert_burst_ids(db: &Database) -> Vec<i64> {
+        let mut ids: Vec<i64> = db
+            .search_images(&SearchQuery::default())
+            .unwrap()
+            .iter()
+            .map(|i| i.id)
+            .collect();
+        ids.sort_unstable();
+        ids
+    }
+
+    #[test]
+    fn taken_order_falls_back_to_added_at_when_undated() {
+        let (_dir, db) = tmp_db();
+        // One dated far in the past, one with no EXIF date at all: the
+        // undated one is inserted now and so must sort first.
+        let dated = PathBuf::from("/photos/dated.jpg");
+        let undated = PathBuf::from("/photos/undated.jpg");
+        db.insert_image(&dated, &fake_hash(1), 1024).unwrap();
+        db.insert_image(&undated, &fake_hash(2), 1024).unwrap();
+        let dated_id = db.image_id_for_path(&dated).unwrap().unwrap();
+        db.update_metadata(dated_id, &ImageMetadata { taken_at: Some(1), ..Default::default() })
+            .unwrap();
+
+        let rows = db
+            .search_images(&SearchQuery::default().with_order(SearchOrder::TakenDesc))
+            .unwrap();
+        assert_eq!(rows[1].id, dated_id);
+    }
+
+    #[test]
+    fn short_page_signals_the_end_of_the_listing() {
+        let (_dir, db) = tmp_db();
+        insert_burst(&db, 12);
+
+        assert_eq!(page_ids(&db, &SearchQuery::default(), 0, 10).len(), 10);
+        assert_eq!(page_ids(&db, &SearchQuery::default(), 1, 10).len(), 2);
+        assert!(page_ids(&db, &SearchQuery::default(), 2, 10).is_empty());
+    }
+
+    #[test]
+    fn text_search_pages_concatenate_and_keep_order() {
+        let (_dir, db) = tmp_db();
+        insert_burst(&db, 12);
+        db.insert_image(&PathBuf::from("/photos/other.jpg"), &fake_hash(200), 1024).unwrap();
+
+        let q = SearchQuery::default().with_text("burst").with_order(SearchOrder::TakenDesc);
+        let all: Vec<i64> = db.search_images(&q).unwrap().iter().map(|i| i.id).collect();
+        assert_eq!(all.len(), 12);
+
+        let mut paged = page_ids(&db, &q, 0, 5);
+        paged.extend(page_ids(&db, &q, 1, 5));
+        paged.extend(page_ids(&db, &q, 2, 5));
+        assert_eq!(paged, all);
+    }
+
+    #[test]
+    fn count_images_ignores_limit_and_offset() {
+        let (_dir, db) = tmp_db();
+        insert_burst(&db, 12);
+
+        let q = SearchQuery::default().with_limit(5).with_offset(5);
+        assert_eq!(db.count_images(&q).unwrap(), Some(12));
+    }
+
+    #[test]
+    fn count_images_matches_the_text_listing() {
+        let (_dir, db) = tmp_db();
+        insert_burst(&db, 12);
+        db.insert_image(&PathBuf::from("/photos/other.jpg"), &fake_hash(200), 1024).unwrap();
+
+        let q = SearchQuery::default().with_text("burst");
+        assert_eq!(db.count_images(&q).unwrap(), Some(12));
+        assert_eq!(db.count_images(&SearchQuery::default()).unwrap(), Some(13));
+        // Blank-ish text has no usable tokens: the listing is empty, so is the count.
+        let blank = SearchQuery { text: Some("   ".into()), ..Default::default() };
+        assert_eq!(db.count_images(&blank).unwrap(), Some(0));
+        assert!(db.search_images(&blank).unwrap().is_empty());
+    }
+
+    #[test]
+    fn count_images_counts_a_stack_once() {
+        let (_dir, db) = tmp_db();
+        insert_burst(&db, 3);
+        let ids = insert_burst_ids(&db);
+        let stack_id = db.create_stack().unwrap();
+        for id in &ids {
+            db.set_image_stack(*id, Some(stack_id)).unwrap();
+        }
+
+        let listed = db.search_images(&SearchQuery::default()).unwrap().len();
+        assert_eq!(listed, 1);
+        assert_eq!(db.count_images(&SearchQuery::default()).unwrap(), Some(listed));
     }
 }

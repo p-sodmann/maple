@@ -7,6 +7,23 @@
 
 // ── Query model ──────────────────────────────────────────────────
 
+/// Row ordering for a library listing.
+///
+/// The ordering has to live in SQL rather than being applied by the caller
+/// afterwards: results are paged (`limit`/`offset`), so a client-side sort
+/// would only ever order one page within itself and pages would interleave
+/// wrongly.
+#[derive(Default, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SearchOrder {
+    /// Library-insertion order, newest import first.
+    #[default]
+    AddedDesc,
+    /// Photo-taken date, newest shot first; falls back to the insertion
+    /// timestamp for images whose EXIF carries no capture date. Drives the
+    /// date-grouped library view, which needs same-day images adjacent.
+    TakenDesc,
+}
+
 /// Parameters for filtering and paginating library images.
 ///
 /// # Example
@@ -35,6 +52,9 @@ pub struct SearchQuery {
     pub semantic_k: usize,
     /// When set, restrict results to images that have a face assigned to this person.
     pub person_id: Option<i64>,
+    /// Row ordering.  Ignored by hybrid (semantic) search, which is ranked
+    /// by relevance instead.
+    pub order: SearchOrder,
 }
 
 impl SearchQuery {
@@ -79,8 +99,30 @@ impl SearchQuery {
         self
     }
 
+    /// Order the results (see [`SearchOrder`]).
+    pub fn with_order(mut self, order: SearchOrder) -> Self {
+        self.order = order;
+        self
+    }
+
     pub fn is_empty(&self) -> bool {
         self.text.is_none() && self.collection_id.is_none() && self.person_id.is_none()
+    }
+}
+
+// ── ORDER BY formatting ──────────────────────────────────────────
+
+/// `ORDER BY` clause for a listing, for a query aliasing `images` as `i`.
+///
+/// Every ordering ends in `i.id DESC`: `added_at`/`taken_at` have
+/// second resolution and tie constantly within one bulk import, and a
+/// non-total sort key makes `LIMIT`/`OFFSET` paging drop or repeat rows
+/// across page boundaries (SQLite is free to break ties differently per
+/// statement).
+pub(crate) fn order_by_sql(order: SearchOrder) -> &'static str {
+    match order {
+        SearchOrder::AddedDesc => "ORDER BY i.added_at DESC, i.id DESC",
+        SearchOrder::TakenDesc => "ORDER BY COALESCE(i.taken_at, i.added_at) DESC, i.id DESC",
     }
 }
 

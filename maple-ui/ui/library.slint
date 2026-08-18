@@ -3,8 +3,13 @@
 // The grid reproduces the former GTK `FlowBox`: a responsive wrap of fixed-size
 // thumbnail tiles whose column count is derived from the available width. Tiles
 // start as placeholders and are filled in-place as the Rust side decodes
-// thumbnails on background threads (see src/grid.rs). Like the old FlowBox this
-// instantiates every tile; true virtualization is a later optimisation.
+// thumbnails on background threads (see src/grid.rs).
+//
+// The library is loaded a page at a time: both grid views report how many
+// items the viewport is approaching (`request-more`, wired to
+// `LibraryGrid::request_more`) and Rust appends the next page before the
+// user reaches the end. Tiles themselves are still all instantiated —
+// element-level virtualization is a later optimisation.
 import { Theme } from "theme.slint";
 import { ScrollView } from "std-widgets.slint";
 
@@ -209,6 +214,8 @@ export component LibraryGridView {
     in property <bool> select-mode: false;
     callback activated(int);
     callback select-drag(int, int, length, length, length, length, float);
+    // Endless scrolling: "have at least this many items loaded".
+    callback request-more(int);
 
     property <length> gap: Theme.gap;
     property <length> pad: Theme.pad;
@@ -218,6 +225,17 @@ export component LibraryGridView {
     // Columns that fit the viewport (mirrors FlowBox's wrap behaviour).
     property <float> columns: Math.max(1, Math.floor((sv.visible-width - 2 * root.pad + root.gap) / (root.cell-size + root.gap)));
     property <float> row-count: Math.ceil(root.items.length / root.columns);
+
+    // Items covered by the viewport plus a prefetch lead of one and a half
+    // screens, so the next page is queried and decoded before the user
+    // scrolls onto it. Deliberately a function of geometry alone and not of
+    // `items.length`: appending a page must not feed straight back into
+    // another request.
+    property <length> prefetch-lead: 1.5 * sv.visible-height;
+    property <int> want-count: Math.ceil((-sv.viewport-y + sv.visible-height + root.prefetch-lead) / root.pitch-y) * root.columns;
+    changed want-count => {
+        root.request-more(root.want-count);
+    }
 
     sv := ScrollView {
         viewport-width: sv.visible-width;
@@ -261,6 +279,7 @@ export component LibraryDateGridView {
     in property <bool> select-mode: false;
     callback activated(int);
     callback select-drag(int, int, length, length, length, length, float);
+    callback request-more(int);
 
     property <length> gap: Theme.gap;
     property <length> pad: Theme.pad;
@@ -268,6 +287,16 @@ export component LibraryDateGridView {
     property <length> pitch-x: root.cell-size + root.gap;
     property <length> pitch-y: root.tile-h + root.gap;
     property <float> columns: Math.max(1, Math.floor((sv.visible-width - 2 * root.pad + root.gap) / (root.cell-size + root.gap)));
+
+    // Same prefetch signal as the flat grid. Day headers and inter-group
+    // spacing make a scrolled pixel worth slightly fewer tiles here, so this
+    // over-estimates — which is the harmless direction: it asks for a page
+    // slightly early, never late.
+    property <length> prefetch-lead: 1.5 * sv.visible-height;
+    property <int> want-count: Math.ceil((-sv.viewport-y + sv.visible-height + root.prefetch-lead) / root.pitch-y) * root.columns;
+    changed want-count => {
+        root.request-more(root.want-count);
+    }
 
     sv := ScrollView {
         VerticalLayout {
@@ -328,6 +357,7 @@ export component LibraryPage inherits Rectangle {
     callback search-changed(string);
     callback activated(int);
     callback select-drag(int, int, length, length, length, length, float);
+    callback request-more(int);
 
     background: Theme.bg;
 
@@ -340,6 +370,7 @@ export component LibraryPage inherits Rectangle {
             select-mode: root.select-mode;
             activated(i) => { root.activated(i); }
             select-drag(b, c, x0, y0, x1, y1, cols) => { root.select-drag(b, c, x0, y0, x1, y1, cols); }
+            request-more(n) => { root.request-more(n); }
         }
 
         if root.date-view: LibraryDateGridView {
@@ -350,6 +381,7 @@ export component LibraryPage inherits Rectangle {
             select-mode: root.select-mode;
             activated(i) => { root.activated(i); }
             select-drag(b, c, x0, y0, x1, y1, cols) => { root.select-drag(b, c, x0, y0, x1, y1, cols); }
+            request-more(n) => { root.request-more(n); }
         }
     }
 }

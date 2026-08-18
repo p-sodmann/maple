@@ -26,6 +26,7 @@ mod face_tag;
 mod grid;
 mod image_loader;
 mod import;
+mod paging;
 mod path_template_window;
 mod people_page;
 mod rep_crop;
@@ -129,7 +130,26 @@ pub fn run() -> anyhow::Result<()> {
     // own constructors — see `grid::request_reload`.
     grid::register(grid.clone(), current_query.clone(), resync_selection.clone());
 
-    // Library is the default page — load immediately.
+    // The grid only holds the pages loaded so far, so the header's photo
+    // count comes from a COUNT query rather than from the item model.
+    grid.on_total_count({
+        let w = window.as_weak();
+        move |total| {
+            if let Some(win) = w.upgrade() {
+                win.set_library_total_count(total.map_or(-1, |n| n as i32));
+            }
+        }
+    });
+
+    // Endless scrolling: the grid view reports how many items the viewport
+    // is approaching (plus a prefetch lead) and the grid appends pages until
+    // it has them.
+    window.on_library_request_more({
+        let grid = grid.clone();
+        move |rows| grid.request_more(rows)
+    });
+
+    // Library is the default page — load the first page immediately.
     grid.load(SearchQuery::default());
 
     // ── Collections page ───────────────────────────────────────────

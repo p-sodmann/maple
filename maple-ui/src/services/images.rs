@@ -19,6 +19,13 @@ pub fn search_library(db: &Arc<Mutex<maple_db::Database>>, query: &SearchQuery) 
         .unwrap_or_default()
 }
 
+/// Row count the search's filters match, ignoring its `limit`/`offset` —
+/// the total the library grid pages through. `None` on a DB error or for a
+/// query with no countable total (see `Database::count_images`).
+pub fn count_library(db: &Arc<Mutex<maple_db::Database>>, query: &SearchQuery) -> Option<usize> {
+    db.lock().ok().and_then(|d| d.count_images(query).ok()).flatten()
+}
+
 /// Bundled fetch for opening the detail view on one image: its face
 /// detections, the known-person embedding matrix (for suggestion matching),
 /// and its collection chip memberships.
