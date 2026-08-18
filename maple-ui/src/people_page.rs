@@ -16,14 +16,98 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
-use slint::{Model, ModelRc, VecModel};
+use slint::{ComponentHandle, Model, ModelRc, VecModel};
 use std::rc::Rc;
 
 use crate::rep_crop::{self, CropCache};
 use crate::services::people as people_service;
-use crate::{AppWindow, PersonItem};
+use crate::transforms::trimmed_name;
+use crate::{face_tag, services, AppCtx, AppWindow, PersonItem};
+
+use maple_db::SearchQuery;
 
 const CROP_PX: u32 = 240;
+
+/// Build the page's model and wire its callbacks.
+///
+/// Called from `lib.rs` during startup — see [`AppCtx`] for the shared
+/// handles the closures clone out of.
+pub fn wire(window: &AppWindow, ctx: &AppCtx) {
+    let people = PeoplePage::new(ctx.db.clone(), ctx.cache.clone(), ctx.thumb_quality);
+    window.set_people_items(people.model());
+
+    window.on_people_page_shown({
+        let people = people.clone();
+        let w = ctx.window.clone();
+        move || {
+            let w2 = w.clone();
+            if let Some(win) = w.upgrade() {
+                win.set_people_untagged_count(people.untagged_count() as i32);
+            }
+            people.load(w2);
+        }
+    });
+
+    window.on_people_person_activated({
+        let grid = ctx.grid.clone();
+        let w = ctx.window.clone();
+        let current_query = ctx.current_query.clone();
+        let select_target = ctx.select_target.clone();
+        move |person_id, name| {
+            let q = SearchQuery::default().with_person(person_id as i64);
+            *current_query.borrow_mut() = q.clone();
+            grid.load(q);
+            select_target.set(None);
+            if let Some(win) = w.upgrade() {
+                win.set_library_filter_name(name);
+                win.set_library_active_collection_id(-1);
+                win.set_page(crate::Page::Library);
+            }
+        }
+    });
+
+    window.on_people_edit_save({
+        let db = ctx.db.clone();
+        let people = people.clone();
+        let w = ctx.window.clone();
+        move |person_id, name| {
+            let Some(name) = trimmed_name(&name) else { return };
+            services::faces::rename_person(&db, person_id as i64, &name);
+            if let Some(win) = w.upgrade() {
+                people.load(win.as_weak());
+            }
+        }
+    });
+
+    window.on_people_edit_delete({
+        let db = ctx.db.clone();
+        let cache = ctx.cache.clone();
+        let people = people.clone();
+        let w = ctx.window.clone();
+        move |person_id| {
+            services::faces::delete_person(&db, &cache, person_id as i64);
+            if let Some(win) = w.upgrade() {
+                win.set_people_untagged_count(people.untagged_count() as i32);
+                people.load(win.as_weak());
+            }
+        }
+    });
+
+    window.on_people_tag_faces({
+        let db = ctx.db.clone();
+        let people = people.clone();
+        let w = ctx.window.clone();
+        move || {
+            face_tag::open(db.clone());
+            // Refresh untagged count after the wizard is closed (best-effort;
+            // the window fires this callback synchronously, so the count
+            // updates when the user returns to the People page).
+            if let Some(win) = w.upgrade() {
+                win.set_people_untagged_count(people.untagged_count() as i32);
+            }
+        }
+    });
+}
 
 #[derive(Clone)]
 pub struct PeoplePage {

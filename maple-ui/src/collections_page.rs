@@ -13,8 +13,8 @@ use maple_db::{SearchQuery, ThumbnailCache};
 use crate::rep_crop::{self, CropCache};
 use crate::services::collections::{self, load_entries};
 use crate::thumbnail;
-use crate::transforms::hex_to_color;
-use crate::{AppWindow, CollectionEntry, CollectionGalleryItem, ThumbItem};
+use crate::transforms::{color_to_hex, hex_to_color, optional_id, record_index, trimmed_name};
+use crate::{detail, AppCtx, AppWindow, CollectionEntry, CollectionGalleryItem, ThumbItem};
 
 /// `(rgb_bytes_w_h, filename, image_id)` — Send-safe thumbnail payload
 /// produced off the main thread, consumed by `upgrade_in_event_loop`.
@@ -23,6 +23,174 @@ type RawThumb = (Option<(Vec<u8>, u32, u32)>, String, i32);
 /// Cover-crop render size — matches the People page's `CROP_PX` so both
 /// galleries share one visual scale.
 const COVER_PX: u32 = 120;
+
+// ── Wiring ────────────────────────────────────────────────────────
+
+/// Populate the page and wire its callbacks.
+///
+/// Called from `lib.rs` during startup — see [`AppCtx`] for the shared
+/// handles the closures clone out of.
+pub fn wire(window: &AppWindow, ctx: &AppCtx) {
+    let db = &ctx.db;
+    let cache = &ctx.cache;
+    let thumb_px = ctx.thumb_px;
+    let thumb_quality = ctx.thumb_quality;
+    let crop_cache = &ctx.coll_crop_cache;
+
+    // Shared record list — populated by load_thumbs, read by on_collections_open_image.
+    let records: Arc<Mutex<Vec<maple_db::LibraryImage>>> = Arc::new(Mutex::new(Vec::new()));
+
+    // Populate sidebar + gallery immediately (so dots/cards show even before navigating).
+    reload(window, db);
+    load_gallery(window, db, cache, thumb_quality, crop_cache);
+
+    window.on_collections_page_shown({
+        let db = db.clone();
+        let cache = cache.clone();
+        let crop_cache = crop_cache.clone();
+        let w = ctx.window.clone();
+        move || {
+            if let Some(win) = w.upgrade() {
+                reload(&win, &db);
+                load_gallery(&win, &db, &cache, thumb_quality, &crop_cache);
+            }
+        }
+    });
+
+    window.on_collections_activated({
+        let grid = ctx.grid.clone();
+        let w = ctx.window.clone();
+        let current_query = ctx.current_query.clone();
+        let select_target = ctx.select_target.clone();
+        move |collection_id, name| {
+            let q = SearchQuery::default().with_collection(collection_id as i64);
+            *current_query.borrow_mut() = q.clone();
+            grid.load(q);
+            select_target.set(Some(collection_id as i64));
+            if let Some(win) = w.upgrade() {
+                win.set_library_filter_name(name);
+                win.set_library_active_collection_id(collection_id);
+                win.set_page(crate::Page::Library);
+            }
+        }
+    });
+
+    window.on_collections_edit_save({
+        let db = db.clone();
+        let cache = cache.clone();
+        let crop_cache = crop_cache.clone();
+        let w = ctx.window.clone();
+        move |id, name, color| {
+            let Some(name) = trimmed_name(&name) else { return };
+            let hex = color_to_hex(color);
+            collections::rename_collection(&db, id as i64, &name);
+            collections::set_collection_color(&db, id as i64, &hex);
+            if let Some(win) = w.upgrade() {
+                reload_keep_sel(&win, &db);
+                load_gallery(&win, &db, &cache, thumb_quality, &crop_cache);
+            }
+        }
+    });
+
+    window.on_collections_edit_delete({
+        let db = db.clone();
+        let cache = cache.clone();
+        let crop_cache = crop_cache.clone();
+        let w = ctx.window.clone();
+        move |id| {
+            collections::delete_collection(&db, &cache, id as i64);
+            if let Some(win) = w.upgrade() {
+                reload(&win, &db);
+                clear_detail(&win);
+                load_gallery(&win, &db, &cache, thumb_quality, &crop_cache);
+            }
+        }
+    });
+
+    window.on_collections_select({
+        let db = db.clone();
+        let cache = cache.clone();
+        let records = records.clone();
+        let w = ctx.window.clone();
+        move |id| {
+            if let Some(win) = w.upgrade() {
+                // Clear old thumbs immediately; push fresh detail.
+                win.set_collections_thumbs(ModelRc::default());
+                push_detail(&win, &db, id);
+            }
+            load_thumbs(
+                id,
+                db.clone(),
+                cache.clone(),
+                thumb_px,
+                thumb_quality,
+                w.clone(),
+                records.clone(),
+            );
+        }
+    });
+
+    window.on_collections_open_image({
+        let records = records.clone();
+        let db = db.clone();
+        let w = ctx.window.clone();
+        move |image_id| {
+            let records = records.lock().ok().map(|g| g.clone()).unwrap_or_default();
+            // Find the index of the clicked image within the loaded records.
+            let idx = record_index(&records, image_id as i64);
+            if !records.is_empty() {
+                let is_dark = w.upgrade().map(|w| w.get_dark()).unwrap_or(false);
+                detail::open(records, idx, db.clone(), is_dark);
+            }
+        }
+    });
+
+    window.on_collections_create({
+        let db = db.clone();
+        let cache = cache.clone();
+        let crop_cache = crop_cache.clone();
+        let w = ctx.window.clone();
+        move |name, color, parent_id| {
+            let Some(name) = trimmed_name(&name) else { return };
+            let hex = color_to_hex(color);
+            collections::create_collection(&db, &name, &hex, optional_id(parent_id));
+            if let Some(win) = w.upgrade() {
+                reload(&win, &db);
+                load_gallery(&win, &db, &cache, thumb_quality, &crop_cache);
+            }
+        }
+    });
+
+    window.on_collections_delete({
+        let db = db.clone();
+        let cache = cache.clone();
+        let crop_cache = crop_cache.clone();
+        let w = ctx.window.clone();
+        move |id| {
+            collections::delete_collection(&db, &cache, id as i64);
+            if let Some(win) = w.upgrade() {
+                reload(&win, &db);
+                clear_detail(&win);
+                load_gallery(&win, &db, &cache, thumb_quality, &crop_cache);
+            }
+        }
+    });
+
+    window.on_collections_rename({
+        let db = db.clone();
+        let cache = cache.clone();
+        let crop_cache = crop_cache.clone();
+        let w = ctx.window.clone();
+        move |id, name| {
+            let Some(name) = trimmed_name(&name) else { return };
+            collections::rename_collection(&db, id as i64, &name);
+            if let Some(win) = w.upgrade() {
+                reload_keep_sel(&win, &db);
+                load_gallery(&win, &db, &cache, thumb_quality, &crop_cache);
+            }
+        }
+    });
+}
 
 // ── Public API ────────────────────────────────────────────────────
 

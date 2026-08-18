@@ -102,6 +102,36 @@ pub fn hex_to_color(hex: &str) -> slint::Color {
     slint::Color::from_rgb_u8(0x9a, 0x9a, 0x9a)
 }
 
+/// Render a Slint colour as the `#rrggbb` string the DB stores. Inverse of
+/// [`hex_to_color`]; the alpha channel is dropped (collection colours are
+/// always opaque).
+pub fn color_to_hex(color: slint::Color) -> String {
+    format!("#{:02x}{:02x}{:02x}", color.red(), color.green(), color.blue())
+}
+
+// ── Name / id sanitising ───────────────────────────────────────────
+
+/// Trim a user-entered name, rejecting one that is empty or all whitespace.
+///
+/// Every rename/create path bails on a blank name rather than writing it, so
+/// the callers read as `let Some(name) = trimmed_name(&raw) else { return }`.
+pub fn trimmed_name(raw: &str) -> Option<String> {
+    let name = raw.trim();
+    (!name.is_empty()).then(|| name.to_owned())
+}
+
+/// Decode the `-1`-means-none sentinel the Slint side uses for optional row
+/// ids (no parent collection, no active filter, …).
+pub fn optional_id(id: i32) -> Option<i64> {
+    (id >= 0).then_some(id as i64)
+}
+
+/// Position of `id` within `records`, defaulting to the first record when it
+/// isn't there — opening the viewer on something is better than not opening.
+pub fn record_index(records: &[LibraryImage], id: i64) -> usize {
+    records.iter().position(|r| r.id == id).unwrap_or(0)
+}
+
 // ── Face overlay ───────────────────────────────────────────────────
 
 /// `true` when this row is a real detection (not a zero-confidence sentinel).
@@ -428,6 +458,50 @@ mod tests {
     fn hex_to_color_falls_back_on_invalid_hex() {
         let c = hex_to_color("not-a-color");
         assert_eq!((c.red(), c.green(), c.blue()), (0x9a, 0x9a, 0x9a));
+    }
+
+    #[test]
+    fn color_to_hex_round_trips_through_hex_to_color() {
+        assert_eq!(color_to_hex(hex_to_color("#ff8800")), "#ff8800");
+    }
+
+    #[test]
+    fn color_to_hex_zero_pads_each_channel() {
+        assert_eq!(color_to_hex(slint::Color::from_rgb_u8(0x00, 0x0a, 0xff)), "#000aff");
+    }
+
+    #[test]
+    fn trimmed_name_strips_surrounding_whitespace() {
+        assert_eq!(trimmed_name("  Holiday  ").as_deref(), Some("Holiday"));
+    }
+
+    #[test]
+    fn trimmed_name_rejects_blank_input() {
+        assert_eq!(trimmed_name(""), None);
+        assert_eq!(trimmed_name("   \t "), None);
+    }
+
+    #[test]
+    fn optional_id_maps_the_negative_sentinel_to_none() {
+        assert_eq!(optional_id(-1), None);
+        assert_eq!(optional_id(0), Some(0));
+        assert_eq!(optional_id(7), Some(7));
+    }
+
+    #[test]
+    fn record_index_finds_the_matching_record() {
+        let mut records = vec![image_at(0, None), image_at(0, None), image_at(0, None)];
+        for (i, rec) in records.iter_mut().enumerate() {
+            rec.id = i as i64 + 10;
+        }
+        assert_eq!(record_index(&records, 11), 1);
+    }
+
+    #[test]
+    fn record_index_falls_back_to_the_first_record() {
+        let records = vec![image_at(0, None)];
+        assert_eq!(record_index(&records, 999), 0);
+        assert_eq!(record_index(&[], 1), 0);
     }
 
     fn face_at(id: i64, person_id: Option<i64>, embedding: Vec<f32>) -> FaceDetection {
