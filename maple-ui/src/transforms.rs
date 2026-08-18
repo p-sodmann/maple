@@ -139,6 +139,80 @@ pub fn is_real_detection(face: &FaceDetection) -> bool {
     face.confidence >= 0.0 && face.bbox != [0.0, 0.0, 0.0, 0.0]
 }
 
+/// Where the image sits inside the detail window's viewport — mirrors the
+/// `geo-*` properties the Slint side computes from the zoom/pan state, so
+/// face hit-testing and box drawing can be done in plain Rust.
+#[derive(Clone, Copy, Debug)]
+pub struct ViewportGeometry {
+    pub img_left: f32,
+    pub img_top: f32,
+    pub disp_w: f32,
+    pub disp_h: f32,
+}
+
+impl ViewportGeometry {
+    /// `None` before the image has been laid out — nothing can be hit or
+    /// drawn against a zero-sized viewport.
+    fn valid(&self) -> Option<&Self> {
+        (self.disp_w > 0.0 && self.disp_h > 0.0).then_some(self)
+    }
+
+    /// Viewport point → normalised image coordinates, clamped to the image.
+    fn normalise(&self, vx: f32, vy: f32) -> (f32, f32) {
+        (
+            ((vx - self.img_left) / self.disp_w).clamp(0.0, 1.0),
+            ((vy - self.img_top) / self.disp_h).clamp(0.0, 1.0),
+        )
+    }
+}
+
+/// Id of the topmost real face box containing the viewport point, if any.
+pub fn hit_test_face(
+    faces: &[FaceDetection],
+    geo: ViewportGeometry,
+    vp_x: f32,
+    vp_y: f32,
+) -> Option<i64> {
+    geo.valid()?;
+    faces.iter().find_map(|face| {
+        if !is_real_detection(face) {
+            return None;
+        }
+        let [x1, y1, x2, y2] = face.bbox;
+        let bx = geo.img_left + x1 * geo.disp_w;
+        let by = geo.img_top + y1 * geo.disp_h;
+        let bw = (x2 - x1) * geo.disp_w;
+        let bh = (y2 - y1) * geo.disp_h;
+        if vp_x >= bx && vp_x <= bx + bw && vp_y >= by && vp_y <= by + bh {
+            Some(face.id)
+        } else {
+            None
+        }
+    })
+}
+
+/// A dragged-out rectangle as a normalised `[min_x, min_y, max_x, max_y]`
+/// bbox, or `None` for a box too small to be anything but an accidental
+/// click (under 0.5% of an image side).
+pub fn normalise_draw_box(
+    geo: ViewportGeometry,
+    vx0: f32,
+    vy0: f32,
+    vx1: f32,
+    vy1: f32,
+) -> Option<[f32; 4]> {
+    geo.valid()?;
+    let (nx0, ny0) = geo.normalise(vx0, vy0);
+    let (nx1, ny1) = geo.normalise(vx1, vy1);
+    // Sort corners so bbox is always [min_x, min_y, max_x, max_y].
+    let (bx1, bx2) = if nx0 <= nx1 { (nx0, nx1) } else { (nx1, nx0) };
+    let (by1, by2) = if ny0 <= ny1 { (ny0, ny1) } else { (ny1, ny0) };
+    if (bx2 - bx1) < 0.005 || (by2 - by1) < 0.005 {
+        return None;
+    }
+    Some([bx1, by1, bx2, by2])
+}
+
 /// In-memory embedding matrix for fast cosine-similarity search.
 ///
 /// Built once per image load from all currently assigned face embeddings
@@ -567,6 +641,60 @@ mod tests {
         sentinel.bbox = [0.0, 0.0, 0.0, 0.0];
         let boxes = faces_to_boxes(&[sentinel], &matrix, 0.5);
         assert!(boxes.is_empty());
+    }
+
+    /// A 200×100 image drawn at (50, 20) in the viewport.
+    fn geo() -> ViewportGeometry {
+        ViewportGeometry { img_left: 50.0, img_top: 20.0, disp_w: 200.0, disp_h: 100.0 }
+    }
+
+    #[test]
+    fn hit_test_face_finds_the_box_under_the_pointer() {
+        // Default bbox [0.1, 0.1, 0.2, 0.2] → viewport x 70..90, y 30..40.
+        let faces = vec![face_at(7, None, vec![])];
+        assert_eq!(hit_test_face(&faces, geo(), 80.0, 35.0), Some(7));
+        // Corners count as inside; just outside does not.
+        assert_eq!(hit_test_face(&faces, geo(), 70.0, 30.0), Some(7));
+        assert_eq!(hit_test_face(&faces, geo(), 91.0, 35.0), None);
+        assert_eq!(hit_test_face(&faces, geo(), 80.0, 20.0), None);
+    }
+
+    #[test]
+    fn hit_test_face_ignores_sentinels_and_an_unlaid_out_viewport() {
+        let mut sentinel = face_at(1, None, vec![]);
+        sentinel.bbox = [0.0, 0.0, 0.0, 0.0];
+        // The sentinel's box would otherwise cover the image's top-left corner.
+        assert_eq!(hit_test_face(&[sentinel], geo(), 50.0, 20.0), None);
+
+        let unlaid = ViewportGeometry { disp_w: 0.0, disp_h: 0.0, ..geo() };
+        assert_eq!(hit_test_face(&[face_at(7, None, vec![])], unlaid, 80.0, 35.0), None);
+    }
+
+    #[test]
+    fn normalise_draw_box_sorts_corners_of_a_backwards_drag() {
+        // Dragged bottom-right → top-left; both orders give the same bbox.
+        let forward = normalise_draw_box(geo(), 70.0, 30.0, 90.0, 40.0).unwrap();
+        let backward = normalise_draw_box(geo(), 90.0, 40.0, 70.0, 30.0).unwrap();
+        assert_eq!(forward, backward);
+        let [x1, y1, x2, y2] = forward;
+        assert!((x1 - 0.1).abs() < 1e-6 && (x2 - 0.2).abs() < 1e-6);
+        assert!((y1 - 0.1).abs() < 1e-6 && (y2 - 0.2).abs() < 1e-6);
+    }
+
+    #[test]
+    fn normalise_draw_box_clamps_a_drag_that_left_the_image() {
+        let [x1, y1, x2, y2] = normalise_draw_box(geo(), -500.0, -500.0, 90.0, 40.0).unwrap();
+        assert_eq!((x1, y1), (0.0, 0.0));
+        assert!((x2 - 0.2).abs() < 1e-6 && (y2 - 0.2).abs() < 1e-6);
+    }
+
+    #[test]
+    fn normalise_draw_box_rejects_an_accidental_click() {
+        // Under 0.5% of an image side in either axis.
+        assert_eq!(normalise_draw_box(geo(), 70.0, 30.0, 70.5, 40.0), None);
+        assert_eq!(normalise_draw_box(geo(), 70.0, 30.0, 90.0, 30.2), None);
+        let unlaid = ViewportGeometry { disp_w: 0.0, disp_h: 0.0, ..geo() };
+        assert_eq!(normalise_draw_box(unlaid, 70.0, 30.0, 90.0, 40.0), None);
     }
 
     #[test]

@@ -25,7 +25,10 @@ use crate::face_overlay::{
 };
 use crate::image_loader;
 use crate::services::images as image_service;
-use crate::transforms::{format_unix_ts, is_real_detection, truncate_value, EmbeddingMatrix};
+use crate::transforms::{
+    format_unix_ts, hit_test_face, normalise_draw_box, trimmed_name, truncate_value,
+    EmbeddingMatrix, ViewportGeometry,
+};
 use crate::{CollectionChip, DetailWindow, ImageInfoRow};
 
 thread_local! {
@@ -109,26 +112,29 @@ pub fn set_dark(dark: bool) {
 /// Build a fresh detail window and wire its callbacks (once).
 fn build(db: Arc<Mutex<maple_db::Database>>) -> Result<Detail, slint::PlatformError> {
     let window = DetailWindow::new()?;
-    let records: Rc<RefCell<Vec<LibraryImage>>> = Rc::new(RefCell::new(Vec::new()));
-    let index = Rc::new(Cell::new(0usize));
-    let faces: Rc<RefCell<Vec<FaceDetection>>> = Rc::new(RefCell::new(Vec::new()));
-    let known_embeddings: Rc<RefCell<EmbeddingMatrix>> =
-        Rc::new(RefCell::new(EmbeddingMatrix::empty()));
-    let current_image_id: Rc<Cell<i64>> = Rc::new(Cell::new(0));
-    let show_all_exif: Rc<Cell<bool>> = Rc::new(Cell::new(false));
-    let rotate_timer: Rc<RefCell<Option<Timer>>> = Rc::new(RefCell::new(None));
     let nav = NavState {
-        records: records.clone(),
-        index: index.clone(),
-        db: db.clone(),
-        faces: faces.clone(),
-        known_embeddings: known_embeddings.clone(),
-        current_image_id: current_image_id.clone(),
-        show_all_exif: show_all_exif.clone(),
-        rotate_timer: rotate_timer.clone(),
+        records: Rc::new(RefCell::new(Vec::new())),
+        index: Rc::new(Cell::new(0usize)),
+        db,
+        faces: Rc::new(RefCell::new(Vec::new())),
+        known_embeddings: Rc::new(RefCell::new(EmbeddingMatrix::empty())),
+        current_image_id: Rc::new(Cell::new(0)),
+        show_all_exif: Rc::new(Cell::new(false)),
+        rotate_timer: Rc::new(RefCell::new(None)),
     };
 
-    // ── Navigation ────────────────────────────────────────────────
+    wire_navigation(&window, &nav);
+    wire_collections(&window, &nav);
+    wire_info_panel(&window, &nav);
+    wire_face_overlay(&window, &nav);
+
+    Ok(Detail { window, nav })
+}
+
+// ── Navigation ────────────────────────────────────────────────────
+
+/// Wire prev/next, close, fullscreen, open-externally and rotate.
+fn wire_navigation(window: &DetailWindow, nav: &NavState) {
     window.on_prev({
         let w = window.as_weak();
         let nav = nav.clone();
@@ -161,11 +167,10 @@ fn build(db: Arc<Mutex<maple_db::Database>>) -> Result<Detail, slint::PlatformEr
     });
 
     window.on_open_external({
-        let records = records.clone();
-        let index = index.clone();
+        let nav = nav.clone();
         move || {
-            let recs = records.borrow();
-            if let Some(rec) = recs.get(index.get()) {
+            let recs = nav.records.borrow();
+            if let Some(rec) = recs.get(nav.index.get()) {
                 if let Err(e) = open::that_detached(&rec.path) {
                     tracing::warn!("Failed to open {} externally: {e}", rec.path.display());
                 }
@@ -178,20 +183,22 @@ fn build(db: Arc<Mutex<maple_db::Database>>) -> Result<Detail, slint::PlatformEr
         let nav = nav.clone();
         move |clockwise| rotate_current(&w, &nav, clockwise)
     });
+}
 
+// ── Collection chips ──────────────────────────────────────────────
+
+fn wire_collections(window: &DetailWindow, nav: &NavState) {
     window.on_remove_collection({
         let w = window.as_weak();
-        let records = records.clone();
-        let index = index.clone();
-        let db = db.clone();
+        let nav = nav.clone();
         move |coll_id| {
-            let image_id = match records.borrow().get(index.get()) {
+            let image_id = match nav.records.borrow().get(nav.index.get()) {
                 Some(rec) => rec.id,
                 None => return,
             };
-            crate::services::collections::remove_image_from_collection(&db, coll_id as i64, image_id);
+            crate::services::collections::remove_image_from_collection(&nav.db, coll_id as i64, image_id);
             if let Some(w) = w.upgrade() {
-                w.set_collection_chips(load_chips(&db, image_id));
+                w.set_collection_chips(load_chips(&nav.db, image_id));
             }
         }
     });
@@ -199,10 +206,10 @@ fn build(db: Arc<Mutex<maple_db::Database>>) -> Result<Detail, slint::PlatformEr
     // Load all collections and open the inline picker panel.
     window.on_add_to_collection({
         let w = window.as_weak();
-        let db = db.clone();
+        let nav = nav.clone();
         move || {
             let Some(w) = w.upgrade() else { return };
-            let chips = crate::services::collections::load_all_collections(&db);
+            let chips = crate::services::collections::load_all_collections(&nav.db);
             w.set_available_collections(ModelRc::from(Rc::new(VecModel::from(chips))));
             w.set_add_coll_panel_open(true);
         }
@@ -210,23 +217,25 @@ fn build(db: Arc<Mutex<maple_db::Database>>) -> Result<Detail, slint::PlatformEr
 
     window.on_add_to_collection_confirm({
         let w = window.as_weak();
-        let records = records.clone();
-        let index = index.clone();
-        let db = db.clone();
+        let nav = nav.clone();
         move |coll_id| {
-            let image_id = match records.borrow().get(index.get()) {
+            let image_id = match nav.records.borrow().get(nav.index.get()) {
                 Some(rec) => rec.id,
                 None => return,
             };
-            if !crate::services::collections::add_image_to_collection(&db, coll_id as i64, image_id) {
+            if !crate::services::collections::add_image_to_collection(&nav.db, coll_id as i64, image_id) {
                 return;
             }
             if let Some(w) = w.upgrade() {
-                w.set_collection_chips(load_chips(&db, image_id));
+                w.set_collection_chips(load_chips(&nav.db, image_id));
             }
         }
     });
+}
 
+// ── Info panel ────────────────────────────────────────────────────
+
+fn wire_info_panel(window: &DetailWindow, nav: &NavState) {
     window.on_toggle_all_exif({
         let w = window.as_weak();
         let nav = nav.clone();
@@ -237,9 +246,11 @@ fn build(db: Arc<Mutex<maple_db::Database>>) -> Result<Detail, slint::PlatformEr
             }
         }
     });
+}
 
-    // ── Face overlay ──────────────────────────────────────────────
+// ── Face overlay ──────────────────────────────────────────────────
 
+fn wire_face_overlay(window: &DetailWindow, nav: &NavState) {
     window.on_toggle_faces({
         let w = window.as_weak();
         move || {
@@ -268,47 +279,23 @@ fn build(db: Arc<Mutex<maple_db::Database>>) -> Result<Detail, slint::PlatformEr
     // the Slint viewport geometry (zoom-area delegates all clicks here).
     window.on_face_area_clicked({
         let w = window.as_weak();
-        let faces = faces.clone();
-        let known_embeddings = known_embeddings.clone();
+        let nav = nav.clone();
         move |vp_x, vp_y| {
             let Some(w) = w.upgrade() else { return };
             if !w.get_show_faces() || w.get_face_draw_mode() {
                 return;
             }
-            let img_left = w.get_geo_img_left();
-            let img_top = w.get_geo_img_top();
-            let disp_w = w.get_geo_disp_w();
-            let disp_h = w.get_geo_disp_h();
-            if disp_w <= 0.0 || disp_h <= 0.0 {
+            let Some(fid) = hit_test_face(&nav.faces.borrow(), geometry(&w), vp_x, vp_y) else {
                 return;
-            }
-            let face_id = {
-                let f = faces.borrow();
-                f.iter().find_map(|face| {
-                    if !is_real_detection(face) {
-                        return None;
-                    }
-                    let [x1, y1, x2, y2] = face.bbox;
-                    let bx = img_left + x1 * disp_w;
-                    let by = img_top + y1 * disp_h;
-                    let bw = (x2 - x1) * disp_w;
-                    let bh = (y2 - y1) * disp_h;
-                    if vp_x >= bx && vp_x <= bx + bw && vp_y >= by && vp_y <= by + bh {
-                        Some(face.id)
-                    } else {
-                        None
-                    }
-                })
             };
-            let Some(fid) = face_id else { return };
             let embedding = {
-                let f = faces.borrow();
+                let f = nav.faces.borrow();
                 f.iter()
                     .find(|f| f.id == fid)
                     .map(|f| f.embedding.clone())
                     .unwrap_or_default()
             };
-            let sugs = build_suggestions(&embedding, &known_embeddings.borrow());
+            let sugs = build_suggestions(&embedding, &nav.known_embeddings.borrow());
             w.set_face_suggestions(sugs);
             w.set_face_panel_id(fid as i32);
             w.set_face_name_entry(SharedString::new());
@@ -318,13 +305,11 @@ fn build(db: Arc<Mutex<maple_db::Database>>) -> Result<Detail, slint::PlatformEr
 
     window.on_face_assign_person({
         let w = window.as_weak();
-        let faces = faces.clone();
-        let known_embeddings = known_embeddings.clone();
-        let db = db.clone();
+        let nav = nav.clone();
         move |face_id, person_id| {
             let Some(w) = w.upgrade() else { return };
-            if assign_to_person(face_id as i64, person_id as i64, &mut faces.borrow_mut(), &db) {
-                let boxes = build_face_boxes(&faces.borrow(), &known_embeddings.borrow());
+            if assign_to_person(face_id as i64, person_id as i64, &mut nav.faces.borrow_mut(), &nav.db) {
+                let boxes = build_face_boxes(&nav.faces.borrow(), &nav.known_embeddings.borrow());
                 w.set_face_boxes(boxes);
                 w.set_face_panel_open(false);
             }
@@ -333,25 +318,20 @@ fn build(db: Arc<Mutex<maple_db::Database>>) -> Result<Detail, slint::PlatformEr
 
     window.on_face_assign_name({
         let w = window.as_weak();
-        let faces = faces.clone();
-        let known_embeddings = known_embeddings.clone();
-        let db = db.clone();
+        let nav = nav.clone();
         move |face_id, name| {
-            let name = name.trim().to_owned();
-            if name.is_empty() {
-                return;
-            }
+            let Some(name) = trimmed_name(&name) else { return };
             let Some(w) = w.upgrade() else { return };
             if assign_to_name(
                 face_id as i64,
                 &name,
-                &mut faces.borrow_mut(),
-                &mut known_embeddings.borrow_mut(),
-                &db,
+                &mut nav.faces.borrow_mut(),
+                &mut nav.known_embeddings.borrow_mut(),
+                &nav.db,
             )
             .is_some()
             {
-                let boxes = build_face_boxes(&faces.borrow(), &known_embeddings.borrow());
+                let boxes = build_face_boxes(&nav.faces.borrow(), &nav.known_embeddings.borrow());
                 w.set_face_boxes(boxes);
                 w.set_face_panel_open(false);
                 w.set_face_name_entry(SharedString::new());
@@ -361,13 +341,11 @@ fn build(db: Arc<Mutex<maple_db::Database>>) -> Result<Detail, slint::PlatformEr
 
     window.on_face_delete({
         let w = window.as_weak();
-        let faces = faces.clone();
-        let known_embeddings = known_embeddings.clone();
-        let db = db.clone();
+        let nav = nav.clone();
         move |face_id| {
             let Some(w) = w.upgrade() else { return };
-            delete_face(face_id as i64, &mut faces.borrow_mut(), &db);
-            let boxes = build_face_boxes(&faces.borrow(), &known_embeddings.borrow());
+            delete_face(face_id as i64, &mut nav.faces.borrow_mut(), &nav.db);
+            let boxes = build_face_boxes(&nav.faces.borrow(), &nav.known_embeddings.borrow());
             w.set_face_boxes(boxes);
             w.set_face_panel_open(false);
         }
@@ -377,41 +355,21 @@ fn build(db: Arc<Mutex<maple_db::Database>>) -> Result<Detail, slint::PlatformEr
     // geo-* properties (img-left, disp-w, etc.) exposed from the Slint model.
     window.on_face_draw_done({
         let w = window.as_weak();
-        let faces = faces.clone();
-        let known_embeddings = known_embeddings.clone();
-        let current_image_id = current_image_id.clone();
-        let db = db.clone();
+        let nav = nav.clone();
         move |vx0, vy0, vx1, vy1| {
             let Some(w) = w.upgrade() else { return };
-            let iid = current_image_id.get();
+            let iid = nav.current_image_id.get();
             if iid == 0 {
                 return;
             }
-            // Convert from viewport coords to normalised image coords [0,1].
-            let img_left = w.get_geo_img_left();
-            let img_top = w.get_geo_img_top();
-            let disp_w = w.get_geo_disp_w();
-            let disp_h = w.get_geo_disp_h();
-            if disp_w <= 0.0 || disp_h <= 0.0 {
+            let Some(bbox) = normalise_draw_box(geometry(&w), vx0, vy0, vx1, vy1) else {
                 return;
-            }
-            let nx0 = ((vx0 - img_left) / disp_w).clamp(0.0, 1.0);
-            let ny0 = ((vy0 - img_top) / disp_h).clamp(0.0, 1.0);
-            let nx1 = ((vx1 - img_left) / disp_w).clamp(0.0, 1.0);
-            let ny1 = ((vy1 - img_top) / disp_h).clamp(0.0, 1.0);
-            // Sort corners so bbox is always [min_x, min_y, max_x, max_y].
-            let (bx1, bx2) = if nx0 <= nx1 { (nx0, nx1) } else { (nx1, nx0) };
-            let (by1, by2) = if ny0 <= ny1 { (ny0, ny1) } else { (ny1, ny0) };
-            // Ignore tiny boxes (accidental clicks, < 0.5% of image side).
-            if (bx2 - bx1) < 0.005 || (by2 - by1) < 0.005 {
-                return;
-            }
-            let bbox = [bx1, by1, bx2, by2];
-            if let Some(face_id) = insert_new_face(iid, bbox, &mut faces.borrow_mut(), &db) {
-                let boxes = build_face_boxes(&faces.borrow(), &known_embeddings.borrow());
+            };
+            if let Some(face_id) = insert_new_face(iid, bbox, &mut nav.faces.borrow_mut(), &nav.db) {
+                let boxes = build_face_boxes(&nav.faces.borrow(), &nav.known_embeddings.borrow());
                 w.set_face_boxes(boxes);
                 // Immediately open the assignment panel for the new box.
-                let sugs = build_suggestions(&[], &known_embeddings.borrow());
+                let sugs = build_suggestions(&[], &nav.known_embeddings.borrow());
                 w.set_face_suggestions(sugs);
                 w.set_face_panel_id(face_id as i32);
                 w.set_face_name_entry(SharedString::new());
@@ -429,8 +387,16 @@ fn build(db: Arc<Mutex<maple_db::Database>>) -> Result<Detail, slint::PlatformEr
             }
         }
     });
+}
 
-    Ok(Detail { window, nav })
+/// Snapshot the window's current image placement for face hit-testing.
+fn geometry(w: &DetailWindow) -> ViewportGeometry {
+    ViewportGeometry {
+        img_left: w.get_geo_img_left(),
+        img_top: w.get_geo_img_top(),
+        disp_w: w.get_geo_disp_w(),
+        disp_h: w.get_geo_disp_h(),
+    }
 }
 
 /// Move `delta` steps through the record list (+1 next, -1 prev).
