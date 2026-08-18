@@ -541,19 +541,20 @@ impl LibraryGrid {
                     let new_selected = if is_tap { !item.selected } else { true };
                     if new_selected != item.selected {
                         if let (Some(coll_id), Some(rec)) = (sync_collection, records.get(idx)) {
-                            if let Ok(g) = self.db.lock() {
-                                let res = if new_selected {
-                                    g.add_image_to_collection(coll_id, rec.id)
-                                } else {
-                                    g.remove_image_from_collection(coll_id, rec.id)
-                                };
-                                if let Err(e) = res {
-                                    tracing::warn!(
-                                        "collection select-sync image={} collection={coll_id}: {e}",
-                                        rec.id
-                                    );
-                                }
+                            let g = maple_db::lock_db(&self.db);
+                            let res = if new_selected {
+                                g.add_image_to_collection(coll_id, rec.id)
+                            } else {
+                                g.remove_image_from_collection(coll_id, rec.id)
+                            };
+                            if let Err(e) = res {
+                                tracing::warn!(
+                                    "collection select-sync image={} collection={coll_id}: {e}",
+                                    rec.id
+                                );
                             }
+                            // Released before the Slint model write below.
+                            drop(g);
                             membership_changed = true;
                         }
                         item.selected = new_selected;
@@ -566,10 +567,9 @@ impl LibraryGrid {
 
         if membership_changed {
             if let Some(coll_id) = sync_collection {
-                if let Ok(g) = self.db.lock() {
-                    if let Err(e) = g.update_collection_representative(coll_id) {
-                        tracing::warn!("update_collection_representative {coll_id}: {e}");
-                    }
+                if let Err(e) = maple_db::lock_db(&self.db).update_collection_representative(coll_id)
+                {
+                    tracing::warn!("update_collection_representative {coll_id}: {e}");
                 }
             }
         }

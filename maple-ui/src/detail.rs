@@ -469,14 +469,12 @@ fn rotate_current(w: &slint::Weak<DetailWindow>, nav: &NavState, clockwise: bool
         let Some(window) = w.upgrade() else { return };
         match outcome {
             Ok((new_orientation, new_hash)) => {
-                if let Ok(guard) = nav.db.lock() {
-                    if let Err(e) = guard.update_image_hash_and_orientation(
-                        image_id,
-                        &new_hash,
-                        new_orientation as i64,
-                    ) {
-                        tracing::warn!("Failed to update DB after rotation: {e}");
-                    }
+                if let Err(e) = maple_db::lock_db(&nav.db).update_image_hash_and_orientation(
+                    image_id,
+                    &new_hash,
+                    new_orientation as i64,
+                ) {
+                    tracing::warn!("Failed to update DB after rotation: {e}");
                 }
                 if let Some(rec) = nav.records.borrow_mut().get_mut(nav.index.get()) {
                     rec.meta.orientation = Some(new_orientation as i64);

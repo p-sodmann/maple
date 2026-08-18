@@ -5,6 +5,7 @@
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
+use maple_db::lock_db;
 use maple_import::{MoveResult, PlannedMove, RestructureSummary};
 
 /// Compute the restructure plan for every present library image against
@@ -16,8 +17,10 @@ pub fn plan(
     folder_template: &str,
     filename_template: &str,
 ) -> Vec<PlannedMove> {
-    let Ok(guard) = db.lock() else { return Vec::new() };
+    let guard = lock_db(db);
     let Ok(candidates) = guard.restructure_candidates() else { return Vec::new() };
+    // Planning is pure CPU work over the candidate list — release the DB before
+    // it, the background workers contend for this mutex.
     drop(guard);
     maple_import::plan_moves(&candidates, library_dir, folder_template, filename_template)
 }
@@ -55,17 +58,17 @@ pub fn execute(
     let _guard = ScannerPauseGuard::new();
     let summary = maple_import::execute_moves(planned, on_progress);
 
-    if let Ok(guard) = db.lock() {
-        for result in &summary.results {
-            if let MoveResult::Moved { id, new_path, new_raw_path, new_filename } = result {
-                if let Err(e) =
-                    guard.update_image_location(*id, new_path, new_raw_path.as_deref(), new_filename)
-                {
-                    tracing::warn!("restructure: failed to update DB row {id}: {e}");
-                }
+    let guard = lock_db(db);
+    for result in &summary.results {
+        if let MoveResult::Moved { id, new_path, new_raw_path, new_filename } = result {
+            if let Err(e) =
+                guard.update_image_location(*id, new_path, new_raw_path.as_deref(), new_filename)
+            {
+                tracing::warn!("restructure: failed to update DB row {id}: {e}");
             }
         }
     }
+    drop(guard);
 
     summary
 }

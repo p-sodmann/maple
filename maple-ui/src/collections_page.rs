@@ -343,13 +343,8 @@ pub fn load_thumbs(
     records_out: Arc<Mutex<Vec<maple_db::LibraryImage>>>,
 ) {
     std::thread::spawn(move || {
-        let images = db
-            .lock()
-            .ok()
-            .and_then(|g| {
-                g.search_images(&SearchQuery::default().with_collection(id as i64).with_limit(12))
-                    .ok()
-            })
+        let images = maple_db::lock_db(&db)
+            .search_images(&SearchQuery::default().with_collection(id as i64).with_limit(12))
             .unwrap_or_default();
 
         // Produce Send-safe raw RGB tuples. slint::Image is built on the

@@ -9,13 +9,15 @@
 
 use std::sync::{Arc, Mutex};
 
+use maple_db::lock_db;
+
 use crate::transforms::EmbeddingMatrix;
 
 /// Load all assigned face embeddings and the full person list into an
 /// in-memory matrix for cosine-similarity suggestion matching (built once
 /// per image load; see [`EmbeddingMatrix`]).
 pub fn load_embedding_matrix(db: &Arc<Mutex<maple_db::Database>>) -> EmbeddingMatrix {
-    let Ok(guard) = db.lock() else { return EmbeddingMatrix::empty() };
+    let guard = lock_db(db);
     let known = guard.all_assigned_face_embeddings().unwrap_or_default();
     let persons: Vec<(i64, String)> = guard
         .search_persons("")
@@ -30,7 +32,7 @@ pub fn load_embedding_matrix(db: &Arc<Mutex<maple_db::Database>>) -> EmbeddingMa
 /// Assign `face_id` to an existing person and refresh their representative
 /// face crop. Returns `false` on DB error (best-effort).
 pub fn assign_face_to_person(db: &Arc<Mutex<maple_db::Database>>, face_id: i64, person_id: i64) -> bool {
-    let Ok(guard) = db.lock() else { return false };
+    let guard = lock_db(db);
     if let Err(e) = guard.assign_face_to_person(face_id, Some(person_id)) {
         tracing::warn!("assign_face_to_person {face_id} -> {person_id}: {e}");
         return false;
@@ -44,7 +46,7 @@ pub fn assign_face_to_person(db: &Arc<Mutex<maple_db::Database>>, face_id: i64, 
 /// Upsert a person by `name`, assign `face_id` to them, and refresh their
 /// representative face crop. Returns the person id on success.
 pub fn assign_face_to_name(db: &Arc<Mutex<maple_db::Database>>, face_id: i64, name: &str) -> Option<i64> {
-    let guard = db.lock().ok()?;
+    let guard = lock_db(db);
     let person_id = guard
         .upsert_person(name)
         .map_err(|e| tracing::warn!("upsert_person '{name}': {e}"))
@@ -61,7 +63,7 @@ pub fn assign_face_to_name(db: &Arc<Mutex<maple_db::Database>>, face_id: i64, na
 
 /// Delete a face detection. Best-effort (logs on DB error).
 pub fn delete_face(db: &Arc<Mutex<maple_db::Database>>, face_id: i64) {
-    let Ok(guard) = db.lock() else { return };
+    let guard = lock_db(db);
     if let Err(e) = guard.delete_face_detection(face_id) {
         tracing::warn!("delete_face {face_id}: {e}");
     }
@@ -70,7 +72,7 @@ pub fn delete_face(db: &Arc<Mutex<maple_db::Database>>, face_id: i64) {
 /// Mark a face as skipped, excluding it from the untagged-face queue without
 /// deleting the detection. Best-effort (logs on DB error).
 pub fn skip_face(db: &Arc<Mutex<maple_db::Database>>, face_id: i64) {
-    let Ok(guard) = db.lock() else { return };
+    let guard = lock_db(db);
     if let Err(e) = guard.mark_face_skipped(face_id, true) {
         tracing::warn!("skip_face {face_id}: {e}");
     }
@@ -78,8 +80,7 @@ pub fn skip_face(db: &Arc<Mutex<maple_db::Database>>, face_id: i64) {
 
 /// Insert a manually-drawn face box. Returns the new face id on success.
 pub fn insert_face(db: &Arc<Mutex<maple_db::Database>>, image_id: i64, bbox: [f32; 4]) -> Option<i64> {
-    let guard = db.lock().ok()?;
-    guard
+    lock_db(db)
         .insert_face_detection(image_id, bbox, &[], 1.0)
         .map_err(|e| tracing::warn!("insert_face image={image_id}: {e}"))
         .ok()
@@ -87,13 +88,13 @@ pub fn insert_face(db: &Arc<Mutex<maple_db::Database>>, image_id: i64, bbox: [f3
 
 /// Rename a person. Returns `false` on DB error (best-effort).
 pub fn rename_person(db: &Arc<Mutex<maple_db::Database>>, id: i64, name: &str) -> bool {
-    db.lock().ok().and_then(|g| g.rename_person(id, name).ok()).is_some()
+    lock_db(db).rename_person(id, name).is_ok()
 }
 
 /// Delete a person and best-effort evict their cached representative face
 /// crop (looked up before the row disappears).
 pub fn delete_person(db: &Arc<Mutex<maple_db::Database>>, cache: &maple_db::ThumbnailCache, id: i64) -> bool {
-    let Ok(guard) = db.lock() else { return false };
+    let guard = lock_db(db);
     let face_id = guard
         .all_persons_with_representatives()
         .unwrap_or_default()

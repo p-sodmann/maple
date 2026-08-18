@@ -108,9 +108,15 @@ pub fn wire(window: &AppWindow, ctx: &AppCtx) {
             let locs = build_import_locations(&settings, &dirs, &starred);
             if let Some(loc) = locs.iter().find(|l| l.id == id.as_str()) {
                 let path = loc.path.as_str();
-                if starred.contains(path) {
-                    if let Ok(g) = db.lock() { let _ = g.remove_starred_path(path); }
-                } else if let Ok(g) = db.lock() { let _ = g.add_starred_path(path); }
+                let g = maple_db::lock_db(&db);
+                let _ = if starred.contains(path) {
+                    g.remove_starred_path(path)
+                } else {
+                    g.add_starred_path(path)
+                };
+                // Explicit: the re-read below locks again, and this mutex is
+                // not reentrant.
+                drop(g);
             }
             let starred = starred_paths(&db);
             let locs = build_import_locations(&settings, &dirs, &starred);
@@ -183,9 +189,8 @@ fn mark_selected(locs: &mut [LocData], id: &str) {
 }
 
 fn starred_paths(db: &std::sync::Arc<std::sync::Mutex<maple_db::Database>>) -> std::collections::HashSet<String> {
-    db.lock()
-        .ok()
-        .and_then(|g| g.get_starred_paths().ok())
+    maple_db::lock_db(db)
+        .get_starred_paths()
         .unwrap_or_default()
         .into_iter()
         .collect()

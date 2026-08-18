@@ -4,7 +4,7 @@
 
 use std::sync::{Arc, Mutex};
 
-use maple_db::{FaceDetection, LibraryImage, SearchQuery};
+use maple_db::{lock_db, FaceDetection, LibraryImage, SearchQuery};
 
 use crate::services::faces::load_embedding_matrix;
 use crate::transforms::{hex_to_color, EmbeddingMatrix};
@@ -13,17 +13,14 @@ use crate::CollectionChip;
 /// Run a library search. Empty Vec on DB error (matches existing callback
 /// behavior — the grid just renders nothing rather than surfacing a dialog).
 pub fn search_library(db: &Arc<Mutex<maple_db::Database>>, query: &SearchQuery) -> Vec<LibraryImage> {
-    db.lock()
-        .ok()
-        .and_then(|d| d.search_images(query).ok())
-        .unwrap_or_default()
+    lock_db(db).search_images(query).unwrap_or_default()
 }
 
 /// Row count the search's filters match, ignoring its `limit`/`offset` —
 /// the total the library grid pages through. `None` on a DB error or for a
 /// query with no countable total (see `Database::count_images`).
 pub fn count_library(db: &Arc<Mutex<maple_db::Database>>, query: &SearchQuery) -> Option<usize> {
-    db.lock().ok().and_then(|d| d.count_images(query).ok()).flatten()
+    lock_db(db).count_images(query).ok().flatten()
 }
 
 /// Bundled fetch for opening the detail view on one image: its face
@@ -36,11 +33,7 @@ pub struct ImageDetail {
 }
 
 pub fn load_image_detail(db: &Arc<Mutex<maple_db::Database>>, image_id: i64) -> ImageDetail {
-    let faces = db
-        .lock()
-        .ok()
-        .and_then(|g| g.faces_for_image(image_id).ok())
-        .unwrap_or_default();
+    let faces = lock_db(db).faces_for_image(image_id).unwrap_or_default();
     let embeddings = load_embedding_matrix(db);
     let collection_chips = load_collection_chips(db, image_id);
     ImageDetail { faces, embeddings, collection_chips }
@@ -49,9 +42,8 @@ pub fn load_image_detail(db: &Arc<Mutex<maple_db::Database>>, image_id: i64) -> 
 /// Collection chips for one image (used both on initial load and after
 /// add/remove-from-collection actions).
 pub fn load_collection_chips(db: &Arc<Mutex<maple_db::Database>>, image_id: i64) -> Vec<CollectionChip> {
-    db.lock()
-        .ok()
-        .and_then(|d| d.collections_for_image(image_id).ok())
+    lock_db(db)
+        .collections_for_image(image_id)
         .unwrap_or_default()
         .iter()
         .map(|c| CollectionChip {
@@ -70,16 +62,12 @@ pub struct ImageInfoData {
 }
 
 pub fn load_image_info_data(db: &Arc<Mutex<maple_db::Database>>, image_id: i64) -> ImageInfoData {
-    let ai_descriptions = db
-        .lock()
-        .ok()
-        .and_then(|g| g.ai_descriptions_for_image(image_id).ok())
-        .unwrap_or_default();
-    let exif_tags = db
-        .lock()
-        .ok()
-        .and_then(|g| g.exif_tags_for_image(image_id).ok())
-        .unwrap_or_default();
+    // Two cheap indexed reads about the same image — one guard, so the popup
+    // can't show descriptions and tags from either side of a concurrent write.
+    let guard = lock_db(db);
+    let ai_descriptions = guard.ai_descriptions_for_image(image_id).unwrap_or_default();
+    let exif_tags = guard.exif_tags_for_image(image_id).unwrap_or_default();
+    drop(guard);
     ImageInfoData { ai_descriptions, exif_tags }
 }
 
@@ -93,7 +81,7 @@ pub fn compare_embeddings(
     id_b: i64,
 ) -> Result<(String, String, f32), String> {
     let algorithm = maple_state::Settings::load().stacks.algorithm_key();
-    let guard = db.lock().map_err(|_| "Database lock poisoned.".to_owned())?;
+    let guard = lock_db(db);
 
     let display_name = |id: i64| -> Result<String, String> {
         let img = guard

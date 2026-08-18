@@ -3,6 +3,8 @@
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
+use maple_db::lock_db;
+
 /// Plain (path, hash) pair for one copied file, ready to insert into the
 /// library DB. Deliberately excludes UI-only fields (decoded thumbnail,
 /// selection state) carried on the import window's own per-entry struct.
@@ -26,7 +28,7 @@ pub fn insert_imported_images(
     entries: &[ImportEntry],
     algorithm_key: &str,
 ) {
-    let Ok(guard) = db.lock() else { return };
+    let guard = lock_db(db);
     for e in entries {
         if let Ok(meta) = e.path.metadata() {
             if let Err(err) = guard.insert_image_with_raw(&e.path, &e.content_hash, meta.len(), None) {

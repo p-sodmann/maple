@@ -6,7 +6,7 @@ use std::sync::{Arc, Mutex};
 
 use slint::SharedString;
 
-use maple_db::SearchQuery;
+use maple_db::{lock_db, SearchQuery};
 
 use crate::transforms::hex_to_color;
 use crate::{CollectionChip, CollectionEntry};
@@ -14,9 +14,8 @@ use crate::{CollectionChip, CollectionEntry};
 /// Load all collection chips for the add-to-collection picker in the detail
 /// window. Returns an empty Vec on DB error.
 pub fn load_all_collections(db: &Arc<Mutex<maple_db::Database>>) -> Vec<CollectionChip> {
-    db.lock()
-        .ok()
-        .and_then(|g| g.all_collections().ok())
+    lock_db(db)
+        .all_collections()
         .unwrap_or_default()
         .iter()
         .map(|c| CollectionChip {
@@ -29,11 +28,7 @@ pub fn load_all_collections(db: &Arc<Mutex<maple_db::Database>>) -> Vec<Collecti
 
 /// Flattened collection tree for the Collections page list + sidebar.
 pub fn load_entries(db: &Arc<Mutex<maple_db::Database>>) -> Vec<CollectionEntry> {
-    let colls = db
-        .lock()
-        .ok()
-        .and_then(|g| g.all_collections().ok())
-        .unwrap_or_default();
+    let colls = lock_db(db).all_collections().unwrap_or_default();
     flatten_tree(&colls)
 }
 
@@ -50,7 +45,7 @@ pub fn load_collection_detail(
     db: &Arc<Mutex<maple_db::Database>>,
     id: i32,
 ) -> Option<CollectionDetail> {
-    let g = db.lock().ok()?;
+    let g = lock_db(db);
     let c = g.collection_by_id(id as i64).ok().flatten()?;
     let parent_name = c
         .parent_id
@@ -73,24 +68,15 @@ pub fn create_collection(
     hex_color: &str,
     parent_id: Option<i64>,
 ) -> bool {
-    db.lock()
-        .ok()
-        .and_then(|g| g.create_collection(name, hex_color, parent_id).ok())
-        .is_some()
+    lock_db(db).create_collection(name, hex_color, parent_id).is_ok()
 }
 
 pub fn rename_collection(db: &Arc<Mutex<maple_db::Database>>, id: i64, name: &str) -> bool {
-    db.lock()
-        .ok()
-        .and_then(|g| g.rename_collection(id, name).ok())
-        .is_some()
+    lock_db(db).rename_collection(id, name).is_ok()
 }
 
 pub fn set_collection_color(db: &Arc<Mutex<maple_db::Database>>, id: i64, hex_color: &str) -> bool {
-    db.lock()
-        .ok()
-        .and_then(|g| g.set_collection_color(id, hex_color).ok())
-        .is_some()
+    lock_db(db).set_collection_color(id, hex_color).is_ok()
 }
 
 /// Delete a collection and best-effort evict its cached cover crop.
@@ -99,11 +85,7 @@ pub fn delete_collection(
     cache: &maple_db::ThumbnailCache,
     id: i64,
 ) -> bool {
-    let ok = db
-        .lock()
-        .ok()
-        .and_then(|g| g.delete_collection(id).ok())
-        .is_some();
+    let ok = lock_db(db).delete_collection(id).is_ok();
     if ok {
         if let Err(e) = cache.remove_cover(id) {
             tracing::warn!("remove_cover {id}: {e}");
@@ -119,7 +101,7 @@ pub fn add_image_to_collection(
     collection_id: i64,
     image_id: i64,
 ) -> bool {
-    let Ok(g) = db.lock() else { return false };
+    let g = lock_db(db);
     if let Err(e) = g.add_image_to_collection(collection_id, image_id) {
         tracing::warn!("add_image_to_collection {image_id} -> {collection_id}: {e}");
         return false;
@@ -137,7 +119,7 @@ pub fn remove_image_from_collection(
     collection_id: i64,
     image_id: i64,
 ) -> bool {
-    let Ok(g) = db.lock() else { return false };
+    let g = lock_db(db);
     if let Err(e) = g.remove_image_from_collection(collection_id, image_id) {
         tracing::warn!("remove_image_from_collection {image_id} <- {collection_id}: {e}");
         return false;
@@ -152,9 +134,8 @@ pub fn remove_image_from_collection(
 /// checkboxes to real membership when a sidebar dot becomes the "editing
 /// target" (see `grid::apply_membership`).
 pub fn member_ids(db: &Arc<Mutex<maple_db::Database>>, collection_id: i64) -> HashSet<i64> {
-    db.lock()
-        .ok()
-        .and_then(|g| g.search_images(&SearchQuery::default().with_collection(collection_id)).ok())
+    lock_db(db)
+        .search_images(&SearchQuery::default().with_collection(collection_id))
         .map(|imgs| imgs.into_iter().map(|i| i.id).collect())
         .unwrap_or_default()
 }
@@ -164,10 +145,7 @@ pub fn member_ids(db: &Arc<Mutex<maple_db::Database>>, collection_id: i64) -> Ha
 pub fn load_all_with_representatives(
     db: &Arc<Mutex<maple_db::Database>>,
 ) -> Vec<maple_db::CollectionWithRep> {
-    db.lock()
-        .ok()
-        .and_then(|g| g.all_collections_with_representatives().ok())
-        .unwrap_or_default()
+    lock_db(db).all_collections_with_representatives().unwrap_or_default()
 }
 
 /// DFS-flatten the collection tree into a display list with depth info.
