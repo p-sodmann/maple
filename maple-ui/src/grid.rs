@@ -118,6 +118,8 @@ pub struct LibraryGrid {
 type ReloadHook = Rc<dyn Fn()>;
 /// Sink for the current query's total row count (see `on_total_count`).
 type TotalHook = Rc<RefCell<Option<Rc<dyn Fn(Option<usize>)>>>>;
+/// What `register` stores for `request_reload` to act on — see `REFRESH_HANDLE`.
+type RefreshHandle = (LibraryGrid, Rc<RefCell<SearchQuery>>, ReloadHook);
 
 thread_local! {
     /// The app's single `LibraryGrid` + its last-used query, registered once
@@ -133,8 +135,7 @@ thread_local! {
     /// `resync_selection`). Called by both `request_reload` and the
     /// date-view toggle, the two places that reload with the *same* query
     /// rather than switching to a new context.
-    static REFRESH_HANDLE: RefCell<Option<(LibraryGrid, Rc<RefCell<SearchQuery>>, ReloadHook)>> =
-        const { RefCell::new(None) };
+    static REFRESH_HANDLE: RefCell<Option<RefreshHandle>> = const { RefCell::new(None) };
 }
 
 /// Register the app's `LibraryGrid`, its current-query cell, and the
