@@ -464,7 +464,11 @@ mod tests {
             .unwrap();
         let mut ids: Vec<i64> = results.iter().map(|i| i.id).collect();
         ids.sort();
-        assert_eq!(ids, vec![img_a, img_b]);
+        // `descriptions_needing_embedding` has no ORDER BY, so `pairs` — and
+        // with it img_a/img_b — arrive in whatever order the planner picks.
+        let mut expected = vec![img_a, img_b];
+        expected.sort();
+        assert_eq!(ids, expected);
 
         // Verify all results are tagged as Direct hits (not Semantic).
         for r in &results {

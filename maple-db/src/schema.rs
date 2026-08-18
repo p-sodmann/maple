@@ -16,6 +16,12 @@
 //!            pairs) + exif_extracted column (explicit extraction-state gate)
 //!   15 → 16: centroid_embedding + representative_image_id columns on
 //!            collections (computed cover image, mirrors persons' V13)
+//!   16 → 17: library-listing indexes on (status, added_at) and
+//!            (status, COALESCE(taken_at, added_at)); drops the never-read
+//!            FTS5 index and its write triggers
+//!
+//! Steps are append-only and replay history, so a fresh database still runs
+//! V2's `image_fts` creation before V17 drops it again.
 
 use rusqlite::Connection;
 
@@ -378,6 +384,58 @@ const V16_REP: &str =
     "ALTER TABLE collections ADD COLUMN representative_image_id INTEGER \
      REFERENCES images(id) ON DELETE SET NULL";
 
+// ── V17: library listing indexes; retire the unread FTS5 index ────
+//
+// The grid pages through `images` filtered on `status` and ordered by one of
+// two keys, and endless scrolling re-issues that query on every scroll.
+// Neither key was indexed, so SQLite sorted the whole table into a temp
+// b-tree for every page.
+//
+// `idx_images_listing_taken` indexes an *expression*.  SQLite only matches an
+// expression index when the query spells the expression the same way, so this
+// DDL and `query::order_by_sql` have to stay textually in step — change one
+// and the planner silently goes back to the temp b-tree.
+//
+// The trailing `id DESC` makes each key total.  Without it `LIMIT`/`OFFSET`
+// paging drops and repeats rows across page boundaries, because `added_at`
+// and `taken_at` tie constantly within one bulk import.
+//
+// The index alone is not enough: the listing's stack-cover test used to reach
+// across a `LEFT JOIN` and blocked the planner from using it either way —
+// see `STACK_COVER_PREDICATE` in `lib.rs`, which is what makes these pay.
+//
+// Deliberately *not* widened to carry `stack_id`, which would let
+// `count_images` read it without touching the table: that makes the index
+// covering, and the planner then prefers it over `idx_images_stack_id` for
+// the per-row stack-size subquery — a scan of every present row per result
+// row.  `count_images` opts out of these indexes instead; see `Entry` in
+// `lib.rs`.
+
+const V17_INDEXES: &str = "
+    CREATE INDEX IF NOT EXISTS idx_images_listing_added
+        ON images(status, added_at DESC, id DESC);
+    CREATE INDEX IF NOT EXISTS idx_images_listing_taken
+        ON images(status, COALESCE(taken_at, added_at) DESC, id DESC);
+";
+
+// `image_fts` (V2) was never read: text search matches `LIKE '%token%'`
+// against `images`, `ai_descriptions`, `persons` and `image_exif_tags`
+// directly.  The three sync triggers made every insert into `images` about
+// 7× more expensive, and fired on *every* UPDATE — including the bulk
+// `status` and `stack_id` writes of the background scanner and stacker — to
+// maintain an index nothing queried.
+//
+// Recreating it later is a matter of restoring the V2 DDL; note that it
+// covers only filename/make/model/lens, so a text search built on it would
+// have to index descriptions, person names and EXIF tag values too before it
+// could replace the LIKE path without losing matches.
+const V17_DROP_FTS: &str = "
+    DROP TRIGGER IF EXISTS images_fts_ai;
+    DROP TRIGGER IF EXISTS images_fts_au;
+    DROP TRIGGER IF EXISTS images_fts_ad;
+    DROP TABLE IF EXISTS image_fts;
+";
+
 // ── Migration runner ─────────────────────────────────────────────
 
 /// Apply all pending schema migrations to `conn`.
@@ -525,6 +583,15 @@ pub fn ensure_schema(conn: &Connection) -> anyhow::Result<()> {
         conn.execute_batch("PRAGMA user_version = 16")?;
     }
 
+    if version < 17 {
+        // Builds the two indexes over the existing rows — a few hundred
+        // milliseconds for a library of a couple of hundred thousand photos,
+        // paid once, on the first launch after the upgrade.
+        conn.execute_batch(V17_INDEXES)?;
+        conn.execute_batch(V17_DROP_FTS)?;
+        conn.execute_batch("PRAGMA user_version = 17")?;
+    }
+
     Ok(())
 }
 
@@ -601,4 +668,108 @@ fn dedup_raw_companions(conn: &Connection) -> anyhow::Result<()> {
         tracing::info!("V5 migration: merged {merged} raw companion(s) into display rows");
     }
     Ok(())
+}
+
+// ── Tests ────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{Database, SearchOrder, SearchQuery};
+
+    fn user_version(conn: &Connection) -> i32 {
+        conn.query_row("PRAGMA user_version", [], |r| r.get(0)).expect("user_version")
+    }
+
+    fn exists(conn: &Connection, name: &str) -> bool {
+        conn.query_row("SELECT COUNT(*) FROM sqlite_master WHERE name = ?1", [name], |r| {
+            r.get::<_, i64>(0)
+        })
+        .map(|n| n > 0)
+        .unwrap_or(false)
+    }
+
+    /// Wind a freshly migrated database back to the V16 state: the listing
+    /// indexes gone, `image_fts` and its triggers restored.
+    fn rewind_to_v16(conn: &Connection) {
+        conn.execute_batch(
+            "DROP INDEX IF EXISTS idx_images_listing_added;
+             DROP INDEX IF EXISTS idx_images_listing_taken;",
+        )
+        .expect("drop v17 indexes");
+        conn.execute_batch(V2_FTS).expect("restore fts");
+        conn.execute_batch(V2_FTS_BACKFILL).expect("backfill fts");
+        conn.execute_batch("PRAGMA user_version = 16").expect("set version");
+    }
+
+    #[test]
+    fn v16_database_with_rows_migrates_to_v17() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = Database::open(&dir.path().join("library.db")).expect("open");
+        let conn = &db.conn;
+        rewind_to_v16(conn);
+        assert_eq!(user_version(conn), 16);
+        assert!(exists(conn, "image_fts"));
+
+        // A populated library: an unstacked image, a two-image stack with an
+        // explicit cover, an undated image, and a missing one.
+        conn.execute_batch(
+            "INSERT INTO stacks(id, created_at) VALUES (1, 0);
+             INSERT INTO images(id, path, hash, file_size, added_at, status, filename,
+                                taken_at, stack_id)
+             VALUES (1, '/p/a.jpg', X'01', 1, 100, 'present', 'a.jpg', 90,   NULL),
+                    (2, '/p/b.jpg', X'02', 1, 101, 'present', 'b.jpg', 91,   1),
+                    (3, '/p/c.jpg', X'03', 1, 102, 'present', 'c.jpg', 92,   1),
+                    (4, '/p/d.jpg', X'04', 1, 103, 'present', 'd.jpg', NULL, NULL),
+                    (5, '/p/e.jpg', X'05', 1, 104, 'missing', 'e.jpg', 94,   NULL);
+             UPDATE stacks SET cover_image_id = 3 WHERE id = 1;",
+        )
+        .expect("seed");
+
+        ensure_schema(conn).expect("migrate 16 → 17");
+
+        assert_eq!(user_version(conn), 17);
+        assert!(exists(conn, "idx_images_listing_added"));
+        assert!(exists(conn, "idx_images_listing_taken"));
+        // Dropping the virtual table must take its shadow tables with it.
+        let leftovers: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE name LIKE 'image_fts%'",
+                [],
+                |r| r.get(0),
+            )
+            .expect("leftovers");
+        assert_eq!(leftovers, 0, "the unread FTS index and its shadow tables are gone");
+        for trigger in ["images_fts_ai", "images_fts_au", "images_fts_ad"] {
+            assert!(!exists(conn, trigger), "{trigger} should be dropped");
+        }
+
+        // Rows survive, and the listing still collapses the stack to its
+        // explicit cover and hides the missing image.
+        let n: i64 = conn
+            .query_row("SELECT COUNT(*) FROM images", [], |r| r.get(0))
+            .expect("count");
+        assert_eq!(n, 5);
+        let ids: Vec<i64> = db
+            .search_images(&SearchQuery::default().with_order(SearchOrder::AddedDesc))
+            .expect("search")
+            .iter()
+            .map(|i| i.id)
+            .collect();
+        assert_eq!(ids, vec![4, 3, 1]);
+
+        // Re-running is a no-op, not an error.
+        ensure_schema(conn).expect("idempotent");
+        assert_eq!(user_version(conn), 17);
+    }
+
+    #[test]
+    fn fresh_database_lands_on_v17_without_the_fts_index() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = Database::open(&dir.path().join("library.db")).expect("open");
+        assert_eq!(user_version(&db.conn), 17);
+        assert!(exists(&db.conn, "idx_images_listing_added"));
+        assert!(exists(&db.conn, "idx_images_listing_taken"));
+        assert!(!exists(&db.conn, "image_fts"));
+    }
 }

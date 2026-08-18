@@ -35,8 +35,9 @@ pub enum SearchOrder {
 /// ```
 #[derive(Default, Clone, Debug)]
 pub struct SearchQuery {
-    /// Free-text search matched against filename, make, model, and lens
-    /// via FTS5 prefix matching.
+    /// Free-text search.  Every whitespace-separated token must appear as a
+    /// substring of one of the image's EXIF fields, AI descriptions, person
+    /// names, or comprehensive EXIF tag values.
     pub text: Option<String>,
     pub limit: Option<usize>,
     pub offset: Option<usize>,
@@ -119,6 +120,13 @@ impl SearchQuery {
 /// non-total sort key makes `LIMIT`/`OFFSET` paging drop or repeat rows
 /// across page boundaries (SQLite is free to break ties differently per
 /// statement).
+///
+/// Each clause is backed by a V17 index (`idx_images_listing_added`,
+/// `idx_images_listing_taken`).  The `TakenDesc` one indexes an expression,
+/// and SQLite matches an expression index only when the query spells the
+/// expression identically — keep `COALESCE(i.taken_at, i.added_at)` here and
+/// the index DDL in `schema.rs` in step, or the planner drops back to sorting
+/// the whole table into a temp b-tree for every page.
 pub(crate) fn order_by_sql(order: SearchOrder) -> &'static str {
     match order {
         SearchOrder::AddedDesc => "ORDER BY i.added_at DESC, i.id DESC",
@@ -126,42 +134,11 @@ pub(crate) fn order_by_sql(order: SearchOrder) -> &'static str {
     }
 }
 
-// ── FTS5 query formatting ────────────────────────────────────────
-
-/// Convert a user search string into a safe FTS5 `MATCH` expression.
-///
-/// Each whitespace-separated token becomes `"token"*` (prefix match).
-/// Double-quotes within a token are doubled to escape them.
-///
-/// `"nikon 50mm"` → `"nikon"* "50mm"*`
-pub fn build_fts_query(text: &str) -> String {
-    text.split_whitespace()
-        .filter(|t| !t.is_empty())
-        .map(|t| format!("\"{}\"*", t.replace('"', "\"\"")))
-        .collect::<Vec<_>>()
-        .join(" ")
-}
-
 // ── Tests ────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn fts_single_token() {
-        assert_eq!(build_fts_query("nikon"), r#""nikon"*"#);
-    }
-
-    #[test]
-    fn fts_multiple_tokens() {
-        assert_eq!(build_fts_query("nikon 50mm"), r#""nikon"* "50mm"*"#);
-    }
-
-    #[test]
-    fn fts_escapes_quotes() {
-        assert_eq!(build_fts_query(r#"say "hello""#), r#""say"* """hello"""*"#);
-    }
 
     #[test]
     fn with_text_trims_and_rejects_blank() {

@@ -7,6 +7,8 @@
 //! re-marking them `present` when it reappears.
 
 mod embedding;
+#[cfg(test)]
+mod listing_bench;
 mod scanner;
 mod schema;
 mod semantic_db;
@@ -238,8 +240,8 @@ impl Database {
 
     /// Insert an image record.  No-op if `path` already exists in the DB.
     ///
-    /// The file basename is stored immediately as `filename` so that FTS-based
-    /// filename search works before full EXIF extraction runs.
+    /// The file basename is stored immediately as `filename` so that filename
+    /// search works before full EXIF extraction runs.
     ///
     /// `raw_path` is the optional companion raw file (e.g. the RAF when the
     /// display file is JPG).  Stored alongside the display path so the DB
@@ -527,7 +529,6 @@ impl Database {
 
     /// Update the on-disk location and display filename for an image record
     /// after a library restructure move (see `maple_import::restructure`).
-    /// The `images_fts_au` trigger keeps `image_fts` in sync automatically.
     pub fn update_image_location(
         &self,
         id: i64,
@@ -700,17 +701,22 @@ impl Database {
         }
 
         let (from_where, params) = match &query.text {
-            Some(text) => match text_from_where(text, query.collection_id, query.person_id) {
+            Some(text) => match text_from_where(
+                text,
+                Entry::Table,
+                query.collection_id,
+                query.person_id,
+            ) {
                 Some(parts) => parts,
                 // No usable tokens — the row query returns nothing, so does this.
                 None => return Ok(Some(0)),
             },
-            None => all_from_where(query.collection_id, query.person_id),
+            None => all_from_where(Entry::Table, query.collection_id, query.person_id),
         };
         // The text query joins descriptions/faces and so can repeat a row per
         // match; `DISTINCT` mirrors its `SELECT DISTINCT`.
         let selector = if query.text.is_some() { "COUNT(DISTINCT i.id)" } else { "COUNT(*)" };
-        let sql = format!("{STACK_COVERS_CTE} SELECT {selector} {from_where}");
+        let sql = format!("SELECT {selector} {from_where}");
 
         let mut stmt = self.conn.prepare(&sql)?;
         let n: i64 = stmt.query_row(rusqlite::params_from_iter(params), |r| r.get(0))?;
@@ -731,10 +737,10 @@ impl Database {
         let limit = limit.unwrap_or(500) as i64;
         let offset = offset.unwrap_or(0) as i64;
 
-        let (from_where, mut params) = all_from_where(collection_id, person_id);
+        let (from_where, mut params) = all_from_where(Entry::Index, collection_id, person_id);
         let order_by = crate::query::order_by_sql(order);
         let sql = format!(
-            "{STACK_COVERS_CTE} SELECT {IMAGE_COLUMNS} {from_where} {order_by} LIMIT ? OFFSET ?"
+            "SELECT {IMAGE_COLUMNS} {from_where} {order_by} LIMIT ? OFFSET ?"
         );
 
         params.push(Value::Integer(limit));
@@ -766,14 +772,15 @@ impl Database {
         let limit = limit.unwrap_or(500) as i64;
         let offset = offset.unwrap_or(0) as i64;
 
-        let Some((from_where, mut params)) = text_from_where(text, collection_id, person_id) else {
+        let Some((from_where, mut params)) =
+            text_from_where(text, Entry::Index, collection_id, person_id)
+        else {
             return Ok(vec![]);
         };
 
         let order_by = crate::query::order_by_sql(order);
         let sql = format!(
-            "{STACK_COVERS_CTE} SELECT DISTINCT {IMAGE_COLUMNS} \
-             {from_where} {order_by} LIMIT ? OFFSET ?"
+            "SELECT DISTINCT {IMAGE_COLUMNS} {from_where} {order_by} LIMIT ? OFFSET ?"
         );
 
         params.push(Value::Integer(limit));
@@ -885,9 +892,9 @@ impl Database {
         Ok(rows)
     }
 
-    /// Delete every row in `ai_descriptions`.  The FTS sync trigger and the
-    /// sentence-embedding invalidation triggers cascade automatically.
-    /// Returns the number of rows deleted.
+    /// Delete every row in `ai_descriptions`.  The sentence-embedding
+    /// invalidation triggers cascade automatically.  Returns the number of
+    /// rows deleted.
     pub fn clear_all_ai_descriptions(&self) -> anyhow::Result<usize> {
         let n = self.conn.execute("DELETE FROM ai_descriptions", [])?;
         Ok(n)
@@ -1199,23 +1206,73 @@ fn escape_like_token(token: &str) -> String {
 // through.  Both are assembled from the fragments below rather than being
 // written out twice.
 
-/// Collapses each stack to its cover image and carries the stack's size.
-const STACK_COVERS_CTE: &str = "WITH stack_covers AS (
-         SELECT s.id                                    AS stack_id,
-                COALESCE(s.cover_image_id, MIN(si.id)) AS cover_id,
-                COUNT(*)                                AS stack_size
-         FROM stacks s
-         JOIN images si ON si.stack_id = s.id AND si.status = 'present'
-         GROUP BY s.id
-     )";
+/// How a listing enters `images` — the one place the row query and its
+/// `COUNT(*)` twin are allowed to differ.
+///
+/// The paged listing wants the V17 ordering index: `LIMIT` means it only
+/// touches `limit + offset` rows, and the index hands them over already
+/// sorted.  The count has no `LIMIT` and needs `stack_id` for every present
+/// row, which those indexes do not carry — the planner walks one anyway and
+/// then fetches each row from the table in index order, one random read per
+/// row across the whole file.  Reading the table instead is ~7× faster, and
+/// still leaves the collection/person filters free to drive the query
+/// through `images`' INTEGER PRIMARY KEY, which `NOT INDEXED` does not
+/// forbid.
+#[derive(Clone, Copy)]
+enum Entry {
+    /// Through whichever ordering index matches the `ORDER BY`.
+    Index,
+    /// Straight down the table (unlimited aggregate — no ordering to serve).
+    Table,
+}
+
+impl Entry {
+    fn images(self) -> &'static str {
+        match self {
+            Entry::Index => "FROM images i",
+            Entry::Table => "FROM images i NOT INDEXED",
+        }
+    }
+}
+
+/// A stack contributes exactly one row to the listing: the image the stack
+/// names as its cover, or its lowest-id present member when it names none.
+///
+/// Correlated subqueries over `i` alone, rather than a join against a
+/// materialised `stack_covers` CTE.  A cover test that reaches across a join
+/// (`i.stack_id IS NULL OR i.id = sc.cover_id`) leaves SQLite unable to use
+/// any index to satisfy the listing's `ORDER BY`, so it sorted the entire
+/// table into a temp b-tree for every page the grid asked for — and adding
+/// the V17 ordering indexes made that *worse*, because the CTE's own scan
+/// then went through them too.  Written this way the ordering index drives
+/// the scan and the cover test is a per-row filter.
+///
+/// A `stack_id` pointing at a row `stacks` no longer has yields NULL here,
+/// which excludes the image — the same thing the outer join did.
+const STACK_COVER_PREDICATE: &str = "(
+             i.stack_id IS NULL
+             OR i.id = (
+                 SELECT COALESCE(
+                            s.cover_image_id,
+                            (SELECT MIN(m.id) FROM images m
+                             WHERE m.stack_id = i.stack_id AND m.status = 'present'))
+                 FROM stacks s WHERE s.id = i.stack_id
+             )
+           )";
 
 /// Column list consumed by [`row_to_library_image`], in its expected order.
+///
+/// `stack_size` stays NULL for an unstacked image (`row_to_library_image`
+/// hands it on as `Option`), which is what the outer join used to produce.
 const IMAGE_COLUMNS: &str = "i.id, i.path, i.added_at, i.status,
             i.filename, i.taken_at, i.make, i.model, i.lens,
             i.focal_length, i.aperture, i.iso,
             i.width, i.height, i.orientation, i.raw_path, i.hash,
             i.stack_id,
-            sc.stack_size";
+            CASE WHEN i.stack_id IS NOT NULL THEN
+                (SELECT COUNT(*) FROM images m
+                 WHERE m.stack_id = i.stack_id AND m.status = 'present')
+            ELSE NULL END";
 
 /// `AND` clauses (and their bound ids) for the optional collection/person
 /// filters, shared by the plain and text listings.
@@ -1240,18 +1297,16 @@ fn filter_clauses(
 
 /// `FROM … WHERE …` for an unfiltered (no text) listing, plus its params.
 fn all_from_where(
+    entry: Entry,
     collection_id: Option<i64>,
     person_id: Option<i64>,
 ) -> (String, Vec<rusqlite::types::Value>) {
     let (extra, params) = filter_clauses(collection_id, person_id);
     let sql = format!(
-        "FROM images i
-         LEFT JOIN stack_covers sc ON sc.stack_id = i.stack_id
+        "{}
          WHERE i.status = 'present'
-           AND (
-             i.stack_id IS NULL
-             OR i.id = sc.cover_id
-           ){extra}"
+           AND {STACK_COVER_PREDICATE}{extra}",
+        entry.images()
     );
     (sql, params)
 }
@@ -1260,6 +1315,7 @@ fn all_from_where(
 /// holds no usable tokens (the caller returns an empty result).
 fn text_from_where(
     text: &str,
+    entry: Entry,
     collection_id: Option<i64>,
     person_id: Option<i64>,
 ) -> Option<(String, Vec<rusqlite::types::Value>)> {
@@ -1300,17 +1356,14 @@ fn text_from_where(
 
     let (extra, extra_params) = filter_clauses(collection_id, person_id);
     let sql = format!(
-        "FROM images i
-         LEFT JOIN stack_covers sc ON sc.stack_id = i.stack_id
+        "{}
          LEFT JOIN ai_descriptions ad ON ad.image_id = i.id
          LEFT JOIN face_detections fd ON fd.image_id = i.id
          LEFT JOIN persons p ON p.id = fd.person_id
          WHERE i.status = 'present'
            AND {token_conditions}
-           AND (
-             i.stack_id IS NULL
-             OR i.id = sc.cover_id
-           ){extra}"
+           AND {STACK_COVER_PREDICATE}{extra}",
+        entry.images()
     );
 
     // Each token pattern appears four times: EXIF, AI desc, person name, EXIF tags.
@@ -1418,7 +1471,7 @@ mod tests {
     }
 
     #[test]
-    fn search_by_filename_fts() {
+    fn search_by_filename() {
         let (_dir, db) = tmp_db();
         db.insert_image(&PathBuf::from("/photos/sunset.jpg"), &fake_hash(5), 1024).unwrap();
         db.insert_image(&PathBuf::from("/photos/portrait.jpg"), &fake_hash(6), 1024).unwrap();
@@ -1685,7 +1738,7 @@ mod tests {
     }
 
     #[test]
-    fn update_image_location_moves_row_and_resyncs_fts() {
+    fn update_image_location_moves_row_and_updates_filename() {
         let (_dir, db) = tmp_db();
         let old = PathBuf::from("/library/old/a.jpg");
         db.insert_image(&old, &fake_hash(72), 1024).unwrap();
@@ -1699,10 +1752,11 @@ mod tests {
         assert_eq!(results[0].path, new_path);
         assert_eq!(results[0].meta.filename.as_deref(), Some("photo.jpg"));
 
-        // The images_fts_au trigger should have resynced the FTS row to the
-        // new filename.
+        // Text search sees the new filename, not the old one.
         let hits = db.search_images(&SearchQuery::default().with_text("photo")).unwrap();
         assert_eq!(hits.len(), 1);
+        let stale = db.search_images(&SearchQuery::default().with_text("a.jpg")).unwrap();
+        assert!(stale.is_empty());
     }
 
     // ── Paged listings ───────────────────────────────────────────
@@ -1863,6 +1917,114 @@ mod tests {
         let blank = SearchQuery { text: Some("   ".into()), ..Default::default() };
         assert_eq!(db.count_images(&blank).unwrap(), Some(0));
         assert!(db.search_images(&blank).unwrap().is_empty());
+    }
+
+    /// `EXPLAIN QUERY PLAN` for a listing, as one string.
+    fn listing_plan(
+        db: &Database,
+        order: SearchOrder,
+        collection_id: Option<i64>,
+        person_id: Option<i64>,
+    ) -> String {
+        use rusqlite::types::Value;
+
+        let (from_where, mut params) = all_from_where(Entry::Index, collection_id, person_id);
+        let order_by = crate::query::order_by_sql(order);
+        let sql = format!(
+            "EXPLAIN QUERY PLAN \
+             SELECT {IMAGE_COLUMNS} {from_where} {order_by} LIMIT ? OFFSET ?"
+        );
+        params.push(Value::Integer(10));
+        params.push(Value::Integer(0));
+
+        let mut stmt = db.conn.prepare(&sql).unwrap();
+        stmt.query_map(rusqlite::params_from_iter(params), |r| r.get::<_, String>(3))
+            .unwrap()
+            .filter_map(|r| r.ok())
+            .collect::<Vec<_>>()
+            .join(" | ")
+    }
+
+    #[test]
+    fn listing_orderings_are_served_by_an_index() {
+        // The grid re-issues the listing on every scroll, so it must never
+        // sort the whole table. SQLite matches `idx_images_listing_taken`
+        // only when the query spells its indexed expression exactly the way
+        // the DDL does, and it cannot use either index at all if the
+        // stack-cover test reaches across a join — both regressions are
+        // silent, showing up only as a grid that crawls on a big library.
+        let (_dir, db) = tmp_db();
+        insert_burst(&db, 25);
+        let ids = insert_burst_ids(&db);
+        let coll = db.create_collection("trip", "#fff", None).unwrap();
+        db.add_image_to_collection(coll, ids[0]).unwrap();
+
+        for order in [SearchOrder::AddedDesc, SearchOrder::TakenDesc] {
+            for (label, cid, pid) in
+                [("unfiltered", None, None), ("collection", Some(coll), None), ("person", None, Some(1))]
+            {
+                let plan = listing_plan(&db, order, cid, pid);
+                assert!(
+                    !plan.contains("TEMP B-TREE FOR ORDER BY"),
+                    "{order:?}/{label} sorts the whole table: {plan}"
+                );
+                assert!(
+                    plan.contains("idx_images_listing_"),
+                    "{order:?}/{label} does not reach the listing index: {plan}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn count_reads_the_table_not_an_ordering_index() {
+        // The count has no ORDER BY to serve and needs `stack_id` for every
+        // present row, which the ordering indexes do not carry — walking one
+        // costs a random row fetch per row. See `Entry`.
+        let (_dir, db) = tmp_db();
+        insert_burst(&db, 25);
+
+        let (from_where, params) = all_from_where(Entry::Table, None, None);
+        let mut stmt = db
+            .conn
+            .prepare(&format!("EXPLAIN QUERY PLAN SELECT COUNT(*) {from_where}"))
+            .unwrap();
+        let plan = stmt
+            .query_map(rusqlite::params_from_iter(params), |r| r.get::<_, String>(3))
+            .unwrap()
+            .filter_map(|r| r.ok())
+            .collect::<Vec<_>>()
+            .join(" | ");
+
+        assert!(
+            !plan.contains("idx_images_listing_"),
+            "count should not detour through an ordering index: {plan}"
+        );
+    }
+
+    #[test]
+    fn filtered_listings_page_without_gaps_or_repeats() {
+        let (_dir, db) = tmp_db();
+        insert_burst(&db, 12);
+        let ids = insert_burst_ids(&db);
+
+        let coll = db.create_collection("trip", "#fff", None).unwrap();
+        for id in ids.iter().take(7) {
+            db.add_image_to_collection(coll, *id).unwrap();
+        }
+
+        for order in [SearchOrder::AddedDesc, SearchOrder::TakenDesc] {
+            let q = SearchQuery::default().with_collection(coll).with_order(order);
+            let all: Vec<i64> =
+                db.search_images(&q).unwrap().iter().map(|i| i.id).collect();
+            assert_eq!(all.len(), 7);
+            assert_eq!(db.count_images(&q).unwrap(), Some(7));
+
+            let mut paged = page_ids(&db, &q, 0, 3);
+            paged.extend(page_ids(&db, &q, 1, 3));
+            paged.extend(page_ids(&db, &q, 2, 3));
+            assert_eq!(paged, all, "{order:?} filtered pages must tile the listing");
+        }
     }
 
     #[test]
