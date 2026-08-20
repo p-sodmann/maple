@@ -8,18 +8,32 @@
 // detection overlay with click-to-assign and draw-new-box support.
 //
 // ── Zoom / pan model ──────────────────────────────────────────────
-// Pan is handled natively by the `Flickable`: the image lives inside a
-// viewport sized to the displayed image (but never smaller than the visible
-// surface, so a fit-sized image stays centred). Zoom is a `zoom` factor
-// (1.0 = fit-to-window … 20.0).
+// Zoom is a `zoom` factor (1.0 = fit-to-window … 20.0); pan is the `ox`/`oy`
+// offset of the `content` rectangle, which is sized to the displayed image
+// but never smaller than the visible surface, so a fit-sized image stays
+// centred. Zoom comes from scroll-to-zoom (pointer-anchored) and from
+// trackpad/touch pinches; pan comes from dragging and is clamped so the
+// image edges can't be dragged inside the surface.
+//
+// Deliberately NOT a `Flickable`: a Flickable handles wheel events in its
+// own event filter as soon as its viewport is larger than itself, so once
+// the image was zoomed in it swallowed every scroll event before the
+// scroll-to-zoom TouchArea could see it, and further two-finger scrolling
+// panned instead of zooming. Panning is ~10 lines here, so we do it
+// ourselves and keep the gesture handling predictable.
 //
 // ── Face overlay ──────────────────────────────────────────────────
-// Face boxes are absolutely-positioned Rectangles inside the Flickable
-// viewport (no per-box TouchArea — click hit-testing is done in Rust via
-// the zoom-area's `clicked` callback + the geo-* properties below). This
-// preserves zoom-area's scroll-event handling for all cursor positions.
-// Draw-mode is a TouchArea stacked above zoom-area that captures drag
-// gestures; it is invisible (and therefore non-hit-testable) when not in use.
+// Face boxes are absolutely-positioned Rectangles inside `content` (no
+// per-box TouchArea — click hit-testing is done in Rust via the zoom-area's
+// `clicked` callback + the geo-* properties below). This preserves
+// zoom-area's scroll-event handling for all cursor positions. Draw-mode is a
+// TouchArea stacked above zoom-area that captures drag gestures; it is
+// invisible (and therefore non-hit-testable) when not in use.
+//
+// The touch areas are siblings of `content`, not children, so their
+// mouse-x/-y stay in stable surface coordinates while panning; content
+// coordinates — which the geo-* properties and all Rust hit-testing use —
+// are mouse-x/-y minus the pan offset.
 
 import { Theme } from "theme.slint";
 import { FlatButton } from "widgets.slint";
@@ -105,9 +119,26 @@ export component DetailWindow inherits Window {
 
     // ── View state ────────────────────────────────────────────────
     property <float> zoom: 1.0;
+    // Pan: offset of the content rectangle inside the surface.  Never
+    // positive — 0 means "top/left edge flush", the axis minimum means
+    // "bottom/right edge flush" (see clamp-ox / clamp-oy).
+    property <length> ox: 0;
+    property <length> oy: 0;
+    // Zoom/pan state captured at the start of a zoom step or pinch gesture,
+    // so the anchoring maths can work from a fixed reference.
     property <float> prev-zoom: 1.0;
     property <length> prev-ox: 0;
     property <length> prev-oy: 0;
+
+    // Drag-to-pan state (no locals in Slint callbacks).
+    property <bool> pan-dragging: false;
+    property <length> pan-x0: 0;
+    property <length> pan-y0: 0;
+    property <length> pan-ox0: 0;
+    property <length> pan-oy0: 0;
+    // Set once a press has moved far enough to count as a pan rather than a
+    // click, so releasing it doesn't also select a face.
+    property <bool> pan-moved: false;
 
     // Draw-mode drag state (no locals in Slint callbacks).
     property <length> draw-x0: 0;
@@ -184,14 +215,30 @@ export component DetailWindow inherits Window {
         return m + o0 - (img-top-for(z1)
             + (m - img-top-for(z0)) * (ppx-for(z1) / ppx-for(z0)));
     }
+    // A mouse wheel notch is 60px, a trackpad delivers a stream of much
+    // smaller deltas — so scale the step by the delta rather than stepping
+    // once per event, which would make trackpad zoom uncontrollably fast.
     pure function stepped-zoom(delta: length) -> float {
-        return clamp(delta > 0 ? root.zoom * 1.15 : root.zoom / 1.15, 1.0, 20.0);
+        return clamp(root.zoom * pow(1.15, delta / 60px), 1.0, 20.0);
+    }
+    pure function clamp-ox(v: length) -> length {
+        return max(min(v, 0px), root.view-w - root.vp-w);
+    }
+    pure function clamp-oy(v: length) -> length {
+        return max(min(v, 0px), root.view-h - root.vp-h);
+    }
+
+    // Re-pans so the image point under (mx, my) — content coordinates in the
+    // *prev-* state — stays under the pointer across a zoom change.
+    function anchor-view(mx: length, my: length) {
+        root.ox = clamp-ox(anchored-ox(mx, root.prev-zoom, root.zoom, root.prev-ox));
+        root.oy = clamp-oy(anchored-oy(my, root.prev-zoom, root.zoom, root.prev-oy));
     }
 
     public function reset-view() {
         root.zoom = 1.0;
-        flick.viewport-x = 0;
-        flick.viewport-y = 0;
+        root.ox = 0;
+        root.oy = 0;
     }
 
     init => { key-scope.focus(); }
@@ -294,78 +341,163 @@ export component DetailWindow inherits Window {
                 clip: true;
                 background: Theme.photo-surface;
 
-                flick := Flickable {
+                // Pinch-to-zoom.  Trackpad pinches (macOS/iOS) and two-finger
+                // touchscreen pinches arrive here; every other event is
+                // forwarded, so the touch areas below still get clicks and
+                // scrolls.  `center` is in this element's coordinates, which
+                // are the surface's, hence the `- prev-o*` to get content
+                // coordinates.
+                pinch := ScaleRotateGestureHandler {
                     width: 100%;
                     height: 100%;
-                    viewport-width: root.vp-w;
-                    viewport-height: root.vp-h;
-                    interactive: root.zoom > 1.0;
 
-                    // ── Image ──────────────────────────────────────
-                    Image {
-                        x: (root.vp-w - root.disp-w) / 2;
-                        y: (root.vp-h - root.disp-h) / 2;
-                        width: root.disp-w;
-                        height: root.disp-h;
-                        source: root.photo;
-                        image-fit: fill;
+                    started => {
+                        root.prev-zoom = root.zoom;
+                        root.prev-ox = root.ox;
+                        root.prev-oy = root.oy;
                     }
 
-                    // ── Face overlay boxes (pure visual, no TouchArea)
-                    // Click hit-testing is delegated to zoom-area.clicked + Rust.
-                    // Using `visible` instead of `if ... for` (Slint does not
-                    // support combining `if` and `for` in one expression).
-                    for fb in root.face-boxes: Rectangle {
-                        visible: root.show-faces;
-                        x: img-left-for(root.zoom) + fb.x1 * root.disp-w;
-                        y: img-top-for(root.zoom) + fb.y1 * root.disp-h;
-                        width: max(4px, (fb.x2 - fb.x1) * root.disp-w);
-                        height: max(4px, (fb.y2 - fb.y1) * root.disp-h);
-                        border-width: 2px;
-                        border-color: fb.is-assigned
-                            ? #33d770
-                            : (fb.is-suggestion ? #ffa500 : #3388ff);
-                        background: fb.is-assigned
-                            ? #33d77012
-                            : (fb.is-suggestion ? #ffa50012 : #3388ff12);
-
-                        // Label just below the box.  Rectangles don't clip
-                        // children by default, so this is visible outside.
-                        Text {
-                            x: 0;
-                            y: parent.height + 2px;
-                            text: fb.label;
-                            color: fb.is-assigned
-                                ? #33d770
-                                : (fb.is-suggestion ? #ffa500 : #3388ff);
-                            font-size: clamp(10px, parent.height * 0.15, 18px);
+                    updated => {
+                        if root.img-w > 0 && root.img-h > 0 {
+                            root.zoom = clamp(root.prev-zoom * self.scale, 1.0, 20.0);
+                            root.anchor-view(
+                                self.center.x - root.prev-ox,
+                                self.center.y - root.prev-oy,
+                            );
                         }
                     }
 
-                    // ── Scroll-to-zoom + face-click area ──────────
-                    // Listed after face boxes so it is on top; it handles
-                    // scroll events (accepted → Flickable never scrolls) and
-                    // click events (delegated to Rust hit-testing when faces
-                    // are shown).
-                    zoom-area := TouchArea {
+                    // ── Pannable content ───────────────────────────
+                    // Sized to the displayed image (but never smaller than the
+                    // surface, so a fit-sized image stays centred) and shifted
+                    // by root.ox / root.oy — that offset *is* the pan.
+                    content := Rectangle {
+                        x: root.ox;
+                        y: root.oy;
                         width: root.vp-w;
                         height: root.vp-h;
+
+                        // ── Image ──────────────────────────────────
+                        Image {
+                            x: (root.vp-w - root.disp-w) / 2;
+                            y: (root.vp-h - root.disp-h) / 2;
+                            width: root.disp-w;
+                            height: root.disp-h;
+                            source: root.photo;
+                            image-fit: fill;
+                        }
+
+                        // ── Face overlay boxes (pure visual, no TouchArea)
+                        // Click hit-testing is delegated to zoom-area.clicked
+                        // + Rust.  Using `visible` instead of `if ... for`
+                        // (Slint does not support combining `if` and `for` in
+                        // one expression).
+                        for fb in root.face-boxes: Rectangle {
+                            visible: root.show-faces;
+                            x: img-left-for(root.zoom) + fb.x1 * root.disp-w;
+                            y: img-top-for(root.zoom) + fb.y1 * root.disp-h;
+                            width: max(4px, (fb.x2 - fb.x1) * root.disp-w);
+                            height: max(4px, (fb.y2 - fb.y1) * root.disp-h);
+                            border-width: 2px;
+                            border-color: fb.is-assigned
+                                ? #33d770
+                                : (fb.is-suggestion ? #ffa500 : #3388ff);
+                            background: fb.is-assigned
+                                ? #33d77012
+                                : (fb.is-suggestion ? #ffa50012 : #3388ff12);
+
+                            // Label just below the box.  Rectangles don't clip
+                            // children by default, so this is visible outside.
+                            Text {
+                                x: 0;
+                                y: parent.height + 2px;
+                                text: fb.label;
+                                color: fb.is-assigned
+                                    ? #33d770
+                                    : (fb.is-suggestion ? #ffa500 : #3388ff);
+                                font-size: clamp(10px, parent.height * 0.15, 18px);
+                            }
+                        }
+
+                        // ── Live drag preview ──────────────────────
+                        Rectangle {
+                            visible: root.face-draw-mode && root.draw-dragging;
+                            x: min(root.draw-x0, root.draw-x1);
+                            y: min(root.draw-y0, root.draw-y1);
+                            width: root.draw-x1 >= root.draw-x0
+                                ? root.draw-x1 - root.draw-x0
+                                : root.draw-x0 - root.draw-x1;
+                            height: root.draw-y1 >= root.draw-y0
+                                ? root.draw-y1 - root.draw-y0
+                                : root.draw-y0 - root.draw-y1;
+                            border-width: 2px;
+                            border-color: white.with-alpha(0.9);
+                            background: transparent;
+                        }
+                    }
+
+                    // ── Scroll-to-zoom + drag-to-pan + face-click area ─
+                    // Deliberately a sibling of `content` rather than a child:
+                    // it must not move with the pan, so that its mouse-x/-y
+                    // stay in stable surface coordinates.  Content coordinates
+                    // (what Rust's hit-testing and the geo-* properties use)
+                    // are mouse-x/-y minus the pan offset.
+                    zoom-area := TouchArea {
+                        width: 100%;
+                        height: 100%;
+                        mouse-cursor: root.zoom <= 1.0
+                            ? MouseCursor.default
+                            : (root.pan-dragging ? MouseCursor.grabbing : MouseCursor.grab);
 
                         scroll-event(event) => {
                             if root.img-w <= 0 || root.img-h <= 0 { return accept; }
                             root.prev-zoom = root.zoom;
-                            root.prev-ox = flick.viewport-x;
-                            root.prev-oy = flick.viewport-y;
+                            root.prev-ox = root.ox;
+                            root.prev-oy = root.oy;
                             root.zoom = stepped-zoom(event.delta-y);
-                            flick.viewport-x = anchored-ox(self.mouse-x, root.prev-zoom, root.zoom, root.prev-ox);
-                            flick.viewport-y = anchored-oy(self.mouse-y, root.prev-zoom, root.zoom, root.prev-oy);
+                            root.anchor-view(
+                                self.mouse-x - root.prev-ox,
+                                self.mouse-y - root.prev-oy,
+                            );
                             return accept;
+                        }
+
+                        // Drag-to-pan, only meaningful once zoomed in.
+                        pointer-event(e) => {
+                            if e.kind == PointerEventKind.down {
+                                root.pan-x0 = self.mouse-x;
+                                root.pan-y0 = self.mouse-y;
+                                root.pan-ox0 = root.ox;
+                                root.pan-oy0 = root.oy;
+                                root.pan-dragging = root.zoom > 1.0;
+                                root.pan-moved = false;
+                            } else if e.kind == PointerEventKind.up
+                                || e.kind == PointerEventKind.cancel {
+                                root.pan-dragging = false;
+                            }
+                        }
+
+                        moved => {
+                            if root.pan-dragging {
+                                if abs(self.mouse-x - root.pan-x0) > 3px
+                                    || abs(self.mouse-y - root.pan-y0) > 3px {
+                                    root.pan-moved = true;
+                                }
+                                root.ox = clamp-ox(root.pan-ox0 + self.mouse-x - root.pan-x0);
+                                root.oy = clamp-oy(root.pan-oy0 + self.mouse-y - root.pan-y0);
+                            }
                         }
 
                         // Delegate face hit-testing to Rust; Rust checks
                         // show-faces / face-draw-mode and the geo-* geometry.
+                        // A drag that panned the image isn't a click on a face.
                         clicked => {
-                            root.face-area-clicked(self.mouse-x, self.mouse-y);
+                            if !root.pan-moved {
+                                root.face-area-clicked(
+                                    self.mouse-x - root.ox,
+                                    self.mouse-y - root.oy,
+                                );
+                            }
                         }
 
                         double-clicked => { root.reset-view(); }
@@ -374,25 +506,27 @@ export component DetailWindow inherits Window {
                     // ── Draw-mode drag area ────────────────────────
                     // Stacked ABOVE zoom-area; visible (and hit-testable) only
                     // in draw mode.  Captures the drag gesture for a new bbox;
-                    // scroll-zoom is blocked for the brief draw-mode session.
+                    // scroll-zoom and drag-to-pan are blocked for the brief
+                    // draw-mode session.
                     draw-ta := TouchArea {
                         visible: root.show-faces && root.face-draw-mode;
-                        width: root.vp-w;
-                        height: root.vp-h;
+                        width: 100%;
+                        height: 100%;
 
                         pointer-event(e) => {
                             if e.kind == PointerEventKind.down {
-                                root.draw-x0 = self.mouse-x;
-                                root.draw-y0 = self.mouse-y;
-                                root.draw-x1 = self.mouse-x;
-                                root.draw-y1 = self.mouse-y;
+                                root.draw-x0 = self.mouse-x - root.ox;
+                                root.draw-y0 = self.mouse-y - root.oy;
+                                root.draw-x1 = root.draw-x0;
+                                root.draw-y1 = root.draw-y0;
                                 root.draw-dragging = true;
                             } else if e.kind == PointerEventKind.up {
                                 if root.draw-dragging {
                                     root.draw-dragging = false;
                                     root.face-draw-done(
                                         root.draw-x0, root.draw-y0,
-                                        self.mouse-x, self.mouse-y,
+                                        self.mouse-x - root.ox,
+                                        self.mouse-y - root.oy,
                                     );
                                     root.face-draw-mode = false;
                                 }
@@ -400,25 +534,9 @@ export component DetailWindow inherits Window {
                         }
 
                         moved => {
-                            root.draw-x1 = self.mouse-x;
-                            root.draw-y1 = self.mouse-y;
+                            root.draw-x1 = self.mouse-x - root.ox;
+                            root.draw-y1 = self.mouse-y - root.oy;
                         }
-                    }
-
-                    // ── Live drag preview ──────────────────────────
-                    Rectangle {
-                        visible: root.face-draw-mode && root.draw-dragging;
-                        x: min(root.draw-x0, root.draw-x1);
-                        y: min(root.draw-y0, root.draw-y1);
-                        width: root.draw-x1 >= root.draw-x0
-                            ? root.draw-x1 - root.draw-x0
-                            : root.draw-x0 - root.draw-x1;
-                        height: root.draw-y1 >= root.draw-y0
-                            ? root.draw-y1 - root.draw-y0
-                            : root.draw-y0 - root.draw-y1;
-                        border-width: 2px;
-                        border-color: white.with-alpha(0.9);
-                        background: transparent;
                     }
                 }
 
