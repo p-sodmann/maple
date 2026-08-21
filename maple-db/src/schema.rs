@@ -19,6 +19,9 @@
 //!   16 → 17: library-listing indexes on (status, added_at) and
 //!            (status, COALESCE(taken_at, added_at)); drops the never-read
 //!            FTS5 index and its write triggers
+//!   17 → 18: guid/rev/rev_dev versioning columns on every synced table,
+//!            plus sync_identity, sync_tombstones and sync_peers — the
+//!            groundwork for master/servant replication
 //!
 //! Steps are append-only and replay history, so a fresh database still runs
 //! V2's `image_fts` creation before V17 drops it again.
@@ -184,9 +187,11 @@ const V6: &str = "
 // `semantic_meta` records the active encoder model + vector dimension so the
 // index can be rebuilt when the model changes (see `Database::ensure_vec_table`).
 //
-// Invalidation is handled by triggers (robust regardless of the foreign_keys
-// pragma, which is not enabled): editing or deleting a description drops its
-// sentence rows, and deleting a sentence row drops its vector.
+// Invalidation is handled by triggers rather than foreign keys, because the
+// *edit* case has no FK equivalent: changing `ai_descriptions.description`
+// must drop the stale sentence rows, and only a trigger can see that. The
+// delete cases could be cascades — `Database::open` enables `foreign_keys` —
+// but keeping all three in one mechanism is easier to reason about.
 
 /// Default vector dimension used when the table is first created (the
 /// `all-MiniLM-L6-v2` default model).  The table is recreated at the correct
@@ -436,6 +441,157 @@ const V17_DROP_FTS: &str = "
     DROP TABLE IF EXISTS image_fts;
 ";
 
+// ── V18: sync identity, row versioning, tombstones ───────────────
+
+/// Tables whose rows replicate between a master and its servants.
+///
+/// Everything else is either recomputed locally (EXIF tags, DINOv2 hashes,
+/// sentence vectors, the thumbnail caches) or machine-local by nature
+/// (`import_starred_paths` holds SD-card mount paths).
+pub const SYNCED_TABLES: &[&str] = &[
+    "images",
+    "ai_descriptions",
+    "persons",
+    "face_detections",
+    "collections",
+    "collection_images",
+    "stacks",
+];
+
+/// Per-table versioning columns, added to each entry of [`SYNCED_TABLES`].
+///
+/// * `guid` — stable cross-device identity. Local `INTEGER PRIMARY KEY`
+///   rowids are assigned by whichever machine inserted the row, so they
+///   cannot serve as a wire identity.
+/// * `rev` — hybrid logical clock stamp. A plain counter is not comparable
+///   across devices and raw wall-clock time breaks under skew, so writes take
+///   `max(clock + 1, now_millis)`. Doubles as the pull watermark:
+///   "everything with `rev >` N".
+/// * `rev_dev` — the device that produced `rev`; the deterministic tiebreak
+///   that makes last-write-wins agree on both sides.
+const V18_COLUMNS: &[&str] = &["guid TEXT", "rev INTEGER NOT NULL DEFAULT 0", "rev_dev TEXT"];
+
+const V18_TABLES: &str = "
+    CREATE TABLE IF NOT EXISTS sync_identity (
+        id          INTEGER PRIMARY KEY CHECK (id = 1),
+        device_id   TEXT    NOT NULL,
+        device_name TEXT    NOT NULL DEFAULT '',
+        role        TEXT    NOT NULL DEFAULT 'off',   -- 'off' | 'master' | 'servant'
+        clock       INTEGER NOT NULL DEFAULT 0        -- HLC reservation ceiling
+    );
+
+    CREATE TABLE IF NOT EXISTS sync_tombstones (
+        guid    TEXT    PRIMARY KEY,
+        entity  TEXT    NOT NULL,   -- which SYNCED_TABLES entry the guid belonged to
+        rev     INTEGER NOT NULL,
+        rev_dev TEXT    NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_tombstones_rev ON sync_tombstones(rev);
+
+    CREATE TABLE IF NOT EXISTS sync_peers (
+        device_id     TEXT PRIMARY KEY,
+        name          TEXT,
+        mode          TEXT    NOT NULL DEFAULT 'relay',  -- 'full' | 'partial' | 'relay'
+        last_pull_rev INTEGER NOT NULL DEFAULT 0,
+        last_push_rev INTEGER NOT NULL DEFAULT 0,
+        last_seen_at  INTEGER
+    );
+";
+
+/// Mint this installation's device id. `randomblob(16)` gives 128 bits
+/// without needing a UUID crate — the value is an opaque key, so the
+/// RFC-4122 version/variant nibbles would carry no meaning here.
+const V18_SEED_IDENTITY: &str = "
+    INSERT OR IGNORE INTO sync_identity (id, device_id)
+    VALUES (1, lower(hex(randomblob(16))));
+";
+
+/// Backfill `rev` for rows that predate versioning, deriving a plausible
+/// ordering from each table's insert timestamp (seconds → milliseconds, to
+/// match the HLC's unit) rather than stamping everything identically.
+///
+/// Rows left at a single shared value would fall back to the `rev_dev`
+/// tiebreak on every conflict, which resolves deterministically but
+/// arbitrarily — two libraries that diverged years ago deserve better than
+/// "whichever device id sorts higher wins". `face_detections` has no
+/// timestamp of its own, so it borrows its image's.
+///
+/// The `max(…, 1)` floor matters: `rev = 0` is the "never synced" watermark,
+/// and a pull asks for `rev > 0`, so a row left at zero would be invisible.
+const V18_BACKFILL: &[&str] = &[
+    "UPDATE images            SET rev = max(coalesce(added_at,   0) * 1000, 1) WHERE rev = 0",
+    "UPDATE ai_descriptions   SET rev = max(coalesce(created_at, 0) * 1000, 1) WHERE rev = 0",
+    "UPDATE persons           SET rev = max(coalesce(created_at, 0) * 1000, 1) WHERE rev = 0",
+    "UPDATE collections       SET rev = max(coalesce(created_at, 0) * 1000, 1) WHERE rev = 0",
+    "UPDATE collection_images SET rev = max(coalesce(added_at,   0) * 1000, 1) WHERE rev = 0",
+    "UPDATE stacks            SET rev = max(coalesce(created_at, 0) * 1000, 1) WHERE rev = 0",
+    "UPDATE face_detections SET rev = max(coalesce(
+         (SELECT added_at FROM images WHERE images.id = face_detections.image_id), 0) * 1000, 1)
+     WHERE rev = 0",
+];
+
+/// Apply V18 to `conn`: versioning columns on every synced table, guid
+/// backfill, indexes, bookkeeping tables, and this device's identity.
+fn apply_v18(conn: &Connection) -> anyhow::Result<()> {
+    for table in SYNCED_TABLES {
+        for column in V18_COLUMNS {
+            add_column(conn, table, column)?;
+        }
+    }
+
+    conn.execute_batch(V18_TABLES)?;
+    conn.execute_batch(V18_SEED_IDENTITY)?;
+
+    // Every pre-existing row needs an identity before the UNIQUE index goes
+    // on. One statement per table beats a Rust round-trip per row — a
+    // 200k-image library would otherwise need 200k UPDATEs.
+    for table in SYNCED_TABLES {
+        conn.execute_batch(&format!(
+            "UPDATE {table} SET guid = lower(hex(randomblob(16))) WHERE guid IS NULL;"
+        ))?;
+    }
+    for sql in V18_BACKFILL {
+        conn.execute_batch(&format!("{sql};"))?;
+    }
+
+    // `rev_dev` completes the stamp: pre-existing rows are attributed to this
+    // device, which is the truthful answer — it is where they were written.
+    let device_id: String =
+        conn.query_row("SELECT device_id FROM sync_identity WHERE id = 1", [], |r| {
+            r.get(0)
+        })?;
+    for table in SYNCED_TABLES {
+        conn.execute(
+            &format!("UPDATE {table} SET rev_dev = ?1 WHERE rev_dev IS NULL"),
+            [&device_id],
+        )?;
+    }
+
+    // UNIQUE on guid enforces the identity invariant the merge engine relies
+    // on; the rev index serves every watermark pull.
+    for table in SYNCED_TABLES {
+        conn.execute_batch(&format!(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_{table}_guid ON {table}(guid);
+             CREATE INDEX IF NOT EXISTS idx_{table}_rev  ON {table}(rev);"
+        ))?;
+    }
+
+    Ok(())
+}
+
+/// `ALTER TABLE … ADD COLUMN`, treating "already present" as success.
+///
+/// The migration runner replays history on every open, and `ADD COLUMN` has
+/// no `IF NOT EXISTS` form, so this is the idempotency the V2/V13/V15/V16
+/// steps each open-code.
+fn add_column(conn: &Connection, table: &str, column: &str) -> anyhow::Result<()> {
+    match conn.execute_batch(&format!("ALTER TABLE {table} ADD COLUMN {column};")) {
+        Ok(()) => Ok(()),
+        Err(e) if e.to_string().to_lowercase().contains("duplicate column") => Ok(()),
+        Err(e) => Err(e.into()),
+    }
+}
+
 // ── Migration runner ─────────────────────────────────────────────
 
 /// Apply all pending schema migrations to `conn`.
@@ -592,6 +748,11 @@ pub fn ensure_schema(conn: &Connection) -> anyhow::Result<()> {
         conn.execute_batch("PRAGMA user_version = 17")?;
     }
 
+    if version < 18 {
+        apply_v18(conn)?;
+        conn.execute_batch("PRAGMA user_version = 18")?;
+    }
+
     Ok(())
 }
 
@@ -703,7 +864,7 @@ mod tests {
     }
 
     #[test]
-    fn v16_database_with_rows_migrates_to_v17() {
+    fn v16_database_with_rows_migrates_to_head() {
         let dir = tempfile::tempdir().expect("tempdir");
         let db = Database::open(&dir.path().join("library.db")).expect("open");
         let conn = &db.conn;
@@ -726,9 +887,9 @@ mod tests {
         )
         .expect("seed");
 
-        ensure_schema(conn).expect("migrate 16 → 17");
+        ensure_schema(conn).expect("migrate 16 → head");
 
-        assert_eq!(user_version(conn), 17);
+        assert_eq!(user_version(conn), 18);
         assert!(exists(conn, "idx_images_listing_added"));
         assert!(exists(conn, "idx_images_listing_taken"));
         // Dropping the virtual table must take its shadow tables with it.
@@ -758,18 +919,118 @@ mod tests {
             .collect();
         assert_eq!(ids, vec![4, 3, 1]);
 
-        // Re-running is a no-op, not an error.
+        // V18 backfilled the rows seeded at v16: every one has an identity,
+        // and `rev` was derived from `added_at` rather than being flattened
+        // to a single shared value.
+        let ungoverned: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM images WHERE guid IS NULL OR rev_dev IS NULL OR rev = 0",
+                [],
+                |r| r.get(0),
+            )
+            .expect("ungoverned");
+        assert_eq!(ungoverned, 0, "every pre-existing row needs a stamp");
+
+        let distinct_guids: i64 = conn
+            .query_row("SELECT COUNT(DISTINCT guid) FROM images", [], |r| r.get(0))
+            .expect("distinct");
+        assert_eq!(distinct_guids, 5, "guids must be unique per row");
+
+        // added_at 100 seconds → rev 100_000 milliseconds.
+        let rev: i64 = conn
+            .query_row("SELECT rev FROM images WHERE id = 1", [], |r| r.get(0))
+            .expect("rev");
+        assert_eq!(rev, 100_000);
+
+        // Re-running is a no-op, not an error — and must not re-mint guids.
+        let before: String = conn
+            .query_row("SELECT guid FROM images WHERE id = 1", [], |r| r.get(0))
+            .expect("guid");
         ensure_schema(conn).expect("idempotent");
-        assert_eq!(user_version(conn), 17);
+        assert_eq!(user_version(conn), 18);
+        let after: String = conn
+            .query_row("SELECT guid FROM images WHERE id = 1", [], |r| r.get(0))
+            .expect("guid");
+        assert_eq!(before, after, "replaying V18 must not change identities");
     }
 
     #[test]
-    fn fresh_database_lands_on_v17_without_the_fts_index() {
+    fn fresh_database_lands_on_head_without_the_fts_index() {
         let dir = tempfile::tempdir().expect("tempdir");
         let db = Database::open(&dir.path().join("library.db")).expect("open");
-        assert_eq!(user_version(&db.conn), 17);
+        assert_eq!(user_version(&db.conn), 18);
         assert!(exists(&db.conn, "idx_images_listing_added"));
         assert!(exists(&db.conn, "idx_images_listing_taken"));
         assert!(!exists(&db.conn, "image_fts"));
+    }
+
+    #[test]
+    fn v18_versions_every_synced_table() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = Database::open(&dir.path().join("library.db")).expect("open");
+        let conn = &db.conn;
+
+        for table in SYNCED_TABLES {
+            let columns: Vec<String> = conn
+                .prepare(&format!("PRAGMA table_info({table})"))
+                .expect("prepare")
+                .query_map([], |r| r.get::<_, String>(1))
+                .expect("query")
+                .filter_map(|r| r.ok())
+                .collect();
+            for expected in ["guid", "rev", "rev_dev"] {
+                assert!(
+                    columns.iter().any(|c| c == expected),
+                    "{table} is missing {expected}"
+                );
+            }
+            assert!(exists(conn, &format!("idx_{table}_guid")));
+            assert!(exists(conn, &format!("idx_{table}_rev")));
+        }
+
+        for table in ["sync_identity", "sync_tombstones", "sync_peers"] {
+            assert!(exists(conn, table), "{table} should exist");
+        }
+    }
+
+    #[test]
+    fn v18_mints_exactly_one_device_identity() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("library.db");
+
+        let device_id = {
+            let db = Database::open(&path).expect("open");
+            let rows: i64 = db
+                .conn
+                .query_row("SELECT COUNT(*) FROM sync_identity", [], |r| r.get(0))
+                .expect("count");
+            assert_eq!(rows, 1);
+            db.device_id().to_owned()
+        };
+
+        // Reopening replays every migration step, including V18's seed. The
+        // device id is this installation's name on the network — re-minting
+        // it would orphan every pairing.
+        let reopened = Database::open(&path).expect("reopen");
+        assert_eq!(reopened.device_id(), device_id);
+    }
+
+    #[test]
+    fn guids_are_unique_across_rows_of_the_same_table() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = Database::open(&dir.path().join("library.db")).expect("open");
+
+        db.conn
+            .execute_batch(
+                "INSERT INTO persons(id, name, created_at, guid, rev, rev_dev)
+                 VALUES (1, 'Ada', 0, 'dup', 1, 'dev');",
+            )
+            .expect("first");
+
+        let clash = db.conn.execute_batch(
+            "INSERT INTO persons(id, name, created_at, guid, rev, rev_dev)
+             VALUES (2, 'Grace', 0, 'dup', 1, 'dev');",
+        );
+        assert!(clash.is_err(), "the UNIQUE guid index must reject a clash");
     }
 }

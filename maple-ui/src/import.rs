@@ -9,7 +9,7 @@
 //! the Slint main thread drains the channels.
 
 use std::cell::{Cell, RefCell};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::{mpsc, Arc, Mutex};
@@ -63,8 +63,18 @@ struct ScanThumb {
 }
 
 enum CopyMsg {
-    Progress { done: usize, total: usize },
-    Done { copied: usize, failed: usize },
+    Progress {
+        done: usize,
+        total: usize,
+    },
+    Done {
+        copied: usize,
+        failed: usize,
+        /// Where each copied source file actually landed. The library DB must
+        /// record destination paths — inserting the source path would store an
+        /// SD-card path that vanishes when the card is ejected.
+        dest_by_source: HashMap<PathBuf, PathBuf>,
+    },
     Error(String),
 }
 
@@ -849,6 +859,7 @@ fn wire_copy(window: &ImportWindow, ctx: &ImportCtx) {
                         let _ = tx.send(CopyMsg::Done {
                             copied: summary.copied,
                             failed: summary.failed,
+                            dest_by_source: summary.destination_map(),
                         });
                     }
                     Err(e) => {
@@ -873,8 +884,12 @@ fn wire_copy(window: &ImportWindow, ctx: &ImportCtx) {
                                     );
                                 }
                             }
-                            Ok(CopyMsg::Done { copied, failed }) => {
-                                finish_copy(&w, &ctx2, &run, copied, failed);
+                            Ok(CopyMsg::Done {
+                                copied,
+                                failed,
+                                dest_by_source,
+                            }) => {
+                                finish_copy(&w, &ctx2, &run, copied, failed, &dest_by_source);
                                 return;
                             }
                             Ok(CopyMsg::Error(e)) => {
@@ -934,7 +949,18 @@ fn copy_sources(
 }
 
 /// The copy finished — record the imported photos and flash the button.
-fn finish_copy(w: &ImportWindow, ctx: &ImportCtx, run: &CopyRun, copied: usize, failed: usize) {
+///
+/// `dest_by_source` maps each source file to where it landed; entries whose
+/// display file is absent from it were either not copied (a `RawOnly` run) or
+/// failed, and are left for the library scanner to discover on its next pass.
+fn finish_copy(
+    w: &ImportWindow,
+    ctx: &ImportCtx,
+    run: &CopyRun,
+    copied: usize,
+    failed: usize,
+    dest_by_source: &HashMap<PathBuf, PathBuf>,
+) {
     // Mark as imported in the SeenSet.
     {
         let mut imp = maple_state::SeenSet::load_imported(&run.library_dir);
@@ -947,16 +973,33 @@ fn finish_copy(w: &ImportWindow, ctx: &ImportCtx, run: &CopyRun, copied: usize, 
         }
         let _ = imp.save_imported(&run.library_dir);
     }
-    // Insert display files into library DB.
+    // Insert display files into library DB, under the path they were copied
+    // to. `Entry::path` is the *source* path — an SD-card path that stops
+    // existing the moment the card is ejected.
     let to_insert: Vec<ImportEntry> = {
         let ents = ctx.entries.borrow();
         run.sel_indices
             .iter()
             .filter_map(|&i| ents.get(i))
-            .map(|e| ImportEntry {
-                path: e.path.clone(),
-                content_hash: e.content_hash,
-                embedding: e.embedding.clone(),
+            .filter_map(|e| {
+                // No destination for the display file means it wasn't copied:
+                // either the copy failed, or this was a `RawOnly` run whose
+                // raw file the scanner will pick up and hash for itself.
+                // `content_hash` is the *display* file's hash, so pinning it
+                // to a raw file here would poison the thumbnail cache key.
+                let path = dest_by_source.get(&e.path)?.clone();
+                let raw_path = e
+                    .companions
+                    .iter()
+                    .find(|c| maple_import::is_raw_format(c))
+                    .and_then(|c| dest_by_source.get(c))
+                    .cloned();
+                Some(ImportEntry {
+                    path,
+                    raw_path,
+                    content_hash: e.content_hash,
+                    embedding: e.embedding.clone(),
+                })
             })
             .collect()
     };

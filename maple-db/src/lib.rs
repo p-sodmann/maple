@@ -12,6 +12,7 @@ mod listing_bench;
 mod scanner;
 mod schema;
 mod semantic_db;
+mod sync_identity;
 mod thumb_cache;
 pub mod worker;
 
@@ -36,6 +37,8 @@ pub use faces::{best_person_match, best_person_matches, cosine_similarity, FaceD
 pub use metadata::{extract_all_exif_tags, extract_metadata, spawn_metadata_filler, ImageMetadata};
 pub use query::{SearchOrder, SearchQuery};
 pub use scanner::{set_scanner_paused, LibraryScanner};
+pub use schema::SYNCED_TABLES;
+pub use sync_identity::SyncIdentity;
 pub use thumb_cache::ThumbnailCache;
 pub use semantic::{spawn_sentence_embedder, split_sentences, SemanticEncoder, SentenceEmbedder};
 
@@ -185,6 +188,9 @@ type ImagePathStatusRow = (PathBuf, ImageStatus, Option<[u8; 32]>);
 
 pub struct Database {
     conn: Connection,
+    /// This installation's device id and hybrid logical clock, used to stamp
+    /// every write that replicates to a paired device.
+    identity: SyncIdentity,
 }
 
 impl Database {
@@ -200,9 +206,96 @@ impl Database {
         // connection so the schema migration can create the vector table.
         register_sqlite_vec();
         let conn = Connection::open(path)?;
-        conn.execute_batch("PRAGMA journal_mode=WAL;")?;
+        // Foreign keys are load-bearing: deleting a collection, person or
+        // image relies on `ON DELETE CASCADE` to take its children with it,
+        // and sync relies on that in turn — a tombstone for a parent row
+        // propagates as one delete, and each side's cascade cleans up its own
+        // children rather than shipping a tombstone per child.
+        //
+        // rusqlite's bundled SQLite happens to be built with
+        // SQLITE_DEFAULT_FOREIGN_KEYS, so this is already on today. Setting it
+        // explicitly means the invariant survives a switch to a system SQLite
+        // instead of silently turning every cascade into an orphaned row.
+        conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;")?;
         schema::ensure_schema(&conn)?;
-        Ok(Self { conn })
+        let identity = SyncIdentity::load(&conn)?;
+        Ok(Self { conn, identity })
+    }
+
+    // ── Sync identity ────────────────────────────────────────────
+
+    /// This installation's device id.
+    pub fn device_id(&self) -> &str {
+        self.identity.device_id()
+    }
+
+    /// Next `(rev, rev_dev)` stamp for a locally-originated write.
+    ///
+    /// Callers append `rev = ?, rev_dev = ?` to the statement's `SET` clause.
+    /// Stamping happens here rather than in a trigger on purpose: V17 removed
+    /// the last `AFTER UPDATE ON images` trigger because the library scanner
+    /// and stacker issue bulk `UPDATE images SET status/stack_id`, and a
+    /// trigger fires on every one of those rows. Explicit stamping keeps that
+    /// cost off the writes that don't replicate.
+    pub fn stamp(&self) -> anyhow::Result<(i64, String)> {
+        self.identity.stamp(&self.conn)
+    }
+
+    /// Advance the local clock past a stamp received from a peer.
+    pub fn observe_remote_rev(&self, rev: i64) {
+        self.identity.observe(rev);
+    }
+
+    /// Generate a fresh row guid.
+    ///
+    /// Matches the `lower(hex(randomblob(16)))` form the V18 backfill uses:
+    /// 128 opaque random bits, no UUID crate needed, since nothing reads the
+    /// RFC-4122 version or variant nibbles.
+    pub fn new_guid(&self) -> anyhow::Result<String> {
+        Ok(self
+            .conn
+            .query_row("SELECT lower(hex(randomblob(16)))", [], |r| r.get(0))?)
+    }
+
+    /// Record that the rows with `ids` in `table` were deleted locally.
+    ///
+    /// Deletion has to be represented explicitly: a row that is simply gone
+    /// is indistinguishable from a row the peer has not sent yet, so without
+    /// a tombstone the next sync would helpfully restore everything the user
+    /// just deleted. The tombstone carries a stamp so it can lose to a later
+    /// edit — a peer that modified the row *after* this delete resurrects it.
+    ///
+    /// Call this *before* the `DELETE`, while the guids are still readable.
+    pub fn tombstone(&self, table: &str, ids: &[i64]) -> anyhow::Result<()> {
+        if ids.is_empty() {
+            return Ok(());
+        }
+        debug_assert!(
+            schema::SYNCED_TABLES.contains(&table),
+            "{table} is not replicated, so its deletes need no tombstone"
+        );
+
+        let (rev, rev_dev) = self.stamp()?;
+        let tx = self.conn.unchecked_transaction()?;
+        {
+            let mut read = tx.prepare(&format!("SELECT guid FROM {table} WHERE id = ?1"))?;
+            let mut write = tx.prepare(
+                "INSERT INTO sync_tombstones (guid, entity, rev, rev_dev)
+                 VALUES (?1, ?2, ?3, ?4)
+                 ON CONFLICT(guid) DO UPDATE SET rev = ?3, rev_dev = ?4",
+            )?;
+            for id in ids {
+                let guid: Option<String> =
+                    read.query_row(params![id], |r| r.get(0)).optional()?.flatten();
+                // A row with no guid predates V18 and was never replicated,
+                // so no peer can be holding a copy to resurrect.
+                if let Some(guid) = guid {
+                    write.execute(params![guid, table, rev, rev_dev])?;
+                }
+            }
+        }
+        tx.commit()?;
+        Ok(())
     }
 
     // ── Starred import paths ──────────────────────────────────────
@@ -275,11 +368,14 @@ impl Database {
             .to_owned();
 
         let raw_str = raw_path.map(path_to_db);
+        let (rev, rev_dev) = self.stamp()?;
+        let guid = self.new_guid()?;
 
         self.conn.execute(
             "INSERT OR IGNORE INTO images
-                 (path, hash, file_size, added_at, status, filename, raw_path)
-             VALUES (?1, ?2, ?3, ?4, 'present', ?5, ?6)",
+                 (path, hash, file_size, added_at, status, filename, raw_path,
+                  guid, rev, rev_dev)
+             VALUES (?1, ?2, ?3, ?4, 'present', ?5, ?6, ?7, ?8, ?9)",
             params![
                 path_to_db(path),
                 hash.as_slice(),
@@ -287,6 +383,9 @@ impl Database {
                 added_at,
                 filename,
                 raw_str,
+                guid,
+                rev,
+                rev_dev,
             ],
         )?;
         Ok(())
@@ -413,18 +512,21 @@ impl Database {
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs() as i64;
+        let (rev, rev_dev) = self.stamp()?;
+        let guid = self.new_guid()?;
         self.conn.execute(
-            "INSERT INTO stacks (created_at) VALUES (?1)",
-            params![now],
+            "INSERT INTO stacks (created_at, guid, rev, rev_dev) VALUES (?1, ?2, ?3, ?4)",
+            params![now, guid, rev, rev_dev],
         )?;
         Ok(self.conn.last_insert_rowid())
     }
 
     /// Assign `image_id` to `stack_id`.  Pass `None` to remove from any stack.
     pub fn set_image_stack(&self, image_id: i64, stack_id: Option<i64>) -> anyhow::Result<()> {
+        let (rev, rev_dev) = self.stamp()?;
         self.conn.execute(
-            "UPDATE images SET stack_id = ?1 WHERE id = ?2",
-            params![stack_id, image_id],
+            "UPDATE images SET stack_id = ?1, rev = ?2, rev_dev = ?3 WHERE id = ?4",
+            params![stack_id, rev, rev_dev, image_id],
         )?;
         Ok(())
     }
@@ -453,9 +555,10 @@ impl Database {
     /// Set the cover (favourite) image for a stack.
     /// The cover is used as the grid thumbnail for the stack.
     pub fn set_stack_cover(&self, stack_id: i64, image_id: i64) -> anyhow::Result<()> {
+        let (rev, rev_dev) = self.stamp()?;
         self.conn.execute(
-            "UPDATE stacks SET cover_image_id = ?1 WHERE id = ?2",
-            params![image_id, stack_id],
+            "UPDATE stacks SET cover_image_id = ?1, rev = ?2, rev_dev = ?3 WHERE id = ?4",
+            params![image_id, rev, rev_dev, stack_id],
         )?;
         Ok(())
     }
@@ -481,9 +584,10 @@ impl Database {
         };
 
         // Remove this image from the stack.
+        let (rev, rev_dev) = self.stamp()?;
         self.conn.execute(
-            "UPDATE images SET stack_id = NULL WHERE id = ?1",
-            params![image_id],
+            "UPDATE images SET stack_id = NULL, rev = ?1, rev_dev = ?2 WHERE id = ?3",
+            params![rev, rev_dev, image_id],
         )?;
 
         // If fewer than 2 images remain, disband the whole stack.
@@ -494,10 +598,12 @@ impl Database {
         )?;
 
         if remaining < 2 {
+            let (rev, rev_dev) = self.stamp()?;
             self.conn.execute(
-                "UPDATE images SET stack_id = NULL WHERE stack_id = ?1",
-                params![stack_id],
+                "UPDATE images SET stack_id = NULL, rev = ?1, rev_dev = ?2 WHERE stack_id = ?3",
+                params![rev, rev_dev, stack_id],
             )?;
+            self.tombstone("stacks", &[stack_id])?;
             self.conn.execute(
                 "DELETE FROM stacks WHERE id = ?1",
                 params![stack_id],
@@ -519,6 +625,9 @@ impl Database {
     }
 
     /// Set the raw companion path on an existing image record.
+    ///
+    /// Not stamped — see [`Database::mark_missing`]; `raw_path` is a local
+    /// filesystem location, and each machine discovers its own.
     pub fn set_raw_path(&self, id: i64, raw_path: &Path) -> anyhow::Result<()> {
         self.conn.execute(
             "UPDATE images SET raw_path = ?1 WHERE id = ?2",
@@ -529,6 +638,11 @@ impl Database {
 
     /// Update the on-disk location and display filename for an image record
     /// after a library restructure move (see `maple_import::restructure`).
+    ///
+    /// Not stamped — see [`Database::mark_missing`]. `filename` rides along
+    /// unreplicated because it is derived from `path`: restructuring the
+    /// workstation's library says nothing about where the laptop keeps its
+    /// copy, and propagating either machine's paths would break the other's.
     pub fn update_image_location(
         &self,
         id: i64,
@@ -551,6 +665,7 @@ impl Database {
     /// Populate / overwrite EXIF metadata for the record with `id`, and mark
     /// it as having had EXIF extraction run (see `records_needing_metadata`).
     pub fn update_metadata(&self, id: i64, meta: &ImageMetadata) -> anyhow::Result<()> {
+        let (rev, rev_dev) = self.stamp()?;
         self.conn.execute(
             "UPDATE images SET
                  filename       = ?1,
@@ -564,8 +679,10 @@ impl Database {
                  width          = ?9,
                  height         = ?10,
                  orientation    = ?11,
-                 exif_extracted = 1
-             WHERE id = ?12",
+                 exif_extracted = 1,
+                 rev            = ?12,
+                 rev_dev        = ?13
+             WHERE id = ?14",
             params![
                 meta.filename,
                 meta.taken_at,
@@ -578,6 +695,8 @@ impl Database {
                 meta.width,
                 meta.height,
                 meta.orientation,
+                rev,
+                rev_dev,
                 id,
             ],
         )?;
@@ -623,14 +742,21 @@ impl Database {
         hash: &[u8; 32],
         orientation: i64,
     ) -> anyhow::Result<()> {
+        let (rev, rev_dev) = self.stamp()?;
         self.conn.execute(
-            "UPDATE images SET hash = ?1, orientation = ?2 WHERE id = ?3",
-            params![hash.as_slice(), orientation, id],
+            "UPDATE images SET hash = ?1, orientation = ?2, rev = ?3, rev_dev = ?4 WHERE id = ?5",
+            params![hash.as_slice(), orientation, rev, rev_dev, id],
         )?;
         Ok(())
     }
 
     /// Mark a record as missing (file deleted from disk).
+    ///
+    /// Deliberately **not** stamped: `status` is a statement about this
+    /// machine's disk, not about the photo. A file absent from the laptop is
+    /// still present on the workstation, so replicating `'missing'` would let
+    /// whichever machine holds fewer originals blank out the other's library.
+    /// The same reasoning keeps `path`, `raw_path` and `file_size` local.
     pub fn mark_missing(&self, path: &Path) -> anyhow::Result<()> {
         self.conn.execute(
             "UPDATE images SET status = 'missing' WHERE path = ?1",
@@ -640,6 +766,8 @@ impl Database {
     }
 
     /// Mark a record as present (file has reappeared on disk).
+    ///
+    /// Not stamped — see [`Database::mark_missing`].
     pub fn mark_present(&self, path: &Path) -> anyhow::Result<()> {
         self.conn.execute(
             "UPDATE images SET status = 'present' WHERE path = ?1",
@@ -847,13 +975,18 @@ impl Database {
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs() as i64;
+        let (rev, rev_dev) = self.stamp()?;
+        let guid = self.new_guid()?;
         self.conn.execute(
-            "INSERT INTO ai_descriptions(image_id, model_id, description, created_at)
-             VALUES (?1, ?2, ?3, ?4)
+            "INSERT INTO ai_descriptions
+                 (image_id, model_id, description, created_at, guid, rev, rev_dev)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
              ON CONFLICT(image_id, model_id) DO UPDATE SET
                  description = excluded.description,
-                 created_at  = excluded.created_at",
-            params![image_id, model_id, description, created_at],
+                 created_at  = excluded.created_at,
+                 rev         = excluded.rev,
+                 rev_dev     = excluded.rev_dev",
+            params![image_id, model_id, description, created_at, guid, rev, rev_dev],
         )?;
         Ok(())
     }
@@ -896,6 +1029,15 @@ impl Database {
     /// invalidation triggers cascade automatically.  Returns the number of
     /// rows deleted.
     pub fn clear_all_ai_descriptions(&self) -> anyhow::Result<usize> {
+        // A deliberate user action, so it has to propagate — otherwise the
+        // next sync refills the table from a peer that still has them.
+        let ids: Vec<i64> = self
+            .conn
+            .prepare("SELECT id FROM ai_descriptions")?
+            .query_map([], |r| r.get(0))?
+            .filter_map(|r| r.ok())
+            .collect();
+        self.tombstone("ai_descriptions", &ids)?;
         let n = self.conn.execute("DELETE FROM ai_descriptions", [])?;
         Ok(n)
     }
@@ -1440,6 +1582,178 @@ mod tests {
         let (_dir, db) = tmp_db();
         db.insert_image(&PathBuf::from("/photos/a.jpg"), &fake_hash(1), 1024).unwrap();
         assert_eq!(db.count().unwrap(), 1);
+    }
+
+    // ── Sync stamping ────────────────────────────────────────────
+
+    /// `(guid, rev, rev_dev)` for one row.
+    fn stamp_of(db: &Database, table: &str, id: i64) -> (Option<String>, i64, Option<String>) {
+        db.conn
+            .query_row(
+                &format!("SELECT guid, rev, rev_dev FROM {table} WHERE id = ?1"),
+                params![id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap()
+    }
+
+    #[test]
+    fn inserted_rows_carry_an_identity_and_a_stamp() {
+        let (_dir, db) = tmp_db();
+        db.insert_image(&PathBuf::from("/photos/a.jpg"), &fake_hash(1), 1024)
+            .unwrap();
+        let id = db
+            .image_id_for_path(&PathBuf::from("/photos/a.jpg"))
+            .unwrap()
+            .unwrap();
+
+        let (guid, rev, rev_dev) = stamp_of(&db, "images", id);
+        assert_eq!(guid.unwrap().len(), 32);
+        assert!(rev > 0, "a fresh row must not sit at the zero watermark");
+        assert_eq!(rev_dev.as_deref(), Some(db.device_id()));
+    }
+
+    #[test]
+    fn editing_a_row_advances_its_stamp() {
+        let (_dir, db) = tmp_db();
+        db.insert_image(&PathBuf::from("/photos/a.jpg"), &fake_hash(1), 1024)
+            .unwrap();
+        let id = db
+            .image_id_for_path(&PathBuf::from("/photos/a.jpg"))
+            .unwrap()
+            .unwrap();
+        let (guid_before, rev_before, _) = stamp_of(&db, "images", id);
+
+        db.update_image_hash_and_orientation(id, &fake_hash(2), 6)
+            .unwrap();
+
+        let (guid_after, rev_after, _) = stamp_of(&db, "images", id);
+        assert!(rev_after > rev_before, "the edit must be newer than the insert");
+        assert_eq!(guid_before, guid_after, "identity is stable across edits");
+    }
+
+    #[test]
+    fn local_only_columns_do_not_advance_the_stamp() {
+        let (_dir, db) = tmp_db();
+        let path = PathBuf::from("/photos/a.jpg");
+        db.insert_image(&path, &fake_hash(1), 1024).unwrap();
+        let id = db.image_id_for_path(&path).unwrap().unwrap();
+        let (_, rev_before, _) = stamp_of(&db, "images", id);
+
+        // `status` describes this machine's disk, not the photo. If these
+        // bumped the stamp, a laptop that has fewer originals would win every
+        // merge and mark the workstation's library missing.
+        db.mark_missing(&path).unwrap();
+        db.mark_present(&path).unwrap();
+        db.set_raw_path(id, &PathBuf::from("/photos/a.raf")).unwrap();
+
+        let (_, rev_after, _) = stamp_of(&db, "images", id);
+        assert_eq!(rev_before, rev_after);
+    }
+
+    #[test]
+    fn deleting_a_collection_leaves_a_tombstone() {
+        let (_dir, db) = tmp_db();
+        let cid = db.create_collection("Trip", "#3584e4", None).unwrap();
+        let (guid, _, _) = stamp_of(&db, "collections", cid);
+        let guid = guid.unwrap();
+
+        db.delete_collection(cid).unwrap();
+
+        let (entity, rev): (String, i64) = db
+            .conn
+            .query_row(
+                "SELECT entity, rev FROM sync_tombstones WHERE guid = ?1",
+                params![guid],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .expect("a delete must be recorded, or the next sync restores it");
+        assert_eq!(entity, "collections");
+        assert!(rev > 0);
+    }
+
+    #[test]
+    fn deleting_a_collection_cascades_to_its_memberships() {
+        let (_dir, db) = tmp_db();
+        db.insert_image(&PathBuf::from("/photos/a.jpg"), &fake_hash(1), 1024)
+            .unwrap();
+        let iid = db
+            .image_id_for_path(&PathBuf::from("/photos/a.jpg"))
+            .unwrap()
+            .unwrap();
+        let cid = db.create_collection("Trip", "#3584e4", None).unwrap();
+        db.add_image_to_collection(cid, iid).unwrap();
+
+        db.delete_collection(cid).unwrap();
+
+        // The cascade is what lets one parent tombstone stand in for the
+        // whole subtree; SQLite rowids get reused, so a leftover membership
+        // row would silently reattach itself to the next collection created.
+        let orphans: i64 = db
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM collection_images WHERE collection_id = ?1",
+                params![cid],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(orphans, 0);
+    }
+
+    #[test]
+    fn deleting_a_person_unassigns_and_stamps_their_faces() {
+        let (_dir, db) = tmp_db();
+        db.insert_image(&PathBuf::from("/photos/a.jpg"), &fake_hash(1), 1024)
+            .unwrap();
+        let iid = db
+            .image_id_for_path(&PathBuf::from("/photos/a.jpg"))
+            .unwrap()
+            .unwrap();
+        let fid = db
+            .insert_face_detection(iid, [0.1, 0.1, 0.2, 0.2], &[0.0; 512], 0.9)
+            .unwrap();
+        let pid = db.upsert_person("Ada").unwrap();
+        db.assign_face_to_person(fid, Some(pid)).unwrap();
+        let (_, rev_before, _) = stamp_of(&db, "face_detections", fid);
+
+        db.delete_person(pid).unwrap();
+
+        // The face survives with its box intact but loses the name, and that
+        // un-assignment is a real edit — a peer still holding the old name
+        // must lose to it.
+        let (_, rev_after, _) = stamp_of(&db, "face_detections", fid);
+        assert!(rev_after > rev_before);
+        let person: Option<i64> = db
+            .conn
+            .query_row(
+                "SELECT person_id FROM face_detections WHERE id = ?1",
+                params![fid],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(person, None);
+    }
+
+    #[test]
+    fn stamps_increase_monotonically_across_tables() {
+        let (_dir, db) = tmp_db();
+        db.insert_image(&PathBuf::from("/photos/a.jpg"), &fake_hash(1), 1024)
+            .unwrap();
+        let iid = db
+            .image_id_for_path(&PathBuf::from("/photos/a.jpg"))
+            .unwrap()
+            .unwrap();
+        let cid = db.create_collection("Trip", "#3584e4", None).unwrap();
+        db.add_image_to_collection(cid, iid).unwrap();
+        let pid = db.upsert_person("Ada").unwrap();
+
+        // One clock serves every table, so a single watermark per peer is
+        // enough to ask "what changed since?" across the whole library.
+        let img = stamp_of(&db, "images", iid).1;
+        let coll = stamp_of(&db, "collections", cid).1;
+        let person = stamp_of(&db, "persons", pid).1;
+        assert!(img < coll, "images {img} should precede collections {coll}");
+        assert!(coll < person, "collections {coll} should precede persons {person}");
     }
 
     #[test]

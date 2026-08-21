@@ -5,11 +5,17 @@ use std::sync::{Arc, Mutex};
 
 use maple_db::lock_db;
 
-/// Plain (path, hash) pair for one copied file, ready to insert into the
-/// library DB. Deliberately excludes UI-only fields (decoded thumbnail,
-/// selection state) carried on the import window's own per-entry struct.
+/// One copied file, ready to insert into the library DB. Deliberately
+/// excludes UI-only fields (decoded thumbnail, selection state) carried on
+/// the import window's own per-entry struct.
 pub struct ImportEntry {
+    /// Where the display file was copied to — a path inside the library, not
+    /// the source path it was scanned under.
     pub path: PathBuf,
+    /// Where this photo's companion RAW landed, if one was copied alongside
+    /// the display file. `None` when the group had no raw, or the copy mode
+    /// excluded it.
+    pub raw_path: Option<PathBuf>,
     pub content_hash: [u8; 32],
     /// DINOv2 embedding computed during the SD-card scan, if stack detection
     /// was enabled and inference succeeded. Transferring it here means the
@@ -31,7 +37,12 @@ pub fn insert_imported_images(
     let guard = lock_db(db);
     for e in entries {
         if let Ok(meta) = e.path.metadata() {
-            if let Err(err) = guard.insert_image_with_raw(&e.path, &e.content_hash, meta.len(), None) {
+            if let Err(err) = guard.insert_image_with_raw(
+                &e.path,
+                &e.content_hash,
+                meta.len(),
+                e.raw_path.as_deref(),
+            ) {
                 tracing::warn!("insert_imported_images {}: {err}", e.path.display());
                 continue;
             }

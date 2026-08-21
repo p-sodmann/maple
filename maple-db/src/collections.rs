@@ -7,7 +7,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use rusqlite::params;
+use rusqlite::{params, OptionalExtension};
 
 use crate::faces::{blob_to_embedding, embedding_to_blob};
 use crate::Database;
@@ -54,33 +54,43 @@ impl Database {
     /// Create a new collection.  Returns the new row id.
     pub fn create_collection(&self, name: &str, color: &str, parent_id: Option<i64>) -> anyhow::Result<i64> {
         let now = now_secs();
+        let (rev, rev_dev) = self.stamp()?;
+        let guid = self.new_guid()?;
         self.conn.execute(
-            "INSERT INTO collections (name, color, created_at, parent_id) VALUES (?1, ?2, ?3, ?4)",
-            params![name, color, now, parent_id],
+            "INSERT INTO collections (name, color, created_at, parent_id, guid, rev, rev_dev)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![name, color, now, parent_id, guid, rev, rev_dev],
         )?;
         Ok(self.conn.last_insert_rowid())
     }
 
     /// Rename an existing collection.
     pub fn rename_collection(&self, id: i64, name: &str) -> anyhow::Result<()> {
+        let (rev, rev_dev) = self.stamp()?;
         self.conn.execute(
-            "UPDATE collections SET name = ?1 WHERE id = ?2",
-            params![name, id],
+            "UPDATE collections SET name = ?1, rev = ?2, rev_dev = ?3 WHERE id = ?4",
+            params![name, rev, rev_dev, id],
         )?;
         Ok(())
     }
 
     /// Change a collection's colour.
     pub fn set_collection_color(&self, id: i64, color: &str) -> anyhow::Result<()> {
+        let (rev, rev_dev) = self.stamp()?;
         self.conn.execute(
-            "UPDATE collections SET color = ?1 WHERE id = ?2",
-            params![color, id],
+            "UPDATE collections SET color = ?1, rev = ?2, rev_dev = ?3 WHERE id = ?4",
+            params![color, rev, rev_dev, id],
         )?;
         Ok(())
     }
 
     /// Delete a collection.  Memberships are removed via `ON DELETE CASCADE`.
+    ///
+    /// Only the collection itself is tombstoned: a peer applying that
+    /// tombstone deletes its own copy, and its own cascade takes that side's
+    /// membership rows with it.
     pub fn delete_collection(&self, id: i64) -> anyhow::Result<()> {
+        self.tombstone("collections", &[id])?;
         self.conn
             .execute("DELETE FROM collections WHERE id = ?1", params![id])?;
         Ok(())
@@ -93,10 +103,13 @@ impl Database {
         image_id: i64,
     ) -> anyhow::Result<()> {
         let now = now_secs();
+        let (rev, rev_dev) = self.stamp()?;
+        let guid = self.new_guid()?;
         self.conn.execute(
-            "INSERT OR IGNORE INTO collection_images (collection_id, image_id, added_at)
-             VALUES (?1, ?2, ?3)",
-            params![collection_id, image_id, now],
+            "INSERT OR IGNORE INTO collection_images
+                 (collection_id, image_id, added_at, guid, rev, rev_dev)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![collection_id, image_id, now, guid, rev, rev_dev],
         )?;
         Ok(())
     }
@@ -107,10 +120,20 @@ impl Database {
         collection_id: i64,
         image_id: i64,
     ) -> anyhow::Result<()> {
+        let id: Option<i64> = self
+            .conn
+            .query_row(
+                "SELECT id FROM collection_images WHERE collection_id = ?1 AND image_id = ?2",
+                params![collection_id, image_id],
+                |r| r.get(0),
+            )
+            .optional()?;
+        let Some(id) = id else { return Ok(()) };
+
+        self.tombstone("collection_images", &[id])?;
         self.conn.execute(
-            "DELETE FROM collection_images
-             WHERE collection_id = ?1 AND image_id = ?2",
-            params![collection_id, image_id],
+            "DELETE FROM collection_images WHERE id = ?1",
+            params![id],
         )?;
         Ok(())
     }
@@ -252,6 +275,8 @@ impl Database {
         };
 
         let centroid_blob = centroid.as_deref().map(embedding_to_blob);
+        // Not stamped — derived locally, and `representative_image_id` is a
+        // local rowid. See `update_person_representative` in `faces.rs`.
         self.conn.execute(
             "UPDATE collections SET centroid_embedding = ?1, representative_image_id = ?2 WHERE id = ?3",
             params![centroid_blob, representative_id, collection_id],

@@ -148,10 +148,13 @@ impl Database {
         confidence: f32,
     ) -> anyhow::Result<i64> {
         let blob = embedding_to_blob(embedding);
+        let (rev, rev_dev) = self.stamp()?;
+        let guid = self.new_guid()?;
         self.conn.execute(
             "INSERT INTO face_detections
-                 (image_id, bbox_x1, bbox_y1, bbox_x2, bbox_y2, embedding, confidence)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                 (image_id, bbox_x1, bbox_y1, bbox_x2, bbox_y2, embedding, confidence,
+                  guid, rev, rev_dev)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
             params![
                 image_id,
                 bbox[0],
@@ -160,6 +163,9 @@ impl Database {
                 bbox[3],
                 blob,
                 confidence,
+                guid,
+                rev,
+                rev_dev,
             ],
         )?;
         Ok(self.conn.last_insert_rowid())
@@ -174,9 +180,12 @@ impl Database {
         face_id: i64,
         person_id: Option<i64>,
     ) -> anyhow::Result<()> {
+        let (rev, rev_dev) = self.stamp()?;
         self.conn.execute(
-            "UPDATE face_detections SET person_id = ?1, skipped = 0 WHERE id = ?2",
-            params![person_id, face_id],
+            "UPDATE face_detections
+             SET person_id = ?1, skipped = 0, rev = ?2, rev_dev = ?3
+             WHERE id = ?4",
+            params![person_id, rev, rev_dev, face_id],
         )?;
         Ok(())
     }
@@ -186,26 +195,30 @@ impl Database {
     /// Skipped faces are excluded from the default tagging queue and only
     /// shown when the user explicitly opens "Review Skipped Faces".
     pub fn mark_face_skipped(&self, face_id: i64, skipped: bool) -> anyhow::Result<()> {
+        let (rev, rev_dev) = self.stamp()?;
         self.conn.execute(
-            "UPDATE face_detections SET skipped = ?1 WHERE id = ?2",
-            params![skipped as i32, face_id],
+            "UPDATE face_detections SET skipped = ?1, rev = ?2, rev_dev = ?3 WHERE id = ?4",
+            params![skipped as i32, rev, rev_dev, face_id],
         )?;
         Ok(())
     }
 
     /// Update the bounding box of an existing face detection.
     pub fn update_face_bbox(&self, face_id: i64, bbox: [f32; 4]) -> anyhow::Result<()> {
+        let (rev, rev_dev) = self.stamp()?;
         self.conn.execute(
             "UPDATE face_detections
-             SET bbox_x1 = ?1, bbox_y1 = ?2, bbox_x2 = ?3, bbox_y2 = ?4
-             WHERE id = ?5",
-            params![bbox[0], bbox[1], bbox[2], bbox[3], face_id],
+             SET bbox_x1 = ?1, bbox_y1 = ?2, bbox_x2 = ?3, bbox_y2 = ?4,
+                 rev = ?5, rev_dev = ?6
+             WHERE id = ?7",
+            params![bbox[0], bbox[1], bbox[2], bbox[3], rev, rev_dev, face_id],
         )?;
         Ok(())
     }
 
     /// Delete a face detection and its person assignment.
     pub fn delete_face_detection(&self, face_id: i64) -> anyhow::Result<()> {
+        self.tombstone("face_detections", &[face_id])?;
         self.conn
             .execute("DELETE FROM face_detections WHERE id = ?1", params![face_id])?;
         Ok(())
@@ -222,6 +235,18 @@ impl Database {
     ///
     /// Returns `(faces_deleted, persons_deleted)`.
     pub fn clear_all_face_data(&self) -> anyhow::Result<(usize, usize)> {
+        // Tombstone everything first: this is a deliberate user action, so it
+        // must propagate rather than being silently undone by the next sync
+        // refilling the tables from a peer.
+        for table in ["face_detections", "persons"] {
+            let ids: Vec<i64> = self
+                .conn
+                .prepare(&format!("SELECT id FROM {table}"))?
+                .query_map([], |r| r.get(0))?
+                .filter_map(|r| r.ok())
+                .collect();
+            self.tombstone(table, &ids)?;
+        }
         let faces = self.conn.execute("DELETE FROM face_detections", [])?;
         let persons = self.conn.execute("DELETE FROM persons", [])?;
         Ok((faces, persons))
@@ -229,8 +254,11 @@ impl Database {
 
     /// Rename an existing person.
     pub fn rename_person(&self, id: i64, name: &str) -> anyhow::Result<()> {
-        self.conn
-            .execute("UPDATE persons SET name = ?1 WHERE id = ?2", params![name, id])?;
+        let (rev, rev_dev) = self.stamp()?;
+        self.conn.execute(
+            "UPDATE persons SET name = ?1, rev = ?2, rev_dev = ?3 WHERE id = ?4",
+            params![name, rev, rev_dev, id],
+        )?;
         Ok(())
     }
 
@@ -238,10 +266,17 @@ impl Database {
     /// set to `NULL`) rather than deleted, so the photos and detected
     /// bounding boxes remain — only the name association is removed.
     pub fn delete_person(&self, id: i64) -> anyhow::Result<()> {
+        // The un-assignment is a real edit to each face row, not a cascade,
+        // so those rows need their own stamps — otherwise a peer would keep
+        // showing the deleted name against them.
+        let (rev, rev_dev) = self.stamp()?;
         self.conn.execute(
-            "UPDATE face_detections SET person_id = NULL WHERE person_id = ?1",
-            params![id],
+            "UPDATE face_detections
+             SET person_id = NULL, rev = ?1, rev_dev = ?2
+             WHERE person_id = ?3",
+            params![rev, rev_dev, id],
         )?;
+        self.tombstone("persons", &[id])?;
         self.conn.execute("DELETE FROM persons WHERE id = ?1", params![id])?;
         Ok(())
     }
@@ -252,10 +287,13 @@ impl Database {
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs() as i64;
+        let (rev, rev_dev) = self.stamp()?;
+        let guid = self.new_guid()?;
         self.conn.execute(
-            "INSERT INTO persons(name, created_at) VALUES (?1, ?2)
+            "INSERT INTO persons(name, created_at, guid, rev, rev_dev)
+             VALUES (?1, ?2, ?3, ?4, ?5)
              ON CONFLICT(name) DO NOTHING",
-            params![name, now],
+            params![name, now, guid, rev, rev_dev],
         )?;
         let id: i64 = self
             .conn
@@ -494,6 +532,10 @@ impl Database {
 
         let (centroid, best_id) = crate::embedding::centroid_and_nearest(&faces);
         let centroid_blob = centroid.as_deref().map(embedding_to_blob);
+        // Not stamped: both columns are derived from this device's face rows,
+        // and `representative_face_id` is a *local* rowid that would be
+        // meaningless on a peer. Each side recomputes them after applying a
+        // sync batch.
         self.conn.execute(
             "UPDATE persons SET centroid_embedding = ?1, representative_face_id = ?2 WHERE id = ?3",
             params![centroid_blob, best_id, person_id],

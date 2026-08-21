@@ -78,12 +78,28 @@ single binary; the backend is fixed at compile time.
 - **Singleton windows**: Each secondary window (`DetailWindow`, `ImportWindow`, `SettingsWindow`, `CollectionsWindow`) is held as `thread_local! { static X: RefCell<Option<T>> }`. Strong handle lives only there; all callbacks capture `slint::Weak`.
 - **Context struct + `wire_*` functions**: each window builds one context holding its shared handles (`AppCtx` in `lib.rs`, `ImportCtx` in `import.rs`, `NavState` in `detail.rs`) and passes it to one `wire_*` function per feature block instead of wiring every callback in one scope. The context holds the window as a `slint::Weak` only — callbacks clone fields out of it, never a strong handle. Startup call order is load-bearing (paging wired before the first `grid.load`, `grid::register` before any window that calls `request_reload`).
 - **Background workers**: AI tagger, face tagger, library scanner all follow the same spawn→loop→sleep→check-stop pattern.
+- **Sync stamping**: every row in `maple_db::SYNCED_TABLES` carries `guid`/`rev`/`rev_dev`.
+  Writers stamp *explicitly* via `Database::stamp()` — never via a trigger, since V17
+  removed the last `AFTER UPDATE ON images` trigger for exactly that cost. Writes to
+  machine-local columns (`status`, `path`, `raw_path`, `filename`) and to derived columns
+  (centroids, `representative_*_id`) deliberately do **not** stamp; each carries a comment
+  saying so. Deletes call `Database::tombstone(table, ids)` *before* the `DELETE`.
 - **Raw file support**: Only Fujifilm RAF currently. Always use `maple_import::loadable_image_bytes(path)` for loading images (handles raw preview extraction transparently). Check format with `maple_import::is_raw_format(path)`.
 
 ### Database
-- SQLite in WAL mode, schema versioned via `PRAGMA user_version` (currently v5).
+- SQLite in WAL mode, schema versioned via `PRAGMA user_version` (currently v18).
+- Migrations live in `maple-db/src/schema.rs` as append-only `if version < N` steps that
+  **replay history** — a fresh database runs every step in order, so a later step may
+  undo an earlier one (V17 drops the FTS table V2 creates). Add new steps at the end;
+  never edit an existing one.
+- `PRAGMA foreign_keys` is enabled explicitly in `Database::open`, so `ON DELETE CASCADE`
+  really cascades. Sync depends on this: one tombstone for a parent row propagates a
+  delete, and each device's own cascade clears that device's children.
 - One row per conceptual image; raw companions stored in `raw_path` column.
-- FTS5 table `image_fts` for full-text search across EXIF fields, AI descriptions, and person names.
+- Text search is `LIKE` across `images`, `ai_descriptions`, `persons` and
+  `image_exif_tags` (`text_from_where` in `lib.rs`). The V2 `image_fts` table was never
+  read and was dropped in V17 — its write triggers made every `images` insert ~7× more
+  expensive and fired on every bulk `status`/`stack_id` update.
 
 ## Key Directories
 

@@ -1,5 +1,6 @@
 //! Copy selected images to the destination directory.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use crate::path_template::{self, TemplateContext};
@@ -8,8 +9,14 @@ use crate::{is_raw_format, loadable_image_bytes, ExifDateTime};
 /// Result of a single file copy operation.
 #[derive(Debug, Clone)]
 pub enum CopyResult {
-    /// File was copied successfully. Contains the destination path.
-    Ok(PathBuf),
+    /// File was copied successfully.
+    ///
+    /// Carries `source` as well as `dest` so callers can correlate the two
+    /// without relying on positional alignment with the input slice — the
+    /// library DB records the *destination*, but everything the import UI
+    /// knows about a photo (its content hash, its raw companion) is keyed by
+    /// the source path it was scanned under.
+    Ok { source: PathBuf, dest: PathBuf },
     /// File copy failed. Contains the source path and error message.
     Failed { source: PathBuf, error: String },
 }
@@ -20,6 +27,23 @@ pub struct CopySummary {
     pub copied: usize,
     pub failed: usize,
     pub results: Vec<CopyResult>,
+}
+
+impl CopySummary {
+    /// Map every successfully copied source path to where it landed.
+    ///
+    /// Failed copies are absent, so a lookup miss means "this file never
+    /// made it to the destination" — which is exactly when the caller should
+    /// skip inserting a library row for it.
+    pub fn destination_map(&self) -> HashMap<PathBuf, PathBuf> {
+        self.results
+            .iter()
+            .filter_map(|r| match r {
+                CopyResult::Ok { source, dest } => Some((source.clone(), dest.clone())),
+                CopyResult::Failed { .. } => None,
+            })
+            .collect()
+    }
 }
 
 /// Copy the given source files into `destination`.
@@ -98,7 +122,10 @@ where
         match std::fs::copy(src, &dest_path) {
             Ok(_) => {
                 tracing::info!("Copied {} → {}", src.display(), dest_path.display());
-                results.push(CopyResult::Ok(dest_path));
+                results.push(CopyResult::Ok {
+                    source: src.clone(),
+                    dest: dest_path,
+                });
                 copied += 1;
             }
             Err(e) => {
@@ -273,6 +300,39 @@ mod tests {
             fs::read(dst_dir.path().join("photo_1.jpg")).unwrap(),
             b"original"
         );
+    }
+
+    #[test]
+    fn destination_map_pairs_each_source_with_where_it_landed() {
+        let src_dir = tempfile::tempdir().unwrap();
+        let dst_dir = tempfile::tempdir().unwrap();
+
+        // A raw + display pair, plus a name that collides in the destination
+        // so the mapping cannot be inferred from the filename alone.
+        fs::write(src_dir.path().join("photo.jpg"), b"display").unwrap();
+        fs::write(src_dir.path().join("photo.raf"), b"raw").unwrap();
+        fs::write(dst_dir.path().join("photo.jpg"), b"existing").unwrap();
+
+        let jpg = src_dir.path().join("photo.jpg");
+        let raf = src_dir.path().join("photo.raf");
+        let missing = PathBuf::from("/nonexistent/photo.jpg");
+
+        let sources = vec![jpg.clone(), raf.clone(), missing.clone()];
+        let summary =
+            copy_images(&sources, dst_dir.path(), "", "{original}", |_, _| {}).unwrap();
+
+        assert_eq!(summary.copied, 2);
+        assert_eq!(summary.failed, 1);
+
+        let map = summary.destination_map();
+        // The display file was renamed around the collision — the map has to
+        // report the suffixed name, not the source's basename.
+        assert_eq!(map.get(&jpg).unwrap(), &dst_dir.path().join("photo_1.jpg"));
+        assert_eq!(map.get(&raf).unwrap(), &dst_dir.path().join("photo.raf"));
+        // Failed copies are absent, so callers skip them rather than
+        // recording a library row for a file that isn't there.
+        assert!(!map.contains_key(&missing));
+        assert_eq!(map.len(), 2);
     }
 
     #[test]
