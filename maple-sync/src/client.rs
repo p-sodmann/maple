@@ -30,7 +30,8 @@ use crate::auth::SignedRequest;
 use crate::backoff::FailureKind;
 use crate::pairing::{ClaimRequest, ClaimResponse};
 use crate::protocol::{
-    route, ErrorBody, ErrorCode, Hello, PullRequest, PushResponse, PROTOCOL_VERSION,
+    route, ErrorBody, ErrorCode, Hello, PullRequest, PushResponse, MAX_ORIG_BYTES,
+    MAX_THUMB_BYTES, PROTOCOL_VERSION,
 };
 use crate::random::SharedRandom;
 use crate::server::Clock;
@@ -44,6 +45,26 @@ use crate::trust::PeerKey;
 /// notices. The `image_loader` watchdog uses 30 s for the same reason; sync
 /// batches are bigger, so this is longer.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// Ask the master to close the connection once it has answered.
+///
+/// `tiny_http` reads each accepted connection on a thread from a pool, and
+/// the task holding a keep-alive connection stays parked in `read()` waiting
+/// for a *second* request that a one-shot client never sends. The pool grows
+/// when every thread is busy, but a burst of connections arriving while one
+/// thread is still idle all queue behind that one thread — and it pins itself
+/// on the first of them. The rest are accepted and never parsed: the server's
+/// loop looks idle, the request bytes sit unread in the socket, and the
+/// caller waits out its whole timeout for a reply nobody is writing.
+///
+/// It is a race, so it is intermittent, and nothing hit it before P6 — one
+/// worker, one connection, every five minutes. A relay servant's grid opens
+/// one per tile and leaves them pooled afterwards, which is the shape that
+/// triggers it; it was reproducible against two running instances, showing up
+/// as three of six tiles blank until `ureq` gave up two minutes later.
+/// Closing after each response costs one handshake per request on a LAN and
+/// means no task ever parks on an idle socket.
+const CLOSE: (&str, &str) = ("connection", "close");
 
 /// A failed request, already sorted into "retry" or "stop".
 #[derive(Debug, Clone)]
@@ -148,6 +169,7 @@ impl SyncClient {
         let response = self
             .agent
             .get(&self.url(route::HELLO))
+            .header(CLOSE.0, CLOSE.1)
             .call()
             .map_err(to_failure)?;
         decode(response)
@@ -180,6 +202,7 @@ impl SyncClient {
         let response = self
             .agent
             .post(&self.url(route::PAIR_CLAIM))
+            .header(CLOSE.0, CLOSE.1)
             .content_type("application/json")
             .send(&body[..])
             .map_err(to_failure)?;
@@ -199,6 +222,78 @@ impl SyncClient {
     /// `POST /sync/push` — merge our batch into the master.
     pub fn push(&self, key: &PeerKey, batch: &SyncBatch) -> Result<PushResponse, SyncFailure> {
         self.signed_post(key, route::PUSH, batch)
+    }
+
+    /// `GET /blob/thumb/{hash}` — a WebP thumbnail for one photo.
+    ///
+    /// Sized and encoded by the *master*, not by this device's thumbnail
+    /// settings: it is the master that holds the file, and asking it to
+    /// re-render per servant preference would trade a visible improvement
+    /// nobody asked for against a cache hit on every request.
+    pub fn blob_thumb(&self, key: &PeerKey, hash: &[u8; 32]) -> Result<Vec<u8>, SyncFailure> {
+        let path = route::blob(route::BLOB_THUMB, hash, false);
+        self.signed_get(key, &path, MAX_THUMB_BYTES)
+    }
+
+    /// `GET /blob/orig/{hash}[?raw=1]` — the original file's bytes.
+    pub fn blob_orig(
+        &self,
+        key: &PeerKey,
+        hash: &[u8; 32],
+        raw: bool,
+    ) -> Result<Vec<u8>, SyncFailure> {
+        let path = route::blob(route::BLOB_ORIG, hash, raw);
+        self.signed_get(key, &path, MAX_ORIG_BYTES)
+    }
+
+    /// A signed `GET` whose response is bytes rather than JSON.
+    ///
+    /// A `GET` carries no body, so the MAC covers method and path only —
+    /// which is exactly why `path` here must be the string that also goes
+    /// into the URL, query string and all. `route::blob` builds both from one
+    /// place for that reason.
+    fn signed_get(
+        &self,
+        key: &PeerKey,
+        path: &str,
+        limit: u64,
+    ) -> Result<Vec<u8>, SyncFailure> {
+        let credential = SignedRequest::sign_with(
+            key,
+            self.device_id.clone(),
+            "GET",
+            path,
+            &[],
+            (self.clock)(),
+            &self.rng,
+        )
+        .map_err(|e| SyncFailure::transport(format!("could not sign request: {e}")))?;
+
+        let mut response = self
+            .agent
+            .get(&self.url(path))
+            .header("Authorization", &credential.header())
+            .header(CLOSE.0, CLOSE.1)
+            .call()
+            .map_err(to_failure)?;
+
+        let status = response.status().as_u16();
+        if !(200..300).contains(&status) {
+            // The error body is JSON and small; read it as text so `classify`
+            // can find the code that says whether this is worth retrying.
+            let text = response
+                .body_mut()
+                .read_to_string()
+                .unwrap_or_else(|e| format!("<unreadable error body: {e}>"));
+            return Err(classify(status, &text));
+        }
+
+        response
+            .body_mut()
+            .with_config()
+            .limit(limit)
+            .read_to_vec()
+            .map_err(|e| SyncFailure::transport(format!("could not read blob: {e}")))
     }
 
     fn signed_post<B: serde::Serialize, R: serde::de::DeserializeOwned>(
@@ -229,6 +324,7 @@ impl SyncClient {
             .agent
             .post(&self.url(path))
             .header("Authorization", &credential.header())
+            .header(CLOSE.0, CLOSE.1)
             .content_type("application/json")
             .send(&body[..])
             .map_err(to_failure)?;

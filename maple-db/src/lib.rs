@@ -129,6 +129,42 @@ impl ImageStatus {
     }
 }
 
+/// Whether this installation holds the photo's bytes, or only knows about it.
+///
+/// Machine-local, like [`ImageStatus`]: the same photo is `Local` on the
+/// master and `Remote` on a relay servant, so the column is never replicated
+/// (see V20 in `schema.rs`). A `Remote` row is `status = 'present'` — it is a
+/// perfectly good library entry that appears in the grid; what makes it
+/// remote is only where its pixels have to be fetched from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Locality {
+    Local,
+    Remote,
+}
+
+impl Locality {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Locality::Local => "local",
+            Locality::Remote => "remote",
+        }
+    }
+
+    /// Anything unrecognised reads as `Local`, matching the column default:
+    /// treating an unknown value as remote would send the UI over the network
+    /// for a file that is sitting on this disk.
+    fn from_str(s: &str) -> Self {
+        match s {
+            "remote" => Locality::Remote,
+            _ => Locality::Local,
+        }
+    }
+
+    pub fn is_remote(&self) -> bool {
+        matches!(self, Locality::Remote)
+    }
+}
+
 // ── Records ──────────────────────────────────────────────────────
 
 /// Minimal record used by the scanner and import code.
@@ -179,6 +215,12 @@ pub struct LibraryImage {
     /// How this image matched the active search query.  `None` for plain
     /// (unfiltered) listings and keyword-only results without semantic search.
     pub search_hit: Option<SearchHit>,
+    /// Whether `path` can actually be opened here, or the bytes have to be
+    /// fetched from `origin_device` (see [`Locality`]).
+    pub locality: Locality,
+    /// Device id this row arrived from, for a `Remote` row. `None` for
+    /// anything this installation imported itself.
+    pub origin_device: Option<String>,
 }
 
 // ── Database ─────────────────────────────────────────────────────
@@ -1175,10 +1217,25 @@ impl Database {
         Ok(records)
     }
 
-    /// Return all `(path, status, hash)` triples — used by the scanner for
-    /// reconciliation and thumbnail cache eviction.
+    /// Return all `(path, status, hash)` triples for files this device
+    /// actually holds — used by the scanner for reconciliation and thumbnail
+    /// cache eviction.
+    ///
+    /// Remote rows are excluded, and that filter is load-bearing rather than
+    /// tidy: their `path` is the *origin* device's, so the scanner would find
+    /// nothing on disk for it, mark the row missing and evict its thumbnail
+    /// on the very next 60-second pass — emptying a relay servant's grid a
+    /// minute after it filled.
+    ///
+    /// Leaving them out of the caller's "already known" set is harmless: for
+    /// a remote path to collide with a file under this machine's library dir
+    /// the two installations would have to share a directory layout *and* a
+    /// user, and `insert_image_with_raw` is `INSERT OR IGNORE`, so the worst
+    /// case is a no-op.
     pub fn all_paths(&self) -> anyhow::Result<Vec<ImagePathStatusRow>> {
-        let mut stmt = self.conn.prepare("SELECT path, status, hash FROM images")?;
+        let mut stmt = self
+            .conn
+            .prepare("SELECT path, status, hash FROM images WHERE locality = 'local'")?;
         let rows = stmt
             .query_map([], |row| {
                 let path: String = row.get(0)?;
@@ -1240,12 +1297,42 @@ impl Database {
                     CASE WHEN i.stack_id IS NOT NULL THEN
                         (SELECT COUNT(*) FROM images sc
                          WHERE sc.stack_id = i.stack_id AND sc.status = 'present')
-                    ELSE NULL END AS stack_size
+                    ELSE NULL END AS stack_size,
+                    i.locality, i.origin_device
              FROM images i
              WHERE i.id = ?1",
         )?;
         let mut rows = stmt.query_map(params![id], row_to_library_image)?;
         Ok(rows.next().transpose()?)
+    }
+
+    /// The file a peer's `/blob/...` request should be served from.
+    ///
+    /// `raw` picks the companion raw file instead of the display image, which
+    /// is the only thing `?raw=1` changes.
+    ///
+    /// `idx_images_hash` is deliberately **not** unique — a library may
+    /// legitimately hold the same photo twice — so several rows can match.
+    /// Any of them serves identical bytes by definition (the hash is of the
+    /// content), so the lowest id is picked purely to make the choice
+    /// deterministic. Rows that are remote or missing are skipped: their
+    /// `path` names a file this machine cannot open.
+    pub fn blob_path(&self, hash: &[u8; 32], raw: bool) -> anyhow::Result<Option<PathBuf>> {
+        let column = if raw { "raw_path" } else { "path" };
+        let found: Option<Option<String>> = self
+            .conn
+            .query_row(
+                &format!(
+                    "SELECT {column} FROM images
+                     WHERE hash = ?1 AND locality = 'local' AND status = 'present'
+                       AND {column} IS NOT NULL
+                     ORDER BY id LIMIT 1"
+                ),
+                params![hash.as_slice()],
+                |r| r.get(0),
+            )
+            .optional()?;
+        Ok(found.flatten().map(path_from_db))
     }
 
     /// Total number of records in the library.
@@ -1497,7 +1584,8 @@ const IMAGE_COLUMNS: &str = "i.id, i.path, i.added_at, i.status,
             CASE WHEN i.stack_id IS NOT NULL THEN
                 (SELECT COUNT(*) FROM images m
                  WHERE m.stack_id = i.stack_id AND m.status = 'present')
-            ELSE NULL END";
+            ELSE NULL END,
+            i.locality, i.origin_device";
 
 /// `AND` clauses (and their bound ids) for the optional collection/person
 /// filters, shared by the plain and text listings.
@@ -1630,6 +1718,8 @@ fn row_to_library_image(row: &rusqlite::Row<'_>) -> rusqlite::Result<LibraryImag
     let hash: Option<[u8; 32]> = hash_bytes.try_into().ok();
     let stack_id: Option<i64> = row.get(17)?;
     let stack_size: Option<i64> = row.get(18)?;
+    let locality: String = row.get(19)?;
+    let origin_device: Option<String> = row.get(20)?;
     Ok(LibraryImage {
         id: row.get(0)?,
         path: path_from_db(row.get::<_, String>(1)?),
@@ -1641,6 +1731,8 @@ fn row_to_library_image(row: &rusqlite::Row<'_>) -> rusqlite::Result<LibraryImag
         stack_id,
         stack_size: stack_size.map(|n| n as usize),
         search_hit: None,
+        locality: Locality::from_str(&locality),
+        origin_device,
     })
 }
 

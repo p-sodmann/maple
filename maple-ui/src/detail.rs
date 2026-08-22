@@ -662,7 +662,25 @@ fn show_record(window: &DetailWindow, nav: &NavState) {
     let face_count = nav.faces.borrow().len();
     window.set_image_info_rows(build_info_rows(&rec, db, face_count, false));
 
-    image_loader::load_full_image(rec.path.clone(), window.as_weak());
+    image_loader::load_full_image(full_image_source(&rec), window.as_weak());
+}
+
+/// Where this record's full-resolution pixels come from.
+///
+/// A remote row's `path` is the *master's* path and must never be opened —
+/// the file behind it does not exist on this machine. Falling back to disk
+/// when the hash is missing is deliberate: that combination should not happen
+/// (every row carries a content hash), and a failed open with a real path in
+/// the message is easier to diagnose than a silent blank.
+fn full_image_source(rec: &LibraryImage) -> image_loader::Source {
+    match (rec.locality.is_remote(), rec.hash) {
+        (true, Some(hash)) => image_loader::Source::Master {
+            blobs: crate::remote::blobs(),
+            hash,
+            origin_path: rec.path.clone(),
+        },
+        _ => image_loader::Source::Disk(rec.path.clone()),
+    }
 }
 
 /// Rebuild just the info-panel rows for the currently shown record, e.g.
@@ -682,4 +700,50 @@ fn load_chips(db: &Arc<Mutex<maple_db::Database>>, image_id: i64) -> ModelRc<Col
 
 fn chips_model(chips: Vec<CollectionChip>) -> ModelRc<CollectionChip> {
     ModelRc::from(Rc::new(VecModel::from(chips)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use maple_db::{ImageStatus, Locality};
+
+    fn record(locality: Locality, hash: Option<[u8; 32]>) -> LibraryImage {
+        LibraryImage {
+            id: 1,
+            path: "/workstation/photos/a.jpg".into(),
+            raw_path: None,
+            added_at: 0,
+            status: ImageStatus::Present,
+            meta: maple_db::ImageMetadata::default(),
+            hash,
+            stack_id: None,
+            stack_size: None,
+            search_hit: None,
+            locality,
+            origin_device: None,
+        }
+    }
+
+    #[test]
+    fn a_remote_record_is_loaded_from_the_master_not_from_its_path() {
+        // The path in a remote row belongs to the *other* machine. Opening it
+        // would either fail or, worse, show whatever happens to sit there.
+        let source = full_image_source(&record(Locality::Remote, Some([7; 32])));
+        assert!(matches!(source, image_loader::Source::Master { .. }));
+    }
+
+    #[test]
+    fn a_local_record_still_comes_off_the_disk() {
+        let source = full_image_source(&record(Locality::Local, Some([7; 32])));
+        assert!(matches!(source, image_loader::Source::Disk(_)));
+    }
+
+    #[test]
+    fn a_remote_record_with_no_hash_has_nothing_to_fetch_with() {
+        // The hash *is* the blob key, so there is no remote request to make.
+        // Falling back to the path fails with a real filename in the message,
+        // which is easier to diagnose than a silent blank pane.
+        let source = full_image_source(&record(Locality::Remote, None));
+        assert!(matches!(source, image_loader::Source::Disk(_)));
+    }
 }

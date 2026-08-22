@@ -422,6 +422,93 @@ fn a_file_missing_on_one_device_stays_present_on_the_other() {
     );
 }
 
+/// §3.5: a photo that arrives from a peer is a real library entry whose bytes
+/// happen to be elsewhere.
+#[test]
+fn an_arriving_photo_lands_present_and_remote() {
+    let mut p = Pair::new();
+    add_photo(&p.a, "a.jpg", 1);
+
+    let batch = p.a.collect_changes(0, DEFAULT_MAX_REVS).unwrap();
+    p.b.apply_batch_from(&batch, Some(p.a.device_id())).unwrap();
+    p.b_seen = batch.next_rev;
+
+    let (status, locality, origin): (String, String, Option<String>) = p
+        .b
+        .conn
+        .query_row("SELECT status, locality, origin_device FROM images", [], |r| {
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+        })
+        .unwrap();
+
+    // `present` is what puts it in the grid — before V20 this landed
+    // `missing`, which hid every relayed photo.
+    assert_eq!(status, "present");
+    assert_eq!(locality, "remote");
+    assert_eq!(origin.as_deref(), Some(p.a.device_id()));
+}
+
+/// The other half: if this device already holds the file, the row it merges
+/// into keeps pointing at the local copy. Otherwise a servant in *full* mode
+/// would be told its own photos live somewhere else.
+#[test]
+fn a_photo_this_device_already_holds_stays_local() {
+    let mut p = Pair::new();
+    add_photo(&p.a, "a.jpg", 1);
+    // Same content hash, different path — the identity-reconciliation case.
+    p.b.insert_image(&PathBuf::from("/laptop/a.jpg"), &hash(1), 1024)
+        .unwrap();
+
+    let batch = p.a.collect_changes(0, DEFAULT_MAX_REVS).unwrap();
+    let report = p.b.apply_batch_from(&batch, Some(p.a.device_id())).unwrap();
+    p.b_seen = batch.next_rev;
+    assert_eq!(report.unified, 1, "the two rows are the same photo");
+
+    let (locality, origin, count): (String, Option<String>, i64) = p
+        .b
+        .conn
+        .query_row(
+            "SELECT locality, origin_device, (SELECT COUNT(*) FROM images) FROM images",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(count, 1, "no duplicate row");
+    assert_eq!(locality, "local", "the file really is on this disk");
+    assert_eq!(origin, None);
+}
+
+/// `locality` is machine-local, so it must not ride back to the peer and must
+/// not be flattened by a later update from it.
+#[test]
+fn locality_does_not_replicate() {
+    let mut p = Pair::new();
+    let a_id = add_photo(&p.a, "a.jpg", 1);
+
+    let batch = p.a.collect_changes(0, DEFAULT_MAX_REVS).unwrap();
+    p.b.apply_batch_from(&batch, Some(p.a.device_id())).unwrap();
+    p.b_seen = batch.next_rev;
+
+    // A later edit on A updates B's row without touching where its bytes live.
+    p.a.update_image_hash_and_orientation(a_id, &hash(9), 6).unwrap();
+    p.converge();
+
+    let b_locality: String = p
+        .b
+        .conn
+        .query_row("SELECT locality FROM images", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(b_locality, "remote");
+
+    // And A never learned about B's copy at all.
+    let a_locality: String = p
+        .a
+        .conn
+        .query_row("SELECT locality FROM images", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(a_locality, "local");
+}
+
 #[test]
 fn a_local_path_is_never_overwritten_by_a_peers_path() {
     let mut p = Pair::new();

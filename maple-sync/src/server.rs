@@ -2,18 +2,34 @@
 //!
 //! One blocking `tiny_http` server on one background thread — no tokio, no
 //! async, matching the architecture the rest of the workspace commits to.
-//! Concurrency is not the point here: a master serves a handful of servants
-//! that poll every few minutes, and every route ends up holding the database
-//! mutex anyway.
+//! Requests are handled one at a time: a master serves a handful of servants,
+//! and every route ends up holding the database mutex anyway.
+//!
+//! Serving serially is a choice; *accepting* serially is not. `tiny_http`
+//! reads each connection on a thread from a pool, and a task holding a
+//! keep-alive connection parks there waiting for a second request that a
+//! one-shot client never sends. A burst of connections arriving while one
+//! thread is still idle queues behind it, and it pins itself on the first —
+//! leaving the rest accepted and never parsed, with their callers waiting out
+//! a timeout on requests this loop never sees. The fix has to be on the
+//! caller: [`crate::client`] asks for `Connection: close`, so no task ever
+//! parks. Anything else pointed at this listener has to do the same.
 //!
 //! # Routes
 //!
 //! ```text
-//! GET  /sync/hello    unsigned — reachability probe (see `protocol::Hello`)
-//! POST /pair/claim    unsigned — the §2.1 handshake
-//! POST /sync/pull     signed   — "everything stamped above my watermark"
-//! POST /sync/push     signed   — merge the caller's batch
+//! GET  /sync/hello         unsigned — reachability probe (`protocol::Hello`)
+//! POST /pair/claim         unsigned — the §2.1 handshake
+//! POST /sync/pull          signed   — "everything stamped above my watermark"
+//! POST /sync/push          signed   — merge the caller's batch
+//! GET  /blob/thumb/{hash}  signed   — WebP thumbnail, rendered on a miss
+//! GET  /blob/orig/{hash}   signed   — the original file, streamed
 //! ```
+//!
+//! The blob routes are what make **relay** possible: a servant that stores no
+//! originals still renders a grid and a detail view by fetching them here.
+//! They are signed like everything else — an unpaired machine on the LAN must
+//! not be able to read the library one photo at a time.
 //!
 //! # What "signed" costs, in order
 //!
@@ -36,11 +52,12 @@
 //! established for the handshake.
 
 use std::net::SocketAddr;
+use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use maple_db::{Database, SyncBatch};
+use maple_db::{Database, SyncBatch, ThumbnailCache};
 use maple_state::{PeerMode, SyncRole};
 
 use crate::auth::{NonceRing, SignedRequest};
@@ -56,6 +73,19 @@ use crate::trust::{TrustStore, TrustedPeer};
 
 /// Wall-clock source, injected so tests can pin it.
 pub type Clock = Arc<dyn Fn() -> i64 + Send + Sync>;
+
+/// Renders a thumbnail for a file on disk, as WebP bytes.
+///
+/// Injected rather than called directly, for a structural reason: the codec
+/// lives in `maple_ui::thumbnail`, and `maple-ui` depends on *this* crate, so
+/// the arrow cannot be turned round. The alternatives were to move thumbnail
+/// rendering down into `maple-db`, or to serve only what the master happens
+/// to have cached and 404 the rest — the second would make a servant's grid
+/// depend on what the master's own user had recently scrolled past. Injection
+/// matches how [`Clock`] and [`SharedRandom`] already arrive, keeps image
+/// decoding out of a transport crate, and the size and quality are the
+/// caller's settings baked into the closure.
+pub type ThumbRenderer = Arc<dyn Fn(&Path) -> anyhow::Result<Vec<u8>> + Send + Sync>;
 
 /// How long the accept loop blocks before re-checking the stop flag.
 ///
@@ -100,6 +130,9 @@ pub struct ServerDeps {
     pub status: StatusCell,
     pub clock: Clock,
     pub rng: SharedRandom,
+    /// The master's own thumbnail store, consulted before rendering anything.
+    pub thumbs: Arc<ThumbnailCache>,
+    pub render_thumb: ThumbRenderer,
 }
 
 /// Everything a request handler needs.
@@ -115,6 +148,8 @@ struct Ctx {
     status: StatusCell,
     nonces: Mutex<NonceRing>,
     config: ServerConfig,
+    thumbs: Arc<ThumbnailCache>,
+    render_thumb: ThumbRenderer,
 }
 
 /// A running master listener. Dropping it stops the thread.
@@ -146,6 +181,8 @@ impl SyncServer {
             status: deps.status,
             nonces: Mutex::new(NonceRing::new()),
             config,
+            thumbs: deps.thumbs,
+            render_thumb: deps.render_thumb,
         });
 
         let stop = Arc::new(AtomicBool::new(false));
@@ -226,6 +263,30 @@ impl Drop for SyncServer {
 
 // ── Dispatch ────────────────────────────────────────────────────
 
+/// What a handler produced.
+///
+/// The sync routes answer in JSON; the blob routes answer in bytes, and an
+/// original can be a 60 MB raw file. `File` keeps that one streaming from
+/// disk rather than buffering the whole photo in the master's memory just to
+/// hand it to the socket — [`MAX_BODY_BYTES`] bounds what a *caller* can make
+/// the server allocate, and serving blobs must not reintroduce the same
+/// exposure from the other direction.
+enum Payload {
+    Json(String),
+    Bytes {
+        data: Vec<u8>,
+        content_type: &'static str,
+    },
+    File {
+        file: std::fs::File,
+        len: u64,
+        content_type: &'static str,
+    },
+}
+
+/// One response type for all of them, so `handle` has a single exit.
+type Reply = tiny_http::Response<Box<dyn std::io::Read + Send + 'static>>;
+
 fn handle(ctx: &Ctx, mut request: tiny_http::Request) {
     let method = request.method().as_str().to_owned();
     // Signed exactly as sent, query string included, so a route that grows
@@ -238,6 +299,18 @@ fn handle(ctx: &Ctx, mut request: tiny_http::Request) {
         ("POST", route::PAIR_CLAIM) => read_body(&mut request).and_then(|body| claim(ctx, &body)),
         ("POST", route::PULL) => signed(ctx, &mut request, &method, &url, pull),
         ("POST", route::PUSH) => signed(ctx, &mut request, &method, &url, push),
+        ("GET", p) if p.starts_with(route::BLOB_THUMB) => {
+            let p = p.to_owned();
+            signed(ctx, &mut request, &method, &url, move |ctx, _dev, _body| {
+                blob_thumb(ctx, &p)
+            })
+        }
+        ("GET", p) if p.starts_with(route::BLOB_ORIG) => {
+            let (p, raw) = (p.to_owned(), wants_raw(&url));
+            signed(ctx, &mut request, &method, &url, move |ctx, _dev, _body| {
+                blob_orig(ctx, &p, raw)
+            })
+        }
         _ => Err(ErrorBody::new(
             ErrorCode::BadRequest,
             format!("no route for {method} {path}"),
@@ -245,7 +318,7 @@ fn handle(ctx: &Ctx, mut request: tiny_http::Request) {
     };
 
     let response = match result {
-        Ok(json) => json_response(200, &json),
+        Ok(payload) => ok_response(payload),
         Err(error) => {
             tracing::debug!("sync server: {method} {path} → {} ({})", error.code, error.message);
             let body = serde_json::to_string(&error)
@@ -258,6 +331,17 @@ fn handle(ctx: &Ctx, mut request: tiny_http::Request) {
     }
 }
 
+/// `?raw=1` on a `/blob/orig/` URL asks for the companion raw file.
+///
+/// Matched on the exact token rather than a substring: the query is part of
+/// the signed path, so a caller that wrote it differently has already failed
+/// verification by the time this runs.
+fn wants_raw(url: &str) -> bool {
+    url.split_once('?')
+        .map(|(_, query)| query.split('&').any(|p| p == "raw=1"))
+        .unwrap_or(false)
+}
+
 /// Read the body, verify the signature over it, then run `f`.
 fn signed<F>(
     ctx: &Ctx,
@@ -265,9 +349,9 @@ fn signed<F>(
     method: &str,
     url: &str,
     f: F,
-) -> Result<String, ErrorBody>
+) -> Result<Payload, ErrorBody>
 where
-    F: FnOnce(&Ctx, &str, &[u8]) -> Result<String, ErrorBody>,
+    F: FnOnce(&Ctx, &str, &[u8]) -> Result<Payload, ErrorBody>,
 {
     let header = request
         .headers()
@@ -311,7 +395,7 @@ where
 
 // ── Handlers ────────────────────────────────────────────────────
 
-fn hello(ctx: &Ctx) -> Result<String, ErrorBody> {
+fn hello(ctx: &Ctx) -> Result<Payload, ErrorBody> {
     let db = lock(&ctx.db);
     let hello = Hello {
         device_id: db.device_id().to_owned(),
@@ -323,7 +407,7 @@ fn hello(ctx: &Ctx) -> Result<String, ErrorBody> {
     encode(&hello)
 }
 
-fn claim(ctx: &Ctx, body: &[u8]) -> Result<String, ErrorBody> {
+fn claim(ctx: &Ctx, body: &[u8]) -> Result<Payload, ErrorBody> {
     let request: ClaimRequest = parse(body)?;
     let now = (ctx.clock)();
 
@@ -381,7 +465,7 @@ fn persist_pairing(ctx: &Ctx, request: &ClaimRequest) -> Result<(), ErrorBody> {
     Ok(())
 }
 
-fn pull(ctx: &Ctx, device_id: &str, body: &[u8]) -> Result<String, ErrorBody> {
+fn pull(ctx: &Ctx, device_id: &str, body: &[u8]) -> Result<Payload, ErrorBody> {
     let request: PullRequest = parse(body)?;
     let max_revs = if request.max_revs == 0 {
         ctx.config.max_revs
@@ -405,10 +489,10 @@ fn pull(ctx: &Ctx, device_id: &str, body: &[u8]) -> Result<String, ErrorBody> {
     encode(&batch)
 }
 
-fn push(ctx: &Ctx, device_id: &str, body: &[u8]) -> Result<String, ErrorBody> {
+fn push(ctx: &Ctx, device_id: &str, body: &[u8]) -> Result<Payload, ErrorBody> {
     let batch: SyncBatch = parse(body)?;
     let db = lock(&ctx.db);
-    let report = apply_and_refresh(&db, &batch).map_err(internal)?;
+    let report = apply_and_refresh(&db, &batch, device_id).map_err(internal)?;
 
     if may_advance(&report) {
         if let Err(e) = db.set_sync_peer_pull_rev(device_id, batch.next_rev) {
@@ -424,6 +508,101 @@ fn push(ctx: &Ctx, device_id: &str, body: &[u8]) -> Result<String, ErrorBody> {
         deferred: report.deferred,
         acked_rev: batch.next_rev,
     })
+}
+
+/// `GET /blob/thumb/{hash}` — the thumbnail for a photo, by content hash.
+///
+/// Cache first, render on a miss, and store what was rendered: a servant
+/// scrolling the master's library warms the master's own cache, which is the
+/// same work the master's grid would have done later anyway.
+fn blob_thumb(ctx: &Ctx, path: &str) -> Result<Payload, ErrorBody> {
+    let hash = blob_hash(path, route::BLOB_THUMB)?;
+
+    if let Some(webp) = ctx.thumbs.get(&hash) {
+        return Ok(webp_payload(webp));
+    }
+
+    // The database lock is released before rendering: decoding a 40-megapixel
+    // JPEG takes long enough that holding it would stall every other route.
+    let file = {
+        let db = lock(&ctx.db);
+        db.blob_path(&hash, false).map_err(internal)?
+    };
+    let Some(file) = file else {
+        return Err(missing(&hash));
+    };
+
+    let webp = (ctx.render_thumb)(&file).map_err(|e| {
+        // Not `internal`: the row exists and names a file this master cannot
+        // decode (deleted under it, or a format it has no reader for). That is
+        // a permanent property of this hash, so the caller should stop asking.
+        tracing::warn!("sync server: could not render {}: {e}", file.display());
+        ErrorBody::new(ErrorCode::NotFound, "could not render a thumbnail for that hash")
+    })?;
+
+    if let Err(e) = ctx.thumbs.insert(&hash, &webp) {
+        tracing::warn!("sync server: thumbnail cache write failed: {e}");
+    }
+    Ok(webp_payload(webp))
+}
+
+/// `GET /blob/orig/{hash}[?raw=1]` — the original file's bytes, streamed.
+///
+/// Nothing is read into memory here: the file goes straight from disk to the
+/// socket, so serving a raw file costs the master a file handle rather than
+/// its size in RAM.
+fn blob_orig(ctx: &Ctx, path: &str, raw: bool) -> Result<Payload, ErrorBody> {
+    let hash = blob_hash(path, route::BLOB_ORIG)?;
+
+    let found = {
+        let db = lock(&ctx.db);
+        db.blob_path(&hash, raw).map_err(internal)?
+    };
+    let Some(found) = found else {
+        return Err(missing(&hash));
+    };
+
+    let file = std::fs::File::open(&found).map_err(|e| {
+        // The row says the file is here and it is not — the scanner will mark
+        // it missing within the minute. Until then, `not_found` is both true
+        // and the answer that keeps the servant's link alive.
+        tracing::warn!("sync server: could not open {}: {e}", found.display());
+        ErrorBody::new(ErrorCode::NotFound, "that blob is no longer readable here")
+    })?;
+    let len = file.metadata().map_err(internal)?.len();
+
+    Ok(Payload::File {
+        file,
+        len,
+        content_type: "application/octet-stream",
+    })
+}
+
+fn blob_hash(path: &str, prefix: &str) -> Result<[u8; 32], ErrorBody> {
+    route::blob_hash(path, prefix).ok_or_else(|| {
+        // A malformed hash is the caller's bug, not a miss: answering 404
+        // would have it retry a URL that can never work.
+        ErrorBody::new(ErrorCode::BadRequest, "blob path is not a 64-character hex hash")
+    })
+}
+
+/// Deliberately says nothing about *why* the hash is unknown — whether the
+/// library never had it or the row is remote here too is not the caller's
+/// business, and both mean the same thing to it.
+fn missing(hash: &[u8; 32]) -> ErrorBody {
+    tracing::debug!("sync server: no local blob for {}", hex(hash));
+    ErrorBody::new(ErrorCode::NotFound, "no blob with that hash here")
+}
+
+fn webp_payload(data: Vec<u8>) -> Payload {
+    Payload::Bytes {
+        data,
+        content_type: "image/webp",
+    }
+}
+
+fn hex(hash: &[u8; 32]) -> String {
+    hash.iter().map(|b| format!("{b:02x}")).collect()
 }
 
 /// Re-derive the pill from what the listener has actually seen.
@@ -499,8 +678,10 @@ fn parse<T: serde::de::DeserializeOwned>(body: &[u8]) -> Result<T, ErrorBody> {
         .map_err(|e| ErrorBody::new(ErrorCode::BadRequest, format!("could not parse body: {e}")))
 }
 
-fn encode<T: serde::Serialize>(value: &T) -> Result<String, ErrorBody> {
-    serde_json::to_string(value).map_err(internal)
+fn encode<T: serde::Serialize>(value: &T) -> Result<Payload, ErrorBody> {
+    serde_json::to_string(value)
+        .map(Payload::Json)
+        .map_err(internal)
 }
 
 /// Turn any internal failure into a retryable error, logging the cause.
@@ -512,13 +693,41 @@ fn internal(error: impl std::fmt::Display) -> ErrorBody {
     ErrorBody::new(ErrorCode::Internal, "the master could not complete the request")
 }
 
-fn json_response(status: u16, body: &str) -> tiny_http::Response<std::io::Cursor<Vec<u8>>> {
-    tiny_http::Response::from_string(body)
-        .with_status_code(status)
-        .with_header(
-            tiny_http::Header::from_bytes(&b"Content-Type"[..], &b"application/json"[..])
-                .expect("static header is well-formed"),
-        )
+fn json_response(status: u16, body: &str) -> Reply {
+    let bytes = body.as_bytes().to_vec();
+    let len = bytes.len() as u64;
+    reply(status, "application/json", len, Box::new(std::io::Cursor::new(bytes)))
+}
+
+fn ok_response(payload: Payload) -> Reply {
+    match payload {
+        Payload::Json(body) => json_response(200, &body),
+        Payload::Bytes { data, content_type } => {
+            let len = data.len() as u64;
+            reply(200, content_type, len, Box::new(std::io::Cursor::new(data)))
+        }
+        Payload::File { file, len, content_type } => {
+            reply(200, content_type, len, Box::new(file))
+        }
+    }
+}
+
+fn reply(
+    status: u16,
+    content_type: &str,
+    len: u64,
+    body: Box<dyn std::io::Read + Send + 'static>,
+) -> Reply {
+    let header =
+        tiny_http::Header::from_bytes(&b"Content-Type"[..], content_type.as_bytes())
+            .expect("content types here are ASCII literals");
+    tiny_http::Response::new(
+        tiny_http::StatusCode(status),
+        vec![header],
+        body,
+        Some(len as usize),
+        None,
+    )
 }
 
 /// Recover from a poisoned lock rather than propagating the panic.

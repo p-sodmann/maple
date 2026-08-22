@@ -76,6 +76,8 @@ fn seeded(seed: u64) -> SharedRandom {
 /// One installation: its database, its key store, and the tempdir both live
 /// in. The tempdir is held so it outlives them.
 struct Install {
+    /// Held so the database, key store and any cache inside it outlive the
+    /// test; also the root a test writes real photo files into.
     _dir: tempfile::TempDir,
     db: Arc<Mutex<Database>>,
     trust: Arc<Mutex<TrustStore>>,
@@ -113,6 +115,12 @@ struct Master {
     slot: PairingSlot,
     server: SyncServer,
     status: maple_sync::StatusCell,
+    /// The master's thumbnail store, kept so a test can assert what
+    /// `/blob/thumb` put in it.
+    thumbs: Arc<maple_db::ThumbnailCache>,
+    /// How many times the injected renderer actually ran — the difference
+    /// between "the master rendered this" and "the cache already had it".
+    renders: Arc<AtomicI64>,
 }
 
 impl Master {
@@ -124,6 +132,24 @@ impl Master {
             .expect("role");
         let slot = PairingSlot::new();
         let status = maple_sync::SyncStatus::cell(maple_state::SyncRole::Master);
+        let thumbs = Arc::new(
+            maple_db::ThumbnailCache::open(&install._dir.path().join("thumbs"))
+                .expect("thumbnail cache"),
+        );
+        // Stands in for `maple_ui::thumbnail::generate_thumbnail`, which this
+        // crate cannot call: `maple-ui` depends on `maple-sync`, not the other
+        // way round. What matters here is the plumbing — that a miss reaches a
+        // renderer at all, and that its output is what comes back over the
+        // wire — so the bytes are a marker rather than a real WebP.
+        let renders = Arc::new(AtomicI64::new(0));
+        let render_thumb: maple_sync::ThumbRenderer = {
+            let renders = renders.clone();
+            Arc::new(move |path: &std::path::Path| {
+                renders.fetch_add(1, Ordering::Relaxed);
+                let bytes = std::fs::read(path)?;
+                Ok(format!("THUMB:{}", bytes.len()).into_bytes())
+            })
+        };
         let server = SyncServer::spawn(
             maple_sync::server::ServerConfig {
                 listen_addr: "127.0.0.1:0".into(),
@@ -137,6 +163,8 @@ impl Master {
                 status: status.clone(),
                 clock: clock.handle(),
                 rng,
+                thumbs: thumbs.clone(),
+                render_thumb,
             },
         )
         .expect("bind loopback");
@@ -145,6 +173,8 @@ impl Master {
             slot,
             server,
             status,
+            thumbs,
+            renders,
         }
     }
 
@@ -233,6 +263,43 @@ fn raw_post(
     let status = response.status().as_u16();
     let text = response.body_mut().read_to_string().expect("read body");
     (status, text)
+}
+
+/// A `GET` built by hand, so a test can send a blob request with a header of
+/// its choosing — or none at all.
+fn raw_get(address: &str, path: &str, header: Option<&str>) -> (u16, Vec<u8>) {
+    let agent: ureq::Agent = ureq::Agent::config_builder()
+        .http_status_as_error(false)
+        .timeout_global(Some(Duration::from_secs(10)))
+        .build()
+        .into();
+    let mut request = agent.get(format!("http://{address}{path}"));
+    if let Some(header) = header {
+        request = request.header("Authorization", header);
+    }
+    let mut response = request.call().expect("request reached the server");
+    let status = response.status().as_u16();
+    let body = response
+        .body_mut()
+        .with_config()
+        .limit(8 * 1024 * 1024)
+        .read_to_vec()
+        .expect("read body");
+    (status, body)
+}
+
+/// Put a real file in the master's library and a row pointing at it, so a
+/// blob request has something to serve. Returns its content hash.
+fn master_photo(master: &Master, name: &str, contents: &[u8]) -> [u8; 32] {
+    let path = master.install._dir.path().join(name);
+    std::fs::write(&path, contents).expect("write photo");
+    let hash: [u8; 32] = blake3::hash(contents).into();
+    master
+        .install
+        .db()
+        .insert_image(&path, &hash, contents.len() as u64)
+        .expect("insert");
+    hash
 }
 
 // ── Hello ───────────────────────────────────────────────────────
@@ -667,7 +734,7 @@ fn metadata_flows_from_master_to_servant() {
 
     let batch = client.pull(&outcome.key, 0, 500).expect("pull");
     assert!(!batch.is_empty(), "the master had a change to send");
-    let report = maple_sync::merge::apply_and_refresh(&servant.db(), &batch).expect("apply");
+    let report = maple_sync::merge::apply_and_refresh(&servant.db(), &batch, &master.install.device_id).expect("apply");
     assert!(report.changed());
 
     let collections = servant.db().all_collections().expect("list");
@@ -773,7 +840,7 @@ fn concurrent_renames_converge_on_the_same_winner() {
         .create_collection("Trip", "#3584e4", None)
         .unwrap();
     let batch = client.pull(&outcome.key, 0, 500).unwrap();
-    maple_sync::merge::apply_and_refresh(&servant.db(), &batch).unwrap();
+    maple_sync::merge::apply_and_refresh(&servant.db(), &batch, &master.install.device_id).unwrap();
     let servant_id = servant.db().all_collections().unwrap()[0].id;
 
     // Both rename it, without talking first.
@@ -788,7 +855,7 @@ fn concurrent_renames_converge_on_the_same_winner() {
     let ours = servant.db().collect_changes(0, 500).unwrap();
     client.push(&outcome.key, &ours).unwrap();
     let theirs = client.pull(&outcome.key, batch.next_rev, 500).unwrap();
-    maple_sync::merge::apply_and_refresh(&servant.db(), &theirs).unwrap();
+    maple_sync::merge::apply_and_refresh(&servant.db(), &theirs, &master.install.device_id).unwrap();
 
     let master_name = master.install.db().all_collections().unwrap()[0].name.clone();
     let servant_name = servant.db().all_collections().unwrap()[0].name.clone();
@@ -1075,6 +1142,108 @@ fn a_worker_with_no_master_listening_shows_a_retry_countdown() {
 }
 
 #[test]
+fn a_master_that_comes_back_refreshes_the_ui_with_nothing_to_merge() {
+    // The relay's own failure mode, and it is not a merge bug: a servant that
+    // starts while the master is down fills its grid with thumbnails that
+    // fail to fetch, and nothing ever retries one. The pill going green is
+    // not enough — the tiles stay blank until something reloads them. So the
+    // first pass after an outage refreshes the UI even though both libraries
+    // are empty and it merged nothing at all.
+    let clock = TestClock::new();
+    let master = Master::start(&clock, seeded(70));
+    let address = master.address();
+    let servant = Install::new("Laptop");
+
+    // Trust written by hand rather than through `pair`, so nothing has
+    // connected to the listener yet: the address below is rebound after a
+    // shutdown, and an accepted connection would leave it in TIME_WAIT.
+    let key = maple_sync::PeerKey::from_bytes([7u8; 32]);
+    for (install, peer, addr) in [
+        (&master.install, &servant.device_id, None),
+        (&servant, &master.install.device_id, Some(address.clone())),
+    ] {
+        install
+            .db()
+            .upsert_sync_peer(peer, Some("Peer"), PeerMode::Relay)
+            .unwrap();
+        install
+            .trust()
+            .upsert_peer(TrustedPeer {
+                device_id: peer.clone(),
+                key: key.clone(),
+                address: addr,
+            })
+            .unwrap();
+    }
+
+    let Master { install, slot, server, status: master_status, thumbs, .. } = master;
+    server.shutdown();
+
+    let changes = Arc::new(AtomicI64::new(0));
+    let status = maple_sync::SyncStatus::cell(maple_state::SyncRole::Servant);
+    let worker = maple_sync::worker::spawn(
+        maple_sync::WorkerConfig {
+            address: address.clone(),
+            master_device_id: install.device_id.clone(),
+            interval: Duration::from_millis(50),
+            max_revs: 500,
+        },
+        maple_sync::worker::WorkerDeps {
+            db: servant.db.clone(),
+            trust: servant.trust.clone(),
+            status: status.clone(),
+            clock: clock.handle(),
+            rng: seeded(71),
+            on_change: {
+                let changes = changes.clone();
+                Arc::new(move || {
+                    changes.fetch_add(1, Ordering::Relaxed);
+                })
+            },
+        },
+    );
+
+    wait_until("the pill to report a retry", || {
+        matches!(
+            status.lock().unwrap().state,
+            maple_sync::status::SyncState::Offline { .. }
+        )
+    });
+    assert_eq!(
+        changes.load(Ordering::Relaxed),
+        0,
+        "a failed pass has nothing to show"
+    );
+
+    // The master comes back on the same address, exactly as a machine that
+    // was asleep does.
+    let revived = SyncServer::spawn(
+        maple_sync::server::ServerConfig {
+            listen_addr: address,
+            max_revs: 500,
+            ..Default::default()
+        },
+        maple_sync::server::ServerDeps {
+            db: install.db.clone(),
+            trust: install.trust.clone(),
+            pairing: slot,
+            status: master_status,
+            clock: clock.handle(),
+            rng: seeded(72),
+            thumbs,
+            render_thumb: Arc::new(|_: &std::path::Path| Ok(Vec::new())),
+        },
+    )
+    .expect("rebind the address the master just released");
+
+    wait_until("the recovered pass to refresh the UI", || {
+        changes.load(Ordering::Relaxed) > 0
+    });
+    worker.stop();
+    revived.shutdown();
+}
+
+#[test]
 fn a_servant_refuses_to_sync_to_another_servant() {
     // A star is the only topology the merge engine is built for. Reachable
     // but wrongly configured is retryable — the user may just not have
@@ -1138,4 +1307,201 @@ fn the_masters_pill_counts_servants_that_actually_called() {
     wait_until("the master to forget a silent servant", || {
         master.status.lock().unwrap().display().label == "Listening · no devices"
     });
+}
+
+// ── Blobs (P6: relay) ───────────────────────────────────────────
+
+#[test]
+fn a_signed_thumb_fetch_renders_on_the_master_and_caches_there() {
+    let clock = TestClock::new();
+    let master = Master::start(&clock, seeded(70));
+    let servant = Install::new("Laptop");
+    let client = client(&master, &servant, &clock, seeded(71));
+    let outcome = pair(&master, &servant, &client, &clock, "482107", "314159").unwrap();
+
+    let hash = master_photo(&master, "a.jpg", b"twelve bytes");
+
+    let webp = client.blob_thumb(&outcome.key, &hash).expect("thumb");
+    assert_eq!(webp, b"THUMB:12", "the renderer's bytes are what came back");
+    assert_eq!(master.renders.load(Ordering::Relaxed), 1);
+    assert_eq!(
+        master.thumbs.get(&hash).as_deref(),
+        Some(&b"THUMB:12"[..]),
+        "the master keeps what it rendered"
+    );
+
+    // A servant scrolling past the same photo again must not make the master
+    // re-decode it — that is the whole reason the cache is written above.
+    let again = client.blob_thumb(&outcome.key, &hash).expect("thumb again");
+    assert_eq!(again, webp);
+    assert_eq!(master.renders.load(Ordering::Relaxed), 1, "served from cache");
+}
+
+#[test]
+fn a_signed_orig_fetch_returns_the_files_bytes_verbatim() {
+    // Verbatim matters beyond P6: P7 will verify the BLAKE3 of what it
+    // downloads before writing it into a library.
+    let clock = TestClock::new();
+    let master = Master::start(&clock, seeded(72));
+    let servant = Install::new("Laptop");
+    let client = client(&master, &servant, &clock, seeded(73));
+    let outcome = pair(&master, &servant, &client, &clock, "482107", "314159").unwrap();
+
+    let contents: Vec<u8> = (0..=255u8).cycle().take(200_000).collect();
+    let hash = master_photo(&master, "big.jpg", &contents);
+
+    let bytes = client.blob_orig(&outcome.key, &hash, false).expect("orig");
+    assert_eq!(bytes.len(), contents.len());
+    assert_eq!(blake3::hash(&bytes), blake3::hash(&contents));
+    assert_eq!(master.renders.load(Ordering::Relaxed), 0, "no decoding involved");
+}
+
+#[test]
+fn an_unknown_hash_is_a_404_that_does_not_break_the_pairing() {
+    // A photo's hash changes when it is losslessly rotated, so a servant can
+    // legitimately ask for one the master no longer has. Costing the link
+    // over that would strand a working pairing behind a re-pair that fixes
+    // nothing.
+    let clock = TestClock::new();
+    let master = Master::start(&clock, seeded(74));
+    let servant = Install::new("Laptop");
+    let client = client(&master, &servant, &clock, seeded(75));
+    let outcome = pair(&master, &servant, &client, &clock, "482107", "314159").unwrap();
+
+    let failure = client
+        .blob_thumb(&outcome.key, &[0x11; 32])
+        .expect_err("nothing has that hash");
+    assert_eq!(failure.code, Some(ErrorCode::NotFound));
+    assert_eq!(failure.kind, FailureKind::Unreachable, "retryable, not fatal");
+
+    // The link still works afterwards.
+    let hash = master_photo(&master, "a.jpg", b"ok");
+    assert!(client.blob_thumb(&outcome.key, &hash).is_ok());
+}
+
+#[test]
+fn a_blob_request_is_refused_exactly_as_a_pull_is() {
+    // The library must not be readable one photo at a time by anything on the
+    // LAN that can guess a hash.
+    let clock = TestClock::new();
+    let master = Master::start(&clock, seeded(76));
+    let servant = Install::new("Laptop");
+    let client = client(&master, &servant, &clock, seeded(77));
+    let outcome = pair(&master, &servant, &client, &clock, "482107", "314159").unwrap();
+    let hash = master_photo(&master, "a.jpg", b"secret");
+    let path = format!("/blob/thumb/{}", hex(&hash));
+
+    let (status, body) = raw_get(&master.address(), &path, None);
+    assert_eq!(status, 400, "no Authorization header at all");
+    assert!(String::from_utf8_lossy(&body).contains("malformed"));
+
+    // A well-formed credential from a device with no key: same answer a bad
+    // MAC gets, so probing tells an attacker nothing.
+    let forged = SignedRequest::sign_with(
+        &outcome.key,
+        "dev-nobody".to_owned(),
+        "GET",
+        &path,
+        &[],
+        clock.now(),
+        &seeded(78),
+    )
+    .expect("sign");
+    let (status, body) = raw_get(&master.address(), &path, Some(&forged.header()));
+    assert_eq!(status, 401);
+    assert!(String::from_utf8_lossy(&body).contains("unauthorized"));
+
+    // And a signature over a *different* path does not transfer.
+    let wrong_path = SignedRequest::sign_with(
+        &outcome.key,
+        servant.device_id.clone(),
+        "GET",
+        route::PULL,
+        &[],
+        clock.now(),
+        &seeded(79),
+    )
+    .expect("sign");
+    let (status, _) = raw_get(&master.address(), &path, Some(&wrong_path.header()));
+    assert_eq!(status, 401, "the MAC covers the path");
+}
+
+#[test]
+fn a_malformed_hash_is_a_400_not_a_404() {
+    // 404 would have the servant retry a URL that can never work.
+    let clock = TestClock::new();
+    let master = Master::start(&clock, seeded(80));
+    let servant = Install::new("Laptop");
+    let client = client(&master, &servant, &clock, seeded(81));
+    let outcome = pair(&master, &servant, &client, &clock, "482107", "314159").unwrap();
+
+    let path = "/blob/thumb/abcd";
+    let credential = SignedRequest::sign_with(
+        &outcome.key,
+        servant.device_id.clone(),
+        "GET",
+        path,
+        &[],
+        clock.now(),
+        &seeded(82),
+    )
+    .expect("sign");
+    let (status, body) = raw_get(&master.address(), path, Some(&credential.header()));
+    assert_eq!(status, 400);
+    assert!(String::from_utf8_lossy(&body).contains("bad_request"));
+}
+
+#[test]
+fn a_relay_servant_browses_the_masters_library_without_storing_a_file() {
+    // The P6 acceptance test, end to end: metadata over the link, pixels over
+    // the blob route, and nothing on the servant's disk when it is done.
+    let clock = TestClock::new();
+    let master = Master::start(&clock, seeded(84));
+    let servant = Install::new("Laptop");
+    let client = client(&master, &servant, &clock, seeded(85));
+    let outcome = pair(&master, &servant, &client, &clock, "482107", "314159").unwrap();
+
+    let contents = b"a photo the servant will never own";
+    let hash = master_photo(&master, "holiday.jpg", contents);
+
+    // 1. The row arrives, and lands as a real library entry.
+    let batch = client.pull(&outcome.key, 0, 500).expect("pull");
+    let report =
+        maple_sync::merge::apply_and_refresh(&servant.db(), &batch, &master.install.device_id)
+            .expect("apply");
+    assert_eq!(report.inserted, 1);
+
+    // Read it back the way the grid does — a listing, not a hand-written
+    // query — so this also pins that a relayed photo is *listed* at all.
+    let listed = servant
+        .db()
+        .search_images(&maple_db::SearchQuery::default())
+        .expect("list");
+    assert_eq!(listed.len(), 1, "it belongs in the grid");
+    let row = &listed[0];
+    assert_eq!(row.status, maple_db::ImageStatus::Present);
+    assert_eq!(row.locality, maple_db::Locality::Remote);
+    assert_eq!(row.origin_device.as_deref(), Some(master.install.device_id.as_str()));
+    assert_eq!(row.hash, Some(hash), "the blob key travelled with it");
+
+    // 2. Both pixel seams work over the wire.
+    let thumb = client.blob_thumb(&outcome.key, &hash).expect("thumbnail");
+    assert_eq!(thumb, format!("THUMB:{}", contents.len()).into_bytes());
+    let full = client.blob_orig(&outcome.key, &hash, false).expect("original");
+    assert_eq!(full, contents);
+
+    // 3. And the servant's own directory is still empty of photos. This is
+    //    the relay contract; a servant that cached originals would have
+    //    stopped being one.
+    let strays: Vec<String> = std::fs::read_dir(servant._dir.path())
+        .expect("read servant dir")
+        .filter_map(|e| e.ok())
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .filter(|name| name.ends_with(".jpg"))
+        .collect();
+    assert!(strays.is_empty(), "servant wrote originals: {strays:?}");
+}
+
+fn hex(hash: &[u8; 32]) -> String {
+    hash.iter().map(|b| format!("{b:02x}")).collect()
 }

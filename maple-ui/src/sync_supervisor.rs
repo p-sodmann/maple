@@ -28,11 +28,14 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use maple_state::SyncRole;
-use maple_sync::server::{ServerConfig, ServerDeps};
+use maple_sync::server::{ServerConfig, ServerDeps, ThumbRenderer};
 use maple_sync::worker::{WorkerConfig, WorkerDeps};
 use maple_sync::{
-    Clock, PairingSlot, SharedRandom, StatusCell, SyncServer, SyncStatus, SyncWorker, TrustStore,
+    Clock, PairingSlot, SharedRandom, StatusCell, SyncClient, SyncServer, SyncStatus, SyncWorker,
+    TrustStore,
 };
+
+use crate::remote::RemoteBlobs;
 
 /// How stale a peer's `last_seen_at` may be before it stops counting as
 /// connected. Two default sync intervals, so one missed pass does not
@@ -48,15 +51,31 @@ pub struct SyncSupervisor {
     rng: SharedRandom,
     server: RefCell<Option<SyncServer>>,
     worker: RefCell<Option<SyncWorker>>,
+    /// The master's own thumbnail store, so a servant's `/blob/thumb` request
+    /// is answered from cache when the master has already rendered it.
+    thumbs: Arc<maple_db::ThumbnailCache>,
+    /// Longest edge and WebP quality for a thumbnail this master renders on
+    /// behalf of a servant. Its own settings — the servant asks for a photo,
+    /// not for a size.
+    thumb_px: u32,
+    thumb_quality: u8,
+    /// Where the grid and the detail view fetch remote pixels from. Written
+    /// by [`restart`](Self::restart), which is the only place that knows
+    /// whether there is a master to fetch from at all.
+    blobs: RemoteBlobs,
 }
 
 impl SyncSupervisor {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         db: Arc<Mutex<maple_db::Database>>,
         trust: Arc<Mutex<TrustStore>>,
         pairing: PairingSlot,
         status: StatusCell,
         rng: SharedRandom,
+        thumbs: Arc<maple_db::ThumbnailCache>,
+        thumb_px: u32,
+        thumb_quality: u8,
     ) -> Rc<Self> {
         Rc::new(Self {
             db,
@@ -67,6 +86,10 @@ impl SyncSupervisor {
             rng,
             server: RefCell::new(None),
             worker: RefCell::new(None),
+            thumbs,
+            thumb_px,
+            thumb_quality,
+            blobs: crate::remote::blobs(),
         })
     }
 
@@ -94,6 +117,11 @@ impl SyncSupervisor {
     pub fn restart(self: &Rc<Self>) {
         *self.worker.borrow_mut() = None;
         *self.server.borrow_mut() = None;
+        // Cleared unconditionally, then re-set below only if this device is
+        // still a servant with a paired master. Leaving a stale client in
+        // place would have every remote thumbnail keep dialling a device we
+        // may no longer hold a key for, failing slowly instead of at once.
+        self.blobs.clear();
 
         let settings = maple_state::Settings::load();
         let role = {
@@ -114,6 +142,7 @@ impl SyncSupervisor {
     pub fn stop(&self) {
         *self.worker.borrow_mut() = None;
         *self.server.borrow_mut() = None;
+        self.blobs.clear();
     }
 
     fn start_master(self: &Rc<Self>, settings: &maple_state::Settings) {
@@ -134,6 +163,8 @@ impl SyncSupervisor {
                 status: self.status.clone(),
                 clock: self.clock.clone(),
                 rng: self.rng.clone(),
+                thumbs: self.thumbs.clone(),
+                render_thumb: self.thumb_renderer(),
             },
         );
 
@@ -168,6 +199,11 @@ impl SyncSupervisor {
             return;
         };
 
+        // The blob client is a servant-side thing and belongs to the same
+        // (device, key) pair the worker signs with, so it is built from the
+        // same trust-store lookup rather than a second, separately-stale one.
+        self.point_blobs_at(&master_device_id, &address);
+
         let worker = maple_sync::worker::spawn(
             WorkerConfig {
                 address,
@@ -185,6 +221,42 @@ impl SyncSupervisor {
             },
         );
         *self.worker.borrow_mut() = Some(worker);
+    }
+
+    /// Point the grid and detail view at `address` for remote pixels.
+    ///
+    /// A missing key is not an error worth surfacing here: the worker is
+    /// about to hit the same gap and report it through the status pill, and
+    /// two messages for one cause is one too many.
+    fn point_blobs_at(&self, master_device_id: &str, address: &str) {
+        let key = {
+            let trust = lock(&self.trust);
+            trust.peer(master_device_id).map(|p| p.key.clone())
+        };
+        let Some(key) = key else {
+            tracing::warn!("sync: no key for master {master_device_id}, remote photos unavailable");
+            return;
+        };
+        let client = SyncClient::new(
+            address,
+            {
+                let db = maple_db::lock_db(&self.db);
+                db.device_id().to_owned()
+            },
+            self.clock.clone(),
+            self.rng.clone(),
+        );
+        self.blobs.set(master_device_id.to_owned(), client, key);
+    }
+
+    /// The closure the listener renders thumbnails through.
+    ///
+    /// See [`ThumbRenderer`] for why this is injected: the codec lives in
+    /// `maple_ui::thumbnail`, and `maple-ui` depends on `maple-sync`, so the
+    /// transport crate cannot call it directly.
+    fn thumb_renderer(&self) -> ThumbRenderer {
+        let (px, quality) = (self.thumb_px, self.thumb_quality);
+        Arc::new(move |path: &std::path::Path| crate::thumbnail::generate_thumbnail(path, px, quality))
     }
 
     /// The master this servant should dial: its device id and last-known

@@ -24,8 +24,15 @@ use maple_db::{ApplyReport, Database};
 /// A failure to refresh is logged rather than propagated: the rows are
 /// already committed, the derived values are a cache, and returning an error
 /// here would make the caller re-send a batch that landed successfully.
-pub fn apply_and_refresh(db: &Database, batch: &SyncBatch) -> anyhow::Result<ApplyReport> {
-    let report = db.apply_batch(batch)?;
+/// `origin` is the device the batch arrived from. It is recorded on any image
+/// row the merge has to *create*, so a relay servant knows which master to
+/// ask for that photo's pixels — see `images.origin_device` (V20).
+pub fn apply_and_refresh(
+    db: &Database,
+    batch: &SyncBatch,
+    origin: &str,
+) -> anyhow::Result<ApplyReport> {
+    let report = db.apply_batch_from(batch, Some(origin))?;
 
     for person_id in &report.touched_persons {
         if let Err(e) = db.update_person_representative(*person_id) {

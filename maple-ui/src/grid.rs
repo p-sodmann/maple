@@ -37,6 +37,7 @@ use maple_db::{LibraryImage, SearchOrder, SearchQuery, ThumbnailCache};
 use maple_import::raw_preview_supported;
 
 use crate::paging::{PageCursor, PAGE_SIZE};
+use crate::remote::RemoteBlobs;
 use crate::services::images::{count_library, search_library};
 use crate::thumbnail;
 use crate::transforms::{append_date_groups, score_caption};
@@ -317,16 +318,18 @@ impl LibraryGrid {
                     std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
                 let chunk_size = (page_len / parallelism).max(1);
 
+                let blobs = crate::remote::blobs();
                 std::thread::scope(|scope| {
                     for (chunk_index, chunk) in records.chunks(chunk_size).enumerate() {
                         let tx = tx.clone();
                         let cache = cache.clone();
+                        let blobs = blobs.clone();
                         scope.spawn(move || {
                             for (i, rec) in chunk.iter().enumerate() {
                                 // Absolute row index: this page starts at
                                 // `offset` in the accumulated grid.
                                 let index = offset + chunk_index * chunk_size + i;
-                                match load_thumbnail(rec, thumb_px, quality, &cache) {
+                                match load_thumbnail(rec, thumb_px, quality, &cache, &blobs) {
                                     Ok((rgb, width, height)) => {
                                         let _ =
                                             tx.send(GridMsg::Thumb { index, rgb, width, height });
@@ -336,7 +339,17 @@ impl LibraryGrid {
                                             "Thumbnail failed for {}: {e}",
                                             rec.path.display()
                                         );
-                                        if !raw_preview_supported(&rec.path) {
+                                        // A remote miss is transient — the
+                                        // master may be asleep, or the hash
+                                        // may have moved under a rotation —
+                                        // so the tile keeps its placeholder
+                                        // and the next load tries again.
+                                        // "Unsupported" is permanent, and
+                                        // claiming it here would be a lie the
+                                        // user cannot clear.
+                                        if !rec.locality.is_remote()
+                                            && !raw_preview_supported(&rec.path)
+                                        {
                                             let _ = tx.send(GridMsg::Unsupported { index });
                                         }
                                     }
@@ -685,18 +698,44 @@ fn rgb_to_image(rgb: &[u8], width: u32, height: u32) -> Image {
 
 /// Load a thumbnail for `rec`, using the thumbnail cache when possible.
 ///
-/// Cache hit: decode stored WebP to RGB. Cache miss: render from disk, encode
-/// WebP, store in cache, return RGB.
+/// ```text
+/// cache hit                    → decode WebP
+/// miss, and the file is here   → render from disk, cache, return RGB
+/// miss, and the file is remote → GET /blob/thumb/{hash}, cache, decode
+/// ```
+///
+/// The remote branch caches too, and deliberately so: §3.6's "loads on demand
+/// without saving" is about *originals*. A thumbnail is ~10 KB and is the
+/// difference between a grid that scrolls and one that re-fetches the whole
+/// viewport every time the user moves.
 fn load_thumbnail(
     rec: &LibraryImage,
     max_size: u32,
     quality: u8,
     cache: &ThumbnailCache,
+    blobs: &RemoteBlobs,
 ) -> anyhow::Result<(Vec<u8>, u32, u32)> {
     if let Some(hash) = rec.hash {
         if let Some(webp) = cache.get(&hash) {
             return thumbnail::decode_webp_rgb(&webp);
         }
+    }
+
+    if rec.locality.is_remote() {
+        // No hash means no blob key — `rec.path` names a file on another
+        // machine, so there is nothing local to fall back to either.
+        let hash = rec
+            .hash
+            .ok_or_else(|| anyhow::anyhow!("remote image {} has no content hash", rec.id))?;
+        let webp = blobs.thumb(&hash)?;
+        // Cached under the master's encoding, not this device's thumbnail
+        // settings: the bytes are whatever the master rendered, and pretending
+        // otherwise by re-encoding would cost a decode round-trip to change
+        // nothing the user can see.
+        if let Err(e) = cache.insert(&hash, &webp) {
+            tracing::warn!("Thumbnail cache write failed for remote image {}: {e}", rec.id);
+        }
+        return thumbnail::decode_webp_rgb(&webp);
     }
 
     let (rgb, w, h) = thumbnail::render_to_rgb(&rec.path, max_size)?;

@@ -24,6 +24,8 @@
 //!            groundwork for master/servant replication
 //!   18 → 19: sync_guid_aliases, so references to a guid that lost identity
 //!            reconciliation still resolve
+//!   19 → 20: locality + origin_device columns on images — a relay servant
+//!            holds rows whose bytes live on the master
 //!
 //! Steps are append-only and replay history, so a fresh database still runs
 //! V2's `image_fts` creation before V17 drops it again.
@@ -625,6 +627,34 @@ const V19: &str = "
     CREATE INDEX IF NOT EXISTS idx_guid_aliases_rev  ON sync_guid_aliases(rev);
 ";
 
+/// V20 — relay support (§3.5): a photo can be *visible* here while its
+/// bytes live on another device.
+///
+/// Both columns are deliberately **machine-local**: they are not in
+/// `ImageRow`, are not stamped, and never replicate. `locality` says where
+/// *this* installation keeps the file, and the same photo is `local` on the
+/// master and `remote` on a relay servant — shipping the column would have
+/// each device telling the other its own files are elsewhere.
+///
+/// `path` stays `NOT NULL` because SQLite cannot drop that without rebuilding
+/// the table. For a `remote` row it holds the origin device's path verbatim
+/// and is never opened; only the filename is ever shown from it.
+///
+/// No index: nothing filters on `locality` in a listing (remote rows appear
+/// in the grid exactly like local ones), and the one query that does —
+/// `all_paths`, for the scanner — already scans the whole table.
+const V20: &str = "
+    ALTER TABLE images ADD COLUMN locality TEXT NOT NULL DEFAULT 'local';
+";
+
+/// Split from [`V20`] so a database that already survived a partial upgrade
+/// can still add the second column: `ALTER TABLE` is one statement per call,
+/// and the runner's duplicate-column tolerance works per batch.
+const V20_ORIGIN: &str = "
+    ALTER TABLE images ADD COLUMN origin_device TEXT;
+";
+
+
 // ── Migration runner ─────────────────────────────────────────────
 
 /// Apply all pending schema migrations to `conn`.
@@ -791,6 +821,17 @@ pub fn ensure_schema(conn: &Connection) -> anyhow::Result<()> {
         conn.execute_batch("PRAGMA user_version = 19")?;
     }
 
+    if version < 20 {
+        for sql in &[V20, V20_ORIGIN] {
+            if let Err(e) = conn.execute_batch(sql) {
+                if !e.to_string().to_lowercase().contains("duplicate column") {
+                    return Err(e.into());
+                }
+            }
+        }
+        conn.execute_batch("PRAGMA user_version = 20")?;
+    }
+
     Ok(())
 }
 
@@ -927,7 +968,7 @@ mod tests {
 
         ensure_schema(conn).expect("migrate 16 → head");
 
-        assert_eq!(user_version(conn), 19);
+        assert_eq!(user_version(conn), 20);
         assert!(exists(conn, "idx_images_listing_added"));
         assert!(exists(conn, "idx_images_listing_taken"));
         // Dropping the virtual table must take its shadow tables with it.
@@ -985,7 +1026,7 @@ mod tests {
             .query_row("SELECT guid FROM images WHERE id = 1", [], |r| r.get(0))
             .expect("guid");
         ensure_schema(conn).expect("idempotent");
-        assert_eq!(user_version(conn), 19);
+        assert_eq!(user_version(conn), 20);
         let after: String = conn
             .query_row("SELECT guid FROM images WHERE id = 1", [], |r| r.get(0))
             .expect("guid");
@@ -996,7 +1037,7 @@ mod tests {
     fn fresh_database_lands_on_head_without_the_fts_index() {
         let dir = tempfile::tempdir().expect("tempdir");
         let db = Database::open(&dir.path().join("library.db")).expect("open");
-        assert_eq!(user_version(&db.conn), 19);
+        assert_eq!(user_version(&db.conn), 20);
         assert!(exists(&db.conn, "idx_images_listing_added"));
         assert!(exists(&db.conn, "idx_images_listing_taken"));
         assert!(!exists(&db.conn, "image_fts"));
@@ -1051,6 +1092,51 @@ mod tests {
         // it would orphan every pairing.
         let reopened = Database::open(&path).expect("reopen");
         assert_eq!(reopened.device_id(), device_id);
+    }
+
+    #[test]
+    fn v20_defaults_every_existing_row_to_local() {
+        // The upgrade case: a library full of photos this machine imported
+        // itself must not wake up thinking they live on another device.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = Database::open(&dir.path().join("library.db")).expect("open");
+        let conn = &db.conn;
+
+        conn.execute_batch(
+            "ALTER TABLE images DROP COLUMN locality;
+             ALTER TABLE images DROP COLUMN origin_device;
+             INSERT INTO images(id, path, hash, file_size, added_at, status, filename)
+             VALUES (1, '/p/a.jpg', X'01', 1, 100, 'present', 'a.jpg');
+             PRAGMA user_version = 19;",
+        )
+        .expect("rewind to v19");
+
+        ensure_schema(conn).expect("migrate 19 → 20");
+        assert_eq!(user_version(conn), 20);
+
+        let (locality, origin): (String, Option<String>) = conn
+            .query_row("SELECT locality, origin_device FROM images", [], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })
+            .expect("row");
+        assert_eq!(locality, "local");
+        assert_eq!(origin, None);
+    }
+
+    #[test]
+    fn v20_is_idempotent_on_a_database_that_already_has_the_columns() {
+        // The runner replays history, so V20 runs again on every open. Its
+        // duplicate-column tolerance is what keeps that from being an error.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("library.db");
+        {
+            let db = Database::open(&path).expect("open");
+            db.conn
+                .execute_batch("PRAGMA user_version = 19")
+                .expect("rewind");
+        }
+        let db = Database::open(&path).expect("reopen");
+        assert_eq!(user_version(&db.conn), 20);
     }
 
     #[test]

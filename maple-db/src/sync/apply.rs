@@ -66,6 +66,22 @@ impl Database {
     /// The whole batch commits or none of it does, so a failure mid-apply
     /// cannot leave the library half-merged with the watermark advanced.
     pub fn apply_batch(&self, batch: &SyncBatch) -> anyhow::Result<ApplyReport> {
+        self.apply_batch_from(batch, None)
+    }
+
+    /// Same, recording `origin` as the device that supplied any image row
+    /// this call has to create.
+    ///
+    /// Separate from [`apply_batch`](Self::apply_batch) rather than an extra
+    /// parameter on it: the merge property test drives two databases through
+    /// thousands of batches and cares about convergence, not provenance, and
+    /// `origin_device` is bookkeeping for the UI — it says which master to
+    /// ask for the pixels, and nothing in the merge reads it.
+    pub fn apply_batch_from(
+        &self,
+        batch: &SyncBatch,
+        origin: Option<&str>,
+    ) -> anyhow::Result<ApplyReport> {
         // Advance the local clock past everything we are about to see, so a
         // subsequent local edit is unambiguously *after* these changes even
         // if the peer's wall clock runs ahead of ours.
@@ -78,7 +94,10 @@ impl Database {
 
         let tx = self.conn.unchecked_transaction()?;
         let mut report = ApplyReport::default();
-        let mut ctx = ApplyCtx::default();
+        let mut ctx = ApplyCtx {
+            origin_device: origin.map(str::to_owned),
+            ..ApplyCtx::default()
+        };
         for row in &batch.rows {
             if let SyncRow::Image(img) = row {
                 *ctx.incoming_by_hash.entry(img.hash).or_insert(0) += 1;
@@ -445,9 +464,10 @@ impl Database {
     fn update_row(&self, row: &SyncRow, id: i64) -> anyhow::Result<()> {
         match row {
             SyncRow::Image(r) => {
-                // `status`, `path`, `raw_path` and `filename` are absent by
-                // design — they describe this machine's disk. `exif_extracted`
-                // is set so the local metadata filler leaves the row alone.
+                // `status`, `path`, `raw_path`, `filename`, `locality` and
+                // `origin_device` are absent by design — they describe this
+                // machine's disk, not the photo. `exif_extracted` is set so
+                // the local metadata filler leaves the row alone.
                 self.conn.execute(
                     "UPDATE images SET
                          hash = ?1, orientation = ?2, taken_at = ?3, make = ?4,
@@ -521,10 +541,17 @@ impl Database {
                     .next()
                     .unwrap_or("")
                     .to_owned();
-                // `path` is UNIQUE and the peer's path may already name a
-                // different local photo. A synthetic placeholder keeps the
-                // row insertable; P6's `locality` column replaces this with a
-                // first-class "this file lives on another device" marker.
+                // A row that gets this far is one no local file matched, so
+                // its bytes live on the peer: `locality = 'remote'`, and
+                // `status = 'present'` because it is a perfectly good library
+                // entry — it belongs in the grid, which lists present rows.
+                // (Before V20 this landed `'missing'`, which hid it.)
+                //
+                // `path` holds the origin's path verbatim, per §3.5, and is
+                // never opened. It is still UNIQUE, though, so a collision
+                // with a local photo needs somewhere else to go; the filename
+                // shown comes from the `filename` column either way, so the
+                // placeholder costs nothing visible.
                 let path = if self.path_is_free(&r.origin_path)? {
                     r.origin_path.clone()
                 } else {
@@ -534,13 +561,15 @@ impl Database {
                     "INSERT INTO images
                          (path, hash, file_size, added_at, status, filename, taken_at,
                           make, model, lens, focal_length, aperture, iso, width, height,
-                          orientation, exif_extracted, guid, rev, rev_dev)
-                     VALUES (?1, ?2, ?3, ?4, 'missing', ?5, ?6, ?7, ?8, ?9, ?10, ?11,
-                             ?12, ?13, ?14, ?15, 1, ?16, ?17, ?18)",
+                          orientation, exif_extracted, guid, rev, rev_dev,
+                          locality, origin_device)
+                     VALUES (?1, ?2, ?3, ?4, 'present', ?5, ?6, ?7, ?8, ?9, ?10, ?11,
+                             ?12, ?13, ?14, ?15, 1, ?16, ?17, ?18, 'remote', ?19)",
                     params![
                         path, r.hash.as_slice(), r.file_size, now_secs(), name, r.taken_at,
                         r.make, r.model, r.lens, r.focal_length, r.aperture, r.iso,
-                        r.width, r.height, r.orientation, r.guid, r.stamp.rev, r.stamp.rev_dev
+                        r.width, r.height, r.orientation, r.guid, r.stamp.rev, r.stamp.rev_dev,
+                        ctx.origin_device
                     ],
                 )?;
             }
@@ -884,6 +913,11 @@ struct ApplyCtx {
     /// half of the "is this match unambiguous?" test in identity
     /// reconciliation.
     incoming_by_hash: HashMap<[u8; 32], usize>,
+    /// Device the batch came from, stamped onto image rows this apply has to
+    /// create so the UI knows who to ask for their pixels. Only applies to
+    /// *inserts*: a row that merged into a local photo keeps that photo's
+    /// `locality = 'local'`, because the file really is here.
+    origin_device: Option<String>,
 }
 
 fn now_secs() -> i64 {

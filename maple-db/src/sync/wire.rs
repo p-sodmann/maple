@@ -6,10 +6,14 @@
 //! * **Foreign keys travel as guids, never rowids.** An `INTEGER PRIMARY KEY`
 //!   is assigned by whichever machine inserted the row, so `image_id = 42`
 //!   means something different on every device.
-//! * **Machine-local columns are absent.** `status`, `path`, `raw_path` and
-//!   `filename` describe one machine's disk. A photo missing from the laptop
-//!   is still present on the workstation, and replicating `'missing'` would
-//!   let whichever device holds fewer originals blank out the other's library.
+//! * **Machine-local columns are absent.** `status`, `path`, `raw_path`,
+//!   `filename`, `locality` and `origin_device` describe one machine's disk.
+//!   A photo missing from the laptop is still present on the workstation, and
+//!   replicating `'missing'` would let whichever device holds fewer originals
+//!   blank out the other's library. `locality` is the same rule sharpened:
+//!   the same photo is `local` on the master and `remote` on a relay servant,
+//!   so shipping it would have each device tell the other its own files are
+//!   somewhere else.
 //! * **Derived columns are absent.** EXIF tag rows, DINOv2 embeddings,
 //!   sentence vectors, centroids and `representative_*_id` are all recomputed
 //!   locally, and the last two are local rowids besides.

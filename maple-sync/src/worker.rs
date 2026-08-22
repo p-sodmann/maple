@@ -152,14 +152,23 @@ pub fn spawn(config: WorkerConfig, deps: WorkerDeps) -> SyncWorker {
             );
             set_state(&status, SyncState::Connecting, None);
 
+            // Whether the last pass failed. A pass that merges nothing is
+            // still worth reporting when it is the first one after an outage:
+            // every remote thumbnail the grid tried to fetch while the master
+            // was unreachable is still a blank tile, and nothing else ever
+            // retries one. "The master answered again" is the moment they can
+            // succeed, and only this loop knows when that happened.
+            let mut recovering = false;
+
             loop {
                 match run_pass(&db, &trust, &status, &client, &config, &stop_rx) {
                     Ok(outcome) => {
                         backoff.on_success();
                         publish_success(&status, &outcome, (clock)());
-                        if outcome.changed {
+                        if outcome.changed || recovering {
                             on_change();
                         }
+                        recovering = false;
                         match stop_rx.recv_timeout(config.interval) {
                             Ok(_) | Err(RecvTimeoutError::Disconnected) => break,
                             Err(RecvTimeoutError::Timeout) => {}
@@ -181,6 +190,7 @@ pub fn spawn(config: WorkerConfig, deps: WorkerDeps) -> SyncWorker {
                                 break;
                             }
                             Retry::After(delay) => {
+                                recovering = true;
                                 tracing::warn!(
                                     "sync worker: {failure} — retrying in {}s",
                                     delay.as_secs()
@@ -271,7 +281,8 @@ fn run_pass(
         );
 
         let guard = lock(db);
-        let report = apply_and_refresh(&guard, &batch).map_err(internal)?;
+        let report =
+            apply_and_refresh(&guard, &batch, &config.master_device_id).map_err(internal)?;
         if may_advance(&report) {
             guard
                 .set_sync_peer_pull_rev(&config.master_device_id, batch.next_rev)

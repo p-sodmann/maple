@@ -394,6 +394,8 @@ mod tests {
             stack_id: None,
             stack_size: None,
             search_hit: None,
+            locality: maple_db::Locality::Local,
+            origin_device: None,
         }
     }
 

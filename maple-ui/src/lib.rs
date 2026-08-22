@@ -28,6 +28,7 @@ mod library_page;
 mod paging;
 mod path_template_window;
 mod people_page;
+mod remote;
 mod rep_crop;
 mod services;
 mod settings_window;
@@ -182,6 +183,9 @@ pub fn run() -> anyhow::Result<()> {
         maple_sync::PairingSlot::new(),
         sync_status.clone(),
         sync_pairing::db_random(db.clone()),
+        cache.clone(),
+        settings.thumbnails.size,
+        settings.thumbnails.quality,
     );
 
     let ctx = AppCtx {

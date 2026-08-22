@@ -82,9 +82,10 @@ single binary; the backend is fixed at compile time.
 - **Sync stamping**: every row in `maple_db::SYNCED_TABLES` carries `guid`/`rev`/`rev_dev`.
   Writers stamp *explicitly* via `Database::stamp()` — never via a trigger, since V17
   removed the last `AFTER UPDATE ON images` trigger for exactly that cost. Writes to
-  machine-local columns (`status`, `path`, `raw_path`, `filename`) and to derived columns
-  (centroids, `representative_*_id`) deliberately do **not** stamp; each carries a comment
-  saying so. Deletes call `Database::tombstone(table, ids)` *before* the `DELETE`.
+  machine-local columns (`status`, `path`, `raw_path`, `filename`, `locality`,
+  `origin_device`) and to derived columns (centroids, `representative_*_id`) deliberately
+  do **not** stamp; each carries a comment saying so. Deletes call
+  `Database::tombstone(table, ids)` *before* the `DELETE`.
 - **Merge engine** (`maple-db/src/sync/`): `collect_changes` reads local changes above a
   watermark, `apply_batch` merges a peer's. It lives in `maple-db`, not `maple-sync`,
   because merging needs transactional SQL over this schema — `maple-sync` is transport
@@ -100,10 +101,20 @@ single binary; the backend is fixed at compile time.
   the RNG — `now_ms` is an argument and randomness arrives through `RandomSource`
   (production: `Database::random_bytes`, SQLite `randomblob`), so every handshake and
   signature is reproducible in a test.
+- **Relay** (`images.locality`, V20): a servant can browse the master's library while
+  storing no originals. `locality='remote'` rows are `status='present'` and list
+  normally; `all_paths()` filters them out so the 60-second scanner does not mark them
+  missing and evict their thumbnails. Pixels come from two signed routes on the master —
+  `GET /blob/thumb/{hash}` (rendered on a cache miss through a `ThumbRenderer` injected
+  from `maple-ui`, because `maple-ui` depends on `maple-sync` and not the reverse) and
+  `GET /blob/orig/{hash}` (streamed **verbatim**; P7 will verify its BLAKE3). The client
+  handle lives in `maple-ui/src/remote.rs` as a process-wide `RemoteBlobs`, written and
+  *cleared* by `SyncSupervisor::restart`. Thumbnails are cached locally; originals are
+  memory-only — that is what makes it a relay.
 - **Raw file support**: Only Fujifilm RAF currently. Always use `maple_import::loadable_image_bytes(path)` for loading images (handles raw preview extraction transparently). Check format with `maple_import::is_raw_format(path)`.
 
 ### Database
-- SQLite in WAL mode, schema versioned via `PRAGMA user_version` (currently v19).
+- SQLite in WAL mode, schema versioned via `PRAGMA user_version` (currently v20).
 - Migrations live in `maple-db/src/schema.rs` as append-only `if version < N` steps that
   **replay history** — a fresh database runs every step in order, so a later step may
   undo an earlier one (V17 drops the FTS table V2 creates). Add new steps at the end;

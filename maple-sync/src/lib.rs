@@ -56,7 +56,7 @@ pub use pairing::{
 pub use protocol::{ErrorBody, ErrorCode, Hello, PullRequest, PushResponse, PROTOCOL_VERSION};
 pub use random::{FnRandom, RandomSource, SharedRandom};
 pub use client::{SyncClient, SyncFailure};
-pub use server::{Clock, SyncServer};
+pub use server::{Clock, SyncServer, ThumbRenderer};
 pub use worker::{SyncWorker, WorkerConfig};
 pub use status::{
     relative_time, StatusCell, StatusDisplay, StatusTone, SyncRole, SyncState, SyncStatus,

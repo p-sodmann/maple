@@ -215,6 +215,93 @@ mod tests {
     use super::*;
     use maple_import::ImageFile;
 
+    /// A library dir with one real photo in it, plus a database holding both
+    /// that photo and one relayed from another device.
+    fn library_with_a_remote_row() -> (tempfile::TempDir, Arc<Mutex<Database>>, [u8; 32]) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let lib = dir.path().join("library");
+        std::fs::create_dir_all(&lib).expect("library dir");
+        let local = lib.join("mine.jpg");
+        std::fs::write(&local, b"\xff\xd8\xffnot-really-a-jpeg").expect("write");
+
+        let db = Database::open(&dir.path().join("library.db")).expect("open");
+        let local_hash = content_hash(&local).expect("hash");
+        db.insert_image(&local, &local_hash, 4).expect("insert local");
+
+        // The remote row: `path` is the *master's*, which is exactly why the
+        // scanner must not look for it on this disk.
+        let remote_hash = [0x5Au8; 32];
+        db.conn
+            .execute(
+                "INSERT INTO images(path, hash, file_size, added_at, status, filename,
+                                    guid, rev, rev_dev, locality, origin_device)
+                 VALUES ('/workstation/photos/theirs.jpg', ?1, 9, 100, 'present',
+                         'theirs.jpg', 'guid-remote', 1, 'dev-master', 'remote', 'dev-master')",
+                rusqlite::params![remote_hash.as_slice()],
+            )
+            .expect("insert remote");
+
+        (dir, Arc::new(Mutex::new(db)), remote_hash)
+    }
+
+    /// The whole point of the `all_paths` filter: a relayed photo has no file
+    /// here, and a scanner that reconciled it would blank the grid one minute
+    /// after it filled — and evict the thumbnail that made it usable.
+    #[test]
+    fn a_remote_row_survives_repeated_scans() {
+        let (dir, db, remote_hash) = library_with_a_remote_row();
+        let cache = Arc::new(
+            ThumbnailCache::open(&dir.path().join("thumbs")).expect("thumbnail cache"),
+        );
+        cache.insert(&remote_hash, b"webp-bytes").expect("seed cache");
+
+        let scanner = LibraryScanner::new(
+            db.clone(),
+            dir.path().join("library"),
+            Some(cache.clone()),
+        );
+        scanner.run_scan();
+        scanner.run_scan();
+
+        let (status, locality): (String, String) = db
+            .lock()
+            .unwrap()
+            .conn
+            .query_row(
+                "SELECT status, locality FROM images WHERE guid = 'guid-remote'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .expect("the remote row is still there");
+        assert_eq!(status, "present", "a relayed photo is not a missing photo");
+        assert_eq!(locality, "remote");
+        assert!(
+            cache.get(&remote_hash).is_some(),
+            "its thumbnail must not have been evicted"
+        );
+    }
+
+    /// ...while a local row that really did vanish is still reconciled.
+    #[test]
+    fn a_local_row_whose_file_vanished_is_still_marked_missing() {
+        let (dir, db, _) = library_with_a_remote_row();
+        std::fs::remove_file(dir.path().join("library/mine.jpg")).expect("delete");
+
+        LibraryScanner::new(db.clone(), dir.path().join("library"), None).run_scan();
+
+        let status: String = db
+            .lock()
+            .unwrap()
+            .conn
+            .query_row(
+                "SELECT status FROM images WHERE filename = 'mine.jpg'",
+                [],
+                |r| r.get(0),
+            )
+            .expect("row");
+        assert_eq!(status, "missing");
+    }
+
     fn img(path: &str) -> ImageFile {
         ImageFile { path: PathBuf::from(path), size: 42 }
     }

@@ -39,12 +39,70 @@ pub const PROTOCOL_VERSION: u32 = 1;
 /// still bounding the damage.
 pub const MAX_BODY_BYTES: u64 = 64 * 1024 * 1024;
 
-/// The four routes P5 serves. Blob routes arrive in P7.
+/// Largest thumbnail a client will read from `/blob/thumb/`.
+///
+/// A thumbnail is ~10 KB. This is not a tuning knob; it is the point past
+/// which whatever is answering is not a Maple master, and the client should
+/// stop reading rather than fill memory on its word.
+pub const MAX_THUMB_BYTES: u64 = 4 * 1024 * 1024;
+
+/// Largest original a client will read from `/blob/orig/`.
+///
+/// Full-res loading is memory-only by the relay contract (§3.6), so this
+/// number is an allocation the servant actually makes. Generous enough for a
+/// large raw file, bounded so a hostile or broken master cannot stream until
+/// the app dies.
+pub const MAX_ORIG_BYTES: u64 = 256 * 1024 * 1024;
+
+/// Every route the master serves.
+///
+/// The two blob routes are **prefixes**: the content hash is the rest of the
+/// path, hex-encoded. Content addressing rather than a row id is what makes a
+/// transfer dedupable — two libraries that both hold a photo ask for the same
+/// URL — and it means a servant can request exactly the bytes it lacks
+/// without either side agreeing on rowids.
 pub mod route {
     pub const HELLO: &str = "/sync/hello";
     pub const PAIR_CLAIM: &str = "/pair/claim";
     pub const PULL: &str = "/sync/pull";
     pub const PUSH: &str = "/sync/push";
+
+    /// `GET /blob/thumb/{hex_hash}` → WebP, rendered on the master if it has
+    /// no cached copy.
+    pub const BLOB_THUMB: &str = "/blob/thumb/";
+    /// `GET /blob/orig/{hex_hash}[?raw=1]` → the original file's bytes,
+    /// streamed. `?raw=1` asks for the companion raw file instead.
+    pub const BLOB_ORIG: &str = "/blob/orig/";
+
+    /// Build a blob path. The MAC covers the path exactly as written here,
+    /// query string included, so client and server must never build it two
+    /// different ways.
+    pub fn blob(prefix: &str, hash: &[u8; 32], raw: bool) -> String {
+        let mut out = String::with_capacity(prefix.len() + 64 + 6);
+        out.push_str(prefix);
+        for byte in hash {
+            out.push_str(&format!("{byte:02x}"));
+        }
+        if raw {
+            out.push_str("?raw=1");
+        }
+        out
+    }
+
+    /// Parse the hex hash out of a blob path. `None` if it is not 64 hex
+    /// characters — a hash is fixed-width, so anything else is a malformed
+    /// request rather than a miss.
+    pub fn blob_hash(path: &str, prefix: &str) -> Option<[u8; 32]> {
+        let hex = path.strip_prefix(prefix)?;
+        if hex.len() != 64 {
+            return None;
+        }
+        let mut out = [0u8; 32];
+        for (i, byte) in out.iter_mut().enumerate() {
+            *byte = u8::from_str_radix(hex.get(i * 2..i * 2 + 2)?, 16).ok()?;
+        }
+        Some(out)
+    }
 }
 
 // ── Envelopes ───────────────────────────────────────────────────
@@ -145,6 +203,12 @@ pub enum ErrorCode {
     Incompatible,
     /// The request body did not parse, or asked for something nonsensical.
     BadRequest,
+    /// No blob with that hash here. Emphatically **not** fatal: a hash
+    /// *mutates* when a photo is losslessly rotated, so a servant can hold a
+    /// row whose hash the master has already replaced. The next metadata sync
+    /// carries the new hash and the fetch succeeds — retrying is exactly
+    /// right, and stopping the link over one missing thumbnail would not be.
+    NotFound,
     /// Something failed on the server. Retryable by definition — the client
     /// cannot tell a transient lock contention from a real bug, and treating
     /// it as fatal would need a human to clear a hiccup.
@@ -156,6 +220,7 @@ impl ErrorCode {
     pub fn http_status(self) -> u16 {
         match self {
             Self::Malformed | Self::BadRequest => 400,
+            Self::NotFound => 404,
             Self::Unauthorized | Self::StaleTimestamp | Self::Replay => 401,
             Self::BadCode => 403,
             Self::PairingClosed | Self::NoPairingWindow => 410,
@@ -191,6 +256,7 @@ impl ErrorCode {
             Self::NoPairingWindow => "no_pairing_window",
             Self::Incompatible => "incompatible",
             Self::BadRequest => "bad_request",
+            Self::NotFound => "not_found",
             Self::Internal => "internal",
         }
     }
@@ -247,6 +313,7 @@ mod tests {
             ErrorCode::NoPairingWindow,
             ErrorCode::Incompatible,
             ErrorCode::BadRequest,
+            ErrorCode::NotFound,
             ErrorCode::Internal,
         ];
         let fatal: Vec<ErrorCode> = all.into_iter().filter(|c| c.is_fatal()).collect();
@@ -278,6 +345,43 @@ mod tests {
             assert_eq!(ErrorCode::from(error), ErrorCode::PairingClosed);
             assert_eq!(ErrorCode::from(error).http_status(), 410);
         }
+    }
+
+    #[test]
+    fn a_blob_path_round_trips_through_its_own_parser() {
+        // Client and server must agree byte for byte: the MAC covers this
+        // string, so a mismatch presents as an authentication failure.
+        let hash = [0xABu8; 32];
+        let path = route::blob(route::BLOB_THUMB, &hash, false);
+        assert_eq!(path, format!("/blob/thumb/{}", "ab".repeat(32)));
+        assert_eq!(route::blob_hash(&path, route::BLOB_THUMB), Some(hash));
+
+        let raw = route::blob(route::BLOB_ORIG, &hash, true);
+        assert!(raw.ends_with("?raw=1"), "{raw}");
+        // The parser is handed the path with the query already split off, as
+        // the dispatcher does.
+        let bare = raw.split('?').next().unwrap();
+        assert_eq!(route::blob_hash(bare, route::BLOB_ORIG), Some(hash));
+    }
+
+    #[test]
+    fn a_hash_that_is_not_64_hex_characters_is_refused() {
+        // Truncating is the difference between "no such blob" and "serve
+        // whichever photo happens to share this prefix".
+        assert_eq!(route::blob_hash("/blob/thumb/abcd", route::BLOB_THUMB), None);
+        assert_eq!(
+            route::blob_hash(&format!("/blob/thumb/{}", "zz".repeat(32)), route::BLOB_THUMB),
+            None
+        );
+        assert_eq!(route::blob_hash("/sync/pull", route::BLOB_THUMB), None);
+    }
+
+    #[test]
+    fn a_missing_blob_never_stops_the_link() {
+        // A rotated photo changes hash, so the servant asks for one the
+        // master no longer has. That must cost one thumbnail, not the pairing.
+        assert!(!ErrorCode::NotFound.is_fatal());
+        assert_eq!(ErrorCode::NotFound.http_status(), 404);
     }
 
     #[test]
