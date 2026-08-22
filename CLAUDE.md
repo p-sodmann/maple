@@ -55,6 +55,7 @@ single binary; the backend is fixed at compile time.
 | `maple-state` | Settings (settings.toml), Session (session.json), SeenSet (bloom filter) |
 | `maple-import` | Recursive image scanner, BLAKE3 hasher, file copier, raw file support |
 | `maple-db` | SQLite library database, background scanner, EXIF, AI tagging, face detection |
+| `maple-sync` | Sync *transport*: pairing handshake, `sync_trust.json`, request signing |
 | `maple-embed`, `maple-cluster`, `maple-tournament` | Future stubs (not yet implemented) |
 
 ## Architecture
@@ -84,10 +85,25 @@ single binary; the backend is fixed at compile time.
   machine-local columns (`status`, `path`, `raw_path`, `filename`) and to derived columns
   (centroids, `representative_*_id`) deliberately do **not** stamp; each carries a comment
   saying so. Deletes call `Database::tombstone(table, ids)` *before* the `DELETE`.
+- **Merge engine** (`maple-db/src/sync/`): `collect_changes` reads local changes above a
+  watermark, `apply_batch` merges a peer's. It lives in `maple-db`, not `maple-sync`,
+  because merging needs transactional SQL over this schema — `maple-sync` is transport
+  only. The property test `random_concurrent_edits_always_converge` drives two real
+  databases through randomised concurrent edits; **keep it deterministic** (no
+  `ORDER BY RANDOM()`), or a failing seed can't be reproduced to debug.
+- **Pairing and signing** (`maple-sync/`): a mutual 6-digit-code handshake derives a
+  shared secret from *both* codes, then seals a 32-byte long-term key stored in
+  `config_dir()/sync_trust.json` (mode `0600`, written atomically — deliberately not
+  `settings.toml`, whose `save` is non-atomic and eats the file's comments). Every later
+  request is MAC'd with that key. Transport is plain HTTP with **no TLS**: signing stops
+  impersonation and replay, not eavesdropping. Nothing in the crate samples the clock or
+  the RNG — `now_ms` is an argument and randomness arrives through `RandomSource`
+  (production: `Database::random_bytes`, SQLite `randomblob`), so every handshake and
+  signature is reproducible in a test.
 - **Raw file support**: Only Fujifilm RAF currently. Always use `maple_import::loadable_image_bytes(path)` for loading images (handles raw preview extraction transparently). Check format with `maple_import::is_raw_format(path)`.
 
 ### Database
-- SQLite in WAL mode, schema versioned via `PRAGMA user_version` (currently v18).
+- SQLite in WAL mode, schema versioned via `PRAGMA user_version` (currently v19).
 - Migrations live in `maple-db/src/schema.rs` as append-only `if version < N` steps that
   **replay history** — a fresh database runs every step in order, so a later step may
   undo an earlier one (V17 drops the FTS table V2 creates). Add new steps at the end;

@@ -1,0 +1,18 @@
+[package]
+name = "maple-sync"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+maple-state = { path = "../maple-state" }
+# blake3 covers both primitives this crate needs: derive_key is HKDF and
+# keyed_hash is a MAC, so pairing and request signing add no crypto dependency.
+blake3 = { workspace = true }
+base64 = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

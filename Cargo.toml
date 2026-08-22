@@ -9,6 +9,7 @@ members = [
     "maple-import",
     "maple-state",
     "maple-db",
+    "maple-sync",
 ]
 
 [workspace.package]

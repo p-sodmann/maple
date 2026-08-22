@@ -22,6 +22,8 @@
 //!   17 → 18: guid/rev/rev_dev versioning columns on every synced table,
 //!            plus sync_identity, sync_tombstones and sync_peers — the
 //!            groundwork for master/servant replication
+//!   18 → 19: sync_guid_aliases, so references to a guid that lost identity
+//!            reconciliation still resolve
 //!
 //! Steps are append-only and replay history, so a fresh database still runs
 //! V2's `image_fts` creation before V17 drops it again.
@@ -592,6 +594,37 @@ fn add_column(conn: &Connection, table: &str, column: &str) -> anyhow::Result<()
     }
 }
 
+// ── V19: guid aliases ────────────────────────────────────────────
+
+// When two devices import the same photo independently they mint different
+// guids for it, and the merge engine reconciles them onto one identity. The
+// guid that loses does not simply vanish: rows that referenced it were
+// already shipped to the other device, and references that arrive *later*
+// still name it.
+//
+// Without a record of the merge, such a reference resolves to nothing, its
+// row is deferred, and — because the watermark has already moved past it —
+// it is never re-sent. That is silent, permanent data loss: a collection
+// membership or a tagged face that simply never arrives.
+// The alias is *replicated*, not re-derived on each device. Deciding to
+// merge requires seeing only one candidate for a content hash, and the two
+// devices do not hold the same set of duplicates — `idx_images_hash` is
+// deliberately non-unique, because a library legitimately contains the same
+// photo twice. So one side can find the match unambiguous while the other
+// cannot, and a merge that is re-derived independently leaves the two
+// libraries permanently one row apart. Shipping the decision makes it
+// symmetric: whoever resolves it first tells the other.
+const V19: &str = "
+    CREATE TABLE IF NOT EXISTS sync_guid_aliases (
+        alias   TEXT PRIMARY KEY,   -- the guid that lost
+        guid    TEXT NOT NULL,      -- the guid now in use
+        rev     INTEGER NOT NULL,
+        rev_dev TEXT    NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_guid_aliases_guid ON sync_guid_aliases(guid);
+    CREATE INDEX IF NOT EXISTS idx_guid_aliases_rev  ON sync_guid_aliases(rev);
+";
+
 // ── Migration runner ─────────────────────────────────────────────
 
 /// Apply all pending schema migrations to `conn`.
@@ -753,6 +786,11 @@ pub fn ensure_schema(conn: &Connection) -> anyhow::Result<()> {
         conn.execute_batch("PRAGMA user_version = 18")?;
     }
 
+    if version < 19 {
+        conn.execute_batch(V19)?;
+        conn.execute_batch("PRAGMA user_version = 19")?;
+    }
+
     Ok(())
 }
 
@@ -889,7 +927,7 @@ mod tests {
 
         ensure_schema(conn).expect("migrate 16 → head");
 
-        assert_eq!(user_version(conn), 18);
+        assert_eq!(user_version(conn), 19);
         assert!(exists(conn, "idx_images_listing_added"));
         assert!(exists(conn, "idx_images_listing_taken"));
         // Dropping the virtual table must take its shadow tables with it.
@@ -947,7 +985,7 @@ mod tests {
             .query_row("SELECT guid FROM images WHERE id = 1", [], |r| r.get(0))
             .expect("guid");
         ensure_schema(conn).expect("idempotent");
-        assert_eq!(user_version(conn), 18);
+        assert_eq!(user_version(conn), 19);
         let after: String = conn
             .query_row("SELECT guid FROM images WHERE id = 1", [], |r| r.get(0))
             .expect("guid");
@@ -958,7 +996,7 @@ mod tests {
     fn fresh_database_lands_on_head_without_the_fts_index() {
         let dir = tempfile::tempdir().expect("tempdir");
         let db = Database::open(&dir.path().join("library.db")).expect("open");
-        assert_eq!(user_version(&db.conn), 18);
+        assert_eq!(user_version(&db.conn), 19);
         assert!(exists(&db.conn, "idx_images_listing_added"));
         assert!(exists(&db.conn, "idx_images_listing_taken"));
         assert!(!exists(&db.conn, "image_fts"));

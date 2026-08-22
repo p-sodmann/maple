@@ -12,6 +12,7 @@ mod listing_bench;
 mod scanner;
 mod schema;
 mod semantic_db;
+pub mod sync;
 mod sync_identity;
 mod thumb_cache;
 pub mod worker;
@@ -38,6 +39,7 @@ pub use metadata::{extract_all_exif_tags, extract_metadata, spawn_metadata_fille
 pub use query::{SearchOrder, SearchQuery};
 pub use scanner::{set_scanner_paused, LibraryScanner};
 pub use schema::SYNCED_TABLES;
+pub use sync::{ApplyReport, SyncBatch, SyncRow, Tombstone};
 pub use sync_identity::SyncIdentity;
 pub use thumb_cache::ThumbnailCache;
 pub use semantic::{spawn_sentence_embedder, split_sentences, SemanticEncoder, SentenceEmbedder};
@@ -179,6 +181,25 @@ pub struct LibraryImage {
 
 // ── Database ─────────────────────────────────────────────────────
 
+/// Replicated tables that `ON DELETE CASCADE` removes along with `parent`,
+/// paired with the foreign-key column that points back at it.
+///
+/// Mirrors the `REFERENCES … ON DELETE CASCADE` clauses in `schema.rs`.
+/// Relationships declared `ON DELETE SET NULL` — `face_detections.person_id`,
+/// `images.stack_id` — are absent on purpose: those children survive the
+/// delete and are stamped as ordinary edits instead.
+fn cascade_children(parent: &str) -> &'static [(&'static str, &'static str)] {
+    match parent {
+        "images" => &[
+            ("ai_descriptions", "image_id"),
+            ("face_detections", "image_id"),
+            ("collection_images", "image_id"),
+        ],
+        "collections" => &[("collection_images", "collection_id")],
+        _ => &[],
+    }
+}
+
 /// `(image_id, path, content_hash)` — returned by [`Database::images_without_hash`].
 type ImageHashCandidate = (i64, PathBuf, Option<[u8; 32]>);
 /// `(image_id, hash_blob, stack_id)` — returned by [`Database::images_with_hash_and_stack`].
@@ -257,13 +278,44 @@ impl Database {
             .query_row("SELECT lower(hex(randomblob(16)))", [], |r| r.get(0))?)
     }
 
-    /// Record that the rows with `ids` in `table` were deleted locally.
+    /// Draw `n` cryptographically random bytes.
+    ///
+    /// SQLite's `randomblob` rather than a `rand` dependency: it is seeded
+    /// from the OS CSPRNG, and it is already the source behind `device_id`
+    /// and every row guid, so sync has one place its randomness comes from
+    /// rather than two. `maple-sync` takes this through its `RandomSource`
+    /// trait, which is what lets its handshake tests replay a fixed stream.
+    pub fn random_bytes(&self, n: usize) -> anyhow::Result<Vec<u8>> {
+        // `randomblob(0)` returns *one* byte, not none — SQLite clamps N to
+        // at least 1. Handled here so a caller sizing a buffer from a length
+        // it computed cannot silently get one byte more than it asked for.
+        if n == 0 {
+            return Ok(Vec::new());
+        }
+        Ok(self
+            .conn
+            .query_row("SELECT randomblob(?1)", [n as i64], |r| r.get(0))?)
+    }
+
+    /// Record that the rows with `ids` in `table` were deleted locally,
+    /// along with everything `ON DELETE CASCADE` will take with them.
     ///
     /// Deletion has to be represented explicitly: a row that is simply gone
     /// is indistinguishable from a row the peer has not sent yet, so without
     /// a tombstone the next sync would helpfully restore everything the user
     /// just deleted. The tombstone carries a stamp so it can lose to a later
     /// edit — a peer that modified the row *after* this delete resurrects it.
+    ///
+    /// # Why children are tombstoned too
+    ///
+    /// It is tempting to tombstone only the parent and let each device's own
+    /// cascade clear its children — and for a plain delete that works. It
+    /// breaks under **resurrection**: if the peer edited the parent after the
+    /// delete, the parent comes back, but its children do not come back with
+    /// it. The two devices then disagree about which children exist, and
+    /// nothing re-sends them, because their stamps are older than the
+    /// watermark. Tombstoning the children makes the delete symmetric, so
+    /// both sides end up with the same (empty) set either way.
     ///
     /// Call this *before* the `DELETE`, while the guids are still readable.
     pub fn tombstone(&self, table: &str, ids: &[i64]) -> anyhow::Result<()> {
@@ -278,19 +330,38 @@ impl Database {
         let (rev, rev_dev) = self.stamp()?;
         let tx = self.conn.unchecked_transaction()?;
         {
-            let mut read = tx.prepare(&format!("SELECT guid FROM {table} WHERE id = ?1"))?;
             let mut write = tx.prepare(
                 "INSERT INTO sync_tombstones (guid, entity, rev, rev_dev)
                  VALUES (?1, ?2, ?3, ?4)
                  ON CONFLICT(guid) DO UPDATE SET rev = ?3, rev_dev = ?4",
             )?;
-            for id in ids {
-                let guid: Option<String> =
-                    read.query_row(params![id], |r| r.get(0)).optional()?.flatten();
+            let mut mark = |t: &str, guid: Option<String>| -> anyhow::Result<()> {
                 // A row with no guid predates V18 and was never replicated,
                 // so no peer can be holding a copy to resurrect.
                 if let Some(guid) = guid {
-                    write.execute(params![guid, table, rev, rev_dev])?;
+                    write.execute(params![guid, t, rev, rev_dev])?;
+                }
+                Ok(())
+            };
+
+            let mut read = tx.prepare(&format!("SELECT guid FROM {table} WHERE id = ?1"))?;
+            for id in ids {
+                mark(
+                    table,
+                    read.query_row(params![id], |r| r.get(0)).optional()?.flatten(),
+                )?;
+
+                for (child, fk) in cascade_children(table) {
+                    let mut kids = tx.prepare(&format!(
+                        "SELECT guid FROM {child} WHERE {fk} = ?1 AND guid IS NOT NULL"
+                    ))?;
+                    let guids: Vec<String> = kids
+                        .query_map(params![id], |r| r.get(0))?
+                        .filter_map(|r| r.ok())
+                        .collect();
+                    for guid in guids {
+                        mark(child, Some(guid))?;
+                    }
                 }
             }
         }
@@ -1732,6 +1803,16 @@ mod tests {
             )
             .unwrap();
         assert_eq!(person, None);
+    }
+
+    #[test]
+    fn random_bytes_are_the_requested_length_and_not_constant() {
+        let (_dir, db) = tmp_db();
+        let a = db.random_bytes(32).unwrap();
+        let b = db.random_bytes(32).unwrap();
+        assert_eq!(a.len(), 32);
+        assert_ne!(a, b, "randomblob must not return a constant");
+        assert!(db.random_bytes(0).unwrap().is_empty());
     }
 
     #[test]

@@ -3344,6 +3344,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "maple-sync"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "base64 0.22.1",
+ "blake3",
+ "maple-state",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tracing",
+]
+
+[[package]]
 name = "maple-tournament"
 version = "0.1.0"
 dependencies = [
