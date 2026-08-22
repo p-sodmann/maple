@@ -40,7 +40,7 @@ pub use metadata::{extract_all_exif_tags, extract_metadata, spawn_metadata_fille
 pub use query::{SearchOrder, SearchQuery};
 pub use scanner::{set_scanner_paused, LibraryScanner};
 pub use schema::SYNCED_TABLES;
-pub use sync::{ApplyReport, SyncBatch, SyncRow, Tombstone};
+pub use sync::{ApplyReport, MissingOriginal, SyncBatch, SyncRow, Tombstone};
 pub use sync_identity::SyncIdentity;
 pub use sync_peers::SyncPeer;
 pub use thumb_cache::ThumbnailCache;
@@ -539,10 +539,13 @@ impl Database {
     }
 
     /// Count images that have no hash for `algorithm`.
+    ///
+    /// Restricted to `locality = 'local'`: a relayed row's `path` names a file
+    /// on the device that holds it, and this work opens the file.
     pub fn count_images_without_hash(&self, algorithm: &str) -> anyhow::Result<usize> {
         let n: i64 = self.conn.query_row(
             "SELECT COUNT(*) FROM images
-             WHERE status = 'present'
+             WHERE status = 'present' AND locality = 'local'
                AND id NOT IN (
                    SELECT image_id FROM image_hashes WHERE algorithm = ?1
                )",
@@ -554,6 +557,9 @@ impl Database {
 
     /// Return up to `limit` images that have no hash for `algorithm`.
     /// Used by the background hasher to find pending work.
+    ///
+    /// Restricted to `locality = 'local'`: a relayed row's `path` names a file
+    /// on the device that holds it, and this work opens the file.
     pub fn images_without_hash(
         &self,
         algorithm: &str,
@@ -561,7 +567,7 @@ impl Database {
     ) -> anyhow::Result<Vec<ImageHashCandidate>> {
         let mut stmt = self.conn.prepare_cached(
             "SELECT id, path, hash FROM images
-             WHERE status = 'present'
+             WHERE status = 'present' AND locality = 'local'
                AND id NOT IN (
                    SELECT image_id FROM image_hashes WHERE algorithm = ?1
                )
@@ -1064,6 +1070,9 @@ impl Database {
 
     /// Return `(id, path)` for all present images that have no description
     /// from `model_id` yet.  Used by `spawn_ai_tagger`.
+    ///
+    /// Restricted to `locality = 'local'`: a relayed row's `path` names a file
+    /// on the device that holds it, and this work opens the file.
     pub fn images_needing_ai_description(
         &self,
         model_id: &str,
@@ -1071,7 +1080,7 @@ impl Database {
         let mut stmt = self.conn.prepare(
             "SELECT i.id, i.path
              FROM images i
-             WHERE i.status = 'present'
+             WHERE i.status = 'present' AND i.locality = 'local'
                AND NOT EXISTS (
                    SELECT 1 FROM ai_descriptions ad
                    WHERE ad.image_id = i.id AND ad.model_id = ?1
@@ -1169,10 +1178,16 @@ impl Database {
 
     /// Return `(id, path)` for all records where EXIF has not been extracted
     /// yet (`exif_extracted = 0`).  Used by `spawn_metadata_filler`.
+    ///
+    /// Restricted to `locality = 'local'`: a relayed row's `path` names a file
+    /// on the device that holds it, and this work opens the file.
     pub fn records_needing_metadata(&self) -> anyhow::Result<Vec<(i64, PathBuf)>> {
         let mut stmt = self
             .conn
-            .prepare("SELECT id, path FROM images WHERE exif_extracted = 0 AND status = 'present'")?;
+            .prepare(
+                "SELECT id, path FROM images
+                 WHERE exif_extracted = 0 AND status = 'present' AND locality = 'local'",
+            )?;
         let rows = stmt
             .query_map([], |row| {
                 Ok((
@@ -1252,9 +1267,13 @@ impl Database {
     /// All present images, packaged as restructure planning candidates (see
     /// `maple_import::restructure::plan_moves`). Metadata comes straight
     /// from already-extracted EXIF columns — no per-file disk re-read.
+    ///
+    /// Restricted to `locality = 'local'`: a relayed row's `path` names a file
+    /// on the device that holds it, and this work opens the file.
     pub fn restructure_candidates(&self) -> anyhow::Result<Vec<maple_import::RestructureCandidate>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, path, raw_path, taken_at, make, model FROM images WHERE status = 'present'",
+            "SELECT id, path, raw_path, taken_at, make, model
+             FROM images WHERE status = 'present' AND locality = 'local'",
         )?;
         let rows = stmt
             .query_map([], |r| {

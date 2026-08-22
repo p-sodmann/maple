@@ -9,6 +9,11 @@ maple-state = { path = "../maple-state" }
 # schema), so transport depends on it rather than the other way round. The
 # ONNX feature has to be forwarded because maple-db's is not additive.
 maple-db = { path = "../maple-db", default-features = false }
+# P7 files received originals through the same path templates a card import
+# uses, so that two machines in "full" mode end up organised identically.
+# `maple-import` is the crate that owns that rendering (and the BLAKE3 that
+# verifies a download) and depends on nothing above it.
+maple-import = { path = "../maple-import" }
 # blake3 covers both primitives this crate needs: derive_key is HKDF and
 # keyed_hash is a MAC, so pairing and request signing add no crypto dependency.
 blake3 = { workspace = true }

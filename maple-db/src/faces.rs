@@ -348,11 +348,14 @@ impl Database {
     /// Return `(id, path)` for images that have no face_detections row yet.
     ///
     /// Used by the background face tagger to determine what to process.
+    ///
+    /// Restricted to `locality = 'local'`: a relayed row's `path` names a file
+    /// on the device that holds it, and this work opens the file.
     pub fn images_needing_face_detection(&self) -> anyhow::Result<Vec<(i64, PathBuf)>> {
         let mut stmt = self.conn.prepare(
             "SELECT i.id, i.path
              FROM images i
-             WHERE i.status = 'present'
+             WHERE i.status = 'present' AND i.locality = 'local'
                AND NOT EXISTS (
                    SELECT 1 FROM face_detections fd WHERE fd.image_id = i.id
                )",

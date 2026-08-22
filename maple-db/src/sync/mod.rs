@@ -20,10 +20,12 @@
 
 pub mod apply;
 pub mod collect;
+pub mod originals;
 pub mod wire;
 
 pub use apply::ApplyReport;
 pub use collect::DEFAULT_MAX_REVS;
+pub use originals::MissingOriginal;
 pub use wire::{
     AiDescriptionRow, CollectionImageRow, CollectionRow, Entity, FaceRow, GuidAlias, ImageRow,
     PersonRow, StackRow, Stamp, SyncBatch, SyncRow, Tombstone,

@@ -124,7 +124,7 @@ impl Database {
         let mut stmt = self.conn.prepare(
             "SELECT i.guid, i.rev, i.rev_dev, i.hash, i.orientation, i.taken_at,
                     i.make, i.model, i.lens, i.focal_length, i.aperture, i.iso,
-                    i.width, i.height, s.guid, i.path, i.file_size
+                    i.width, i.height, s.guid, i.path, i.file_size, i.raw_path
              FROM images i
              LEFT JOIN stacks s ON s.id = i.stack_id
              WHERE i.guid = ?1",
@@ -195,7 +195,7 @@ impl Database {
         let mut stmt = self.conn.prepare(
             "SELECT i.guid, i.rev, i.rev_dev, i.hash, i.orientation, i.taken_at,
                     i.make, i.model, i.lens, i.focal_length, i.aperture, i.iso,
-                    i.width, i.height, s.guid, i.path, i.file_size
+                    i.width, i.height, s.guid, i.path, i.file_size, i.raw_path
              FROM images i
              LEFT JOIN stacks s ON s.id = i.stack_id
              WHERE i.rev > ?1 AND i.rev <= ?2 AND i.guid IS NOT NULL
@@ -401,6 +401,7 @@ fn image_row(r: &Row<'_>) -> rusqlite::Result<SyncRow> {
         stack_guid: r.get(14)?,
         origin_path: r.get(15)?,
         file_size: r.get(16)?,
+        origin_raw_path: r.get(17)?,
     }))
 }
 

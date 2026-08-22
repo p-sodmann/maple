@@ -31,8 +31,8 @@ use maple_state::SyncRole;
 use maple_sync::server::{ServerConfig, ServerDeps, ThumbRenderer};
 use maple_sync::worker::{WorkerConfig, WorkerDeps};
 use maple_sync::{
-    Clock, PairingSlot, SharedRandom, StatusCell, SyncClient, SyncServer, SyncStatus, SyncWorker,
-    TrustStore,
+    Clock, LibraryLayout, PairingSlot, SharedRandom, StatusCell, SyncClient, SyncServer, SyncStatus,
+    SyncWorker, TrustStore,
 };
 
 use crate::remote::RemoteBlobs;
@@ -165,6 +165,8 @@ impl SyncSupervisor {
                 rng: self.rng.clone(),
                 thumbs: self.thumbs.clone(),
                 render_thumb: self.thumb_renderer(),
+                layout: layout(settings),
+                on_change: Arc::new(on_change),
             },
         );
 
@@ -210,6 +212,7 @@ impl SyncSupervisor {
                 master_device_id,
                 interval: Duration::from_secs(settings.sync.interval_secs.max(1)),
                 max_revs: maple_db::sync::DEFAULT_MAX_REVS,
+                layout: layout(settings),
             },
             WorkerDeps {
                 db: self.db.clone(),
@@ -273,6 +276,20 @@ impl SyncSupervisor {
             .peers()
             .iter()
             .find_map(|peer| Some((peer.device_id.clone(), peer.address.clone()?)))
+    }
+}
+
+/// Where this device files a photo that arrives over the wire.
+///
+/// The import templates, not a second set: a library organised one way by the
+/// card importer and another by sync would be worse than either. Read on each
+/// restart rather than cached, so editing the template in Settings takes
+/// effect on the next role change like every other sync setting.
+fn layout(settings: &maple_state::Settings) -> LibraryLayout {
+    LibraryLayout {
+        library_dir: settings.library_dir.clone(),
+        folder_template: settings.path_template.folder.clone(),
+        filename_template: settings.path_template.filename.clone(),
     }
 }
 

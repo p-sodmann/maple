@@ -14,10 +14,10 @@ pub mod restructure;
 mod scan;
 pub mod sharpness;
 
-pub use copy::{copy_images, CopyResult, CopySummary};
+pub use copy::{copy_images, place_file, CopyResult, CopySummary};
 pub use embed_cache::EmbeddingCache;
 pub use exif_date::ExifDateTime;
-pub use hash::content_hash;
+pub use hash::{content_hash, hash_bytes};
 pub use image_source::{is_raw_format, loadable_image_bytes, raw_preview_supported};
 pub use loader::{apply_orientation, decode_image, decode_image_bytes};
 pub use path_template::{render_filename_stem, render_folder, TemplateContext};

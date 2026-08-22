@@ -30,12 +30,13 @@ use crate::auth::SignedRequest;
 use crate::backoff::FailureKind;
 use crate::pairing::{ClaimRequest, ClaimResponse};
 use crate::protocol::{
-    route, ErrorBody, ErrorCode, Hello, PullRequest, PushResponse, MAX_ORIG_BYTES,
-    MAX_THUMB_BYTES, PROTOCOL_VERSION,
+    route, ErrorBody, ErrorCode, Hello, PullRequest, PushResponse, UploadResponse, WantedRequest,
+    WantedResponse, MAX_ORIG_BYTES, MAX_THUMB_BYTES, PROTOCOL_VERSION,
 };
 use crate::random::SharedRandom;
 use crate::server::Clock;
 use crate::trust::PeerKey;
+use maple_state::PeerMode;
 
 /// How long a single request may take.
 ///
@@ -210,13 +211,34 @@ impl SyncClient {
     }
 
     /// `POST /sync/pull` — everything the master has stamped above `since`.
+    ///
+    /// `mode` rides along so the master's settings card can show what this
+    /// link actually does with files, rather than the `relay` that pairing
+    /// defaulted to. It is told, not asked: the servant's disk is the one at
+    /// stake, so the servant's setting is the one that counts.
     pub fn pull(
         &self,
         key: &PeerKey,
         since: i64,
         max_revs: usize,
+        mode: PeerMode,
     ) -> Result<SyncBatch, SyncFailure> {
-        self.signed_post(key, route::PULL, &PullRequest { since, max_revs })
+        self.signed_post(
+            key,
+            route::PULL,
+            &PullRequest {
+                since,
+                max_revs,
+                mode: Some(mode.as_str().to_owned()),
+            },
+        )
+    }
+
+    /// `POST /sync/wanted` — hashes the master lists but does not hold.
+    pub fn wanted(&self, key: &PeerKey, limit: usize) -> Result<Vec<[u8; 32]>, SyncFailure> {
+        let response: WantedResponse =
+            self.signed_post(key, route::WANTED, &WantedRequest { limit })?;
+        Ok(response.decoded())
     }
 
     /// `POST /sync/push` — merge our batch into the master.
@@ -244,6 +266,60 @@ impl SyncClient {
     ) -> Result<Vec<u8>, SyncFailure> {
         let path = route::blob(route::BLOB_ORIG, hash, raw);
         self.signed_get(key, &path, MAX_ORIG_BYTES)
+    }
+
+    /// `POST /blob/orig/{hash}[?raw=1]` — send an original to the master.
+    ///
+    /// # Why this one signs an empty body
+    ///
+    /// Every other signed request MACs a hash of its body, which is what
+    /// forces the server to buffer the whole thing before it can decide
+    /// whether the caller is anyone. Doing that here would mean holding a
+    /// 100 MB raw file in the master's memory to check a signature — for the
+    /// one route whose bodies are photographs.
+    ///
+    /// It is unnecessary, and only because the blob is *content-addressed*:
+    /// the hash is in the path, the path is signed, and the master hashes
+    /// what arrives and rejects it unless the two match. A tampered body
+    /// fails that check exactly as it would fail a MAC, so the master can
+    /// stream the upload to disk and verify as it goes. What the signature
+    /// still buys is that an unpaired machine cannot make it write anything
+    /// at all.
+    ///
+    /// The exception is `raw = true`: the schema hashes the display file, not
+    /// its companion, so there is nothing to check a raw upload against. See
+    /// [`crate::transfer`].
+    pub fn upload_orig(
+        &self,
+        key: &PeerKey,
+        hash: &[u8; 32],
+        raw: bool,
+        body: &mut dyn std::io::Read,
+    ) -> Result<UploadResponse, SyncFailure> {
+        let path = route::blob(route::BLOB_ORIG, hash, raw);
+        let credential = SignedRequest::sign_with(
+            key,
+            self.device_id.clone(),
+            "POST",
+            &path,
+            &[],
+            (self.clock)(),
+            &self.rng,
+        )
+        .map_err(|e| SyncFailure::transport(format!("could not sign request: {e}")))?;
+
+        let response = self
+            .agent
+            .post(&self.url(&path))
+            .header("Authorization", &credential.header())
+            .header(CLOSE.0, CLOSE.1)
+            .content_type("application/octet-stream")
+            // Streamed, not buffered: `send` with a reader means a 100 MB raw
+            // file crosses the wire in chunks rather than sitting in this
+            // servant's memory beside the copy already on its disk.
+            .send(ureq::SendBody::from_reader(body))
+            .map_err(to_failure)?;
+        decode(response)
     }
 
     /// A signed `GET` whose response is bytes rather than JSON.

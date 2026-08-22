@@ -104,6 +104,38 @@ impl Install {
         self.db.lock().expect("db lock")
     }
 
+    /// This installation's photo directory. Created on demand, because most
+    /// of these tests never put a file in one.
+    fn library_dir(&self) -> std::path::PathBuf {
+        let dir = self._dir.path().join("photos");
+        std::fs::create_dir_all(&dir).expect("library dir");
+        dir
+    }
+
+    /// Where this installation files a photo it receives. A flat destination
+    /// and the source name kept, so a test asserting on a path is asserting
+    /// on the transfer and not on the template renderer, which has its own
+    /// tests in `maple-import`.
+    fn layout(&self) -> maple_sync::LibraryLayout {
+        maple_sync::LibraryLayout {
+            library_dir: self.library_dir(),
+            folder_template: String::new(),
+            filename_template: "{original}".into(),
+        }
+    }
+
+    /// Add a real file to this library, as an import would: bytes on disk and
+    /// a `local` row that names them.
+    fn import(&self, name: &str, bytes: &[u8]) -> std::path::PathBuf {
+        let path = self.library_dir().join(name);
+        std::fs::write(&path, bytes).expect("write photo");
+        let hash = maple_import::content_hash(&path).expect("hash");
+        self.db()
+            .insert_image(&path, &hash, bytes.len() as u64)
+            .expect("insert");
+        path
+    }
+
     fn trust(&self) -> std::sync::MutexGuard<'_, TrustStore> {
         self.trust.lock().expect("trust lock")
     }
@@ -121,6 +153,10 @@ struct Master {
     /// How many times the injected renderer actually ran — the difference
     /// between "the master rendered this" and "the cache already had it".
     renders: Arc<AtomicI64>,
+    /// How many times the listener asked its UI to reload. A master is
+    /// passive and polls nothing, so this is the only thing standing between
+    /// a photo a servant sent and a grid that shows it after a restart.
+    changes: Arc<AtomicI64>,
 }
 
 impl Master {
@@ -150,6 +186,7 @@ impl Master {
                 Ok(format!("THUMB:{}", bytes.len()).into_bytes())
             })
         };
+        let changes = Arc::new(AtomicI64::new(0));
         let server = SyncServer::spawn(
             maple_sync::server::ServerConfig {
                 listen_addr: "127.0.0.1:0".into(),
@@ -165,6 +202,13 @@ impl Master {
                 rng,
                 thumbs: thumbs.clone(),
                 render_thumb,
+                layout: install.layout(),
+                on_change: {
+                    let changes = changes.clone();
+                    Arc::new(move || {
+                        changes.fetch_add(1, Ordering::Relaxed);
+                    })
+                },
             },
         )
         .expect("bind loopback");
@@ -175,6 +219,7 @@ impl Master {
             status,
             thumbs,
             renders,
+            changes,
         }
     }
 
@@ -551,7 +596,7 @@ fn an_unpaired_device_is_refused_and_the_client_calls_it_fatal() {
 
     let stranger = maple_sync::PeerKey::from_bytes([0x5A; 32]);
     let failure = client
-        .pull(&stranger, 0, 500)
+        .pull(&stranger, 0, 500, PeerMode::Relay)
         .expect_err("no key for this device");
     assert_eq!(failure.code, Some(ErrorCode::Unauthorized));
     assert_eq!(failure.kind, FailureKind::Auth, "must not retry");
@@ -565,7 +610,7 @@ fn unpairing_on_the_master_turns_a_working_link_fatal() {
     let client = client(&master, &servant, &clock, seeded(21));
     let outcome = pair(&master, &servant, &client, &clock, "482107", "314159").unwrap();
 
-    assert!(client.pull(&outcome.key, 0, 500).is_ok(), "paired link works");
+    assert!(client.pull(&outcome.key, 0, 500, PeerMode::Relay).is_ok(), "paired link works");
 
     master
         .install
@@ -573,7 +618,7 @@ fn unpairing_on_the_master_turns_a_working_link_fatal() {
         .remove_peer(&servant.device_id)
         .expect("unpair");
 
-    let failure = client.pull(&outcome.key, 0, 500).expect_err("key is gone");
+    let failure = client.pull(&outcome.key, 0, 500, PeerMode::Relay).expect_err("key is gone");
     assert_eq!(failure.kind, FailureKind::Auth);
     assert_eq!(failure.code, Some(ErrorCode::Unauthorized));
 }
@@ -589,6 +634,7 @@ fn a_replayed_request_is_rejected_but_stays_retryable() {
     // Built by hand so the *same* nonce goes out twice; `SyncClient` draws a
     // fresh one per call, which is exactly what stops this happening for real.
     let body = serde_json::to_vec(&maple_sync::PullRequest {
+        mode: None,
         since: 0,
         max_revs: 500,
     })
@@ -634,6 +680,7 @@ fn a_stale_timestamp_is_refused_without_demanding_a_re_pair() {
     let outcome = pair(&master, &servant, &client, &clock, "482107", "314159").unwrap();
 
     let body = serde_json::to_vec(&maple_sync::PullRequest {
+        mode: None,
         since: 0,
         max_revs: 500,
     })
@@ -669,6 +716,7 @@ fn a_body_rewritten_in_flight_does_not_verify() {
     let outcome = pair(&master, &servant, &client, &clock, "482107", "314159").unwrap();
 
     let signed_body = serde_json::to_vec(&maple_sync::PullRequest {
+        mode: None,
         since: 0,
         max_revs: 500,
     })
@@ -685,6 +733,7 @@ fn a_body_rewritten_in_flight_does_not_verify() {
 
     // A man in the middle rewinds the watermark to re-harvest the library.
     let tampered = serde_json::to_vec(&maple_sync::PullRequest {
+        mode: None,
         since: -1,
         max_revs: 999_999,
     })
@@ -732,7 +781,7 @@ fn metadata_flows_from_master_to_servant() {
         .create_collection("Iceland 2024", "#3584e4", None)
         .expect("create");
 
-    let batch = client.pull(&outcome.key, 0, 500).expect("pull");
+    let batch = client.pull(&outcome.key, 0, 500, PeerMode::Relay).expect("pull");
     assert!(!batch.is_empty(), "the master had a change to send");
     let report = maple_sync::merge::apply_and_refresh(&servant.db(), &batch, &master.install.device_id).expect("apply");
     assert!(report.changed());
@@ -783,10 +832,10 @@ fn a_pull_advances_the_masters_record_of_what_the_servant_holds() {
         .create_collection("Iceland", "#3584e4", None)
         .expect("create");
 
-    let batch = client.pull(&outcome.key, 0, 500).expect("first pull");
+    let batch = client.pull(&outcome.key, 0, 500, PeerMode::Relay).expect("first pull");
     assert!(batch.next_rev > 0);
     // The servant merges and comes back with the new watermark.
-    let _ = client.pull(&outcome.key, batch.next_rev, 500).expect("second pull");
+    let _ = client.pull(&outcome.key, batch.next_rev, 500, PeerMode::Relay).expect("second pull");
 
     let peer = master
         .install
@@ -839,7 +888,7 @@ fn concurrent_renames_converge_on_the_same_winner() {
         .db()
         .create_collection("Trip", "#3584e4", None)
         .unwrap();
-    let batch = client.pull(&outcome.key, 0, 500).unwrap();
+    let batch = client.pull(&outcome.key, 0, 500, PeerMode::Relay).unwrap();
     maple_sync::merge::apply_and_refresh(&servant.db(), &batch, &master.install.device_id).unwrap();
     let servant_id = servant.db().all_collections().unwrap()[0].id;
 
@@ -854,7 +903,7 @@ fn concurrent_renames_converge_on_the_same_winner() {
     // Full exchange in both directions.
     let ours = servant.db().collect_changes(0, 500).unwrap();
     client.push(&outcome.key, &ours).unwrap();
-    let theirs = client.pull(&outcome.key, batch.next_rev, 500).unwrap();
+    let theirs = client.pull(&outcome.key, batch.next_rev, 500, PeerMode::Relay).unwrap();
     maple_sync::merge::apply_and_refresh(&servant.db(), &theirs, &master.install.device_id).unwrap();
 
     let master_name = master.install.db().all_collections().unwrap()[0].name.clone();
@@ -916,6 +965,7 @@ fn spawn_worker(
             // both the sleep and the stop check.
             interval: Duration::from_millis(50),
             max_revs: 500,
+            layout: servant.layout(),
         },
         maple_sync::worker::WorkerDeps {
             db: servant.db.clone(),
@@ -1019,8 +1069,12 @@ fn the_worker_keeps_its_watermarks_so_a_second_pass_is_quiet() {
         })
     });
 
-    wait_until("the collection to arrive", || {
+    // Wait for the *callback*, not just the row: a pass applies the batch and
+    // then reports it, and a snapshot taken between the two would count the
+    // delivering pass's own report as if an idle pass had made it.
+    wait_until("the collection to arrive and be reported", || {
         collection_names(&servant) == vec!["Once".to_owned()]
+            && changes.load(Ordering::Relaxed) > 0
     });
     let after_first = changes.load(Ordering::Relaxed);
 
@@ -1110,6 +1164,7 @@ fn a_worker_with_no_master_listening_shows_a_retry_countdown() {
             master_device_id: "dev-ghost".into(),
             interval: Duration::from_millis(50),
             max_revs: 500,
+            layout: servant.layout(),
         },
         maple_sync::worker::WorkerDeps {
             db: servant.db.clone(),
@@ -1187,6 +1242,7 @@ fn a_master_that_comes_back_refreshes_the_ui_with_nothing_to_merge() {
             master_device_id: install.device_id.clone(),
             interval: Duration::from_millis(50),
             max_revs: 500,
+            layout: servant.layout(),
         },
         maple_sync::worker::WorkerDeps {
             db: servant.db.clone(),
@@ -1232,6 +1288,8 @@ fn a_master_that_comes_back_refreshes_the_ui_with_nothing_to_merge() {
             rng: seeded(72),
             thumbs,
             render_thumb: Arc::new(|_: &std::path::Path| Ok(Vec::new())),
+            layout: install.layout(),
+            on_change: Arc::new(|| {}),
         },
     )
     .expect("rebind the address the master just released");
@@ -1296,7 +1354,7 @@ fn the_masters_pill_counts_servants_that_actually_called() {
         "Listening · no devices"
     );
 
-    client.pull(&outcome.key, 0, 500).expect("pull");
+    client.pull(&outcome.key, 0, 500, PeerMode::Relay).expect("pull");
     wait_until("the master to notice the servant", || {
         master.status.lock().unwrap().display().label == "1 device"
     });
@@ -1465,7 +1523,7 @@ fn a_relay_servant_browses_the_masters_library_without_storing_a_file() {
     let hash = master_photo(&master, "holiday.jpg", contents);
 
     // 1. The row arrives, and lands as a real library entry.
-    let batch = client.pull(&outcome.key, 0, 500).expect("pull");
+    let batch = client.pull(&outcome.key, 0, 500, PeerMode::Relay).expect("pull");
     let report =
         maple_sync::merge::apply_and_refresh(&servant.db(), &batch, &master.install.device_id)
             .expect("apply");
@@ -1504,4 +1562,337 @@ fn a_relay_servant_browses_the_masters_library_without_storing_a_file() {
 
 fn hex(hash: &[u8; 32]) -> String {
     hash.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+// ── Originals (P7: full and partial) ────────────────────────────
+
+/// One full metadata exchange, both directions, as a pass does it.
+///
+/// P7's transfers are all downstream of this: a photo can only be downloaded
+/// once the row naming it exists here, and can only be uploaded once the
+/// master has a row waiting for it.
+fn sync_metadata(
+    master: &Master,
+    servant: &Install,
+    client: &SyncClient,
+    key: &maple_sync::PeerKey,
+) {
+    let batch = client.pull(key, 0, 500, PeerMode::Relay).expect("pull");
+    maple_sync::merge::apply_and_refresh(&servant.db(), &batch, &master.install.device_id)
+        .expect("apply");
+    let ours = servant.db().collect_changes(0, 500).expect("collect");
+    client.push(key, &ours).expect("push");
+}
+
+/// Run the file half of a pass, with nothing asking it to stop.
+fn move_files(
+    servant: &Install,
+    client: &SyncClient,
+    key: &maple_sync::PeerKey,
+    mode: PeerMode,
+) -> maple_sync::TransferOutcome {
+    maple_sync::transfer::transfer(
+        &servant.db,
+        client,
+        key,
+        mode,
+        &servant.layout(),
+        &|| false,
+        &|_, _| {},
+    )
+    .expect("transfer")
+}
+
+/// Photo files (not staging, not the database) directly inside a library.
+fn photos_in(dir: &std::path::Path) -> Vec<String> {
+    let mut names: Vec<String> = std::fs::read_dir(dir)
+        .expect("read library dir")
+        .filter_map(|e| e.ok())
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .filter(|name| !name.starts_with('.'))
+        .collect();
+    names.sort();
+    names
+}
+
+#[test]
+fn a_full_servant_ends_up_holding_the_masters_photos() {
+    let clock = TestClock::new();
+    let master = Master::start(&clock, seeded(86));
+    let servant = Install::new("Laptop");
+    let client = client(&master, &servant, &clock, seeded(87));
+    let outcome = pair(&master, &servant, &client, &clock, "482107", "314159").unwrap();
+
+    let contents = b"the master's only photograph";
+    let path = master.install.import("holiday.jpg", contents);
+    let hash = maple_import::content_hash(&path).unwrap();
+    sync_metadata(&master, &servant, &client, &outcome.key);
+    assert_eq!(
+        servant.db().originals_to_fetch(10).unwrap().len(),
+        1,
+        "P6 leaves it relayed; P7 is what fetches it"
+    );
+
+    let moved = move_files(&servant, &client, &outcome.key, PeerMode::Full);
+    assert_eq!(moved.downloaded, 1);
+    assert_eq!(moved.skipped, 0);
+
+    // The bytes are here, under this device's own path template.
+    assert_eq!(photos_in(&servant.library_dir()), vec!["holiday.jpg"]);
+    let landed = servant.library_dir().join("holiday.jpg");
+    assert_eq!(std::fs::read(&landed).unwrap(), contents);
+
+    // And the row now says so, which is what stops the grid fetching pixels
+    // over the wire for a file that is sitting on this disk.
+    assert!(servant.db().originals_to_fetch(10).unwrap().is_empty());
+    assert_eq!(servant.db().holds_original(&hash).unwrap(), Some(landed));
+    let listed = servant
+        .db()
+        .search_images(&maple_db::SearchQuery::default())
+        .unwrap();
+    assert_eq!(listed[0].locality, maple_db::Locality::Local);
+
+    // A second pass has nothing left to do — the queue is what makes it
+    // idempotent, and re-downloading every photo every five minutes would be
+    // the worst possible bug to ship here.
+    let again = move_files(&servant, &client, &outcome.key, PeerMode::Full);
+    assert_eq!(again.downloaded, 0);
+    assert_eq!(photos_in(&servant.library_dir()), vec!["holiday.jpg"]);
+}
+
+#[test]
+fn a_partial_servant_pushes_its_photos_and_leaves_the_masters_alone() {
+    // The mode's whole definition: the servant's originals end up on the
+    // master, and master-only photos stay relayed on the servant.
+    let clock = TestClock::new();
+    let master = Master::start(&clock, seeded(88));
+    let servant = Install::new("Laptop");
+    let client = client(&master, &servant, &clock, seeded(89));
+    let outcome = pair(&master, &servant, &client, &clock, "482107", "314159").unwrap();
+
+    let theirs = b"a photo only the master has";
+    master.install.import("master.jpg", theirs);
+    let mine = b"a photo taken on the laptop";
+    let mine_path = servant.import("laptop.jpg", mine);
+    let mine_hash = maple_import::content_hash(&mine_path).unwrap();
+    sync_metadata(&master, &servant, &client, &outcome.key);
+
+    let moved = move_files(&servant, &client, &outcome.key, PeerMode::Partial);
+    assert_eq!(moved.uploaded, 1);
+    assert_eq!(moved.downloaded, 0, "partial does not pull originals down");
+
+    // Up: the master holds it, filed under the *master's* template.
+    assert!(master.install.library_dir().join("laptop.jpg").exists());
+    assert_eq!(
+        std::fs::read(master.install.library_dir().join("laptop.jpg")).unwrap(),
+        mine
+    );
+    assert!(master.install.db().holds_original(&mine_hash).unwrap().is_some());
+    assert!(master.install.db().originals_to_fetch(10).unwrap().is_empty());
+
+    // Down: nothing. The master's photo is still one the servant relays.
+    assert_eq!(photos_in(&servant.library_dir()), vec!["laptop.jpg"]);
+    let queued = servant.db().originals_to_fetch(10).unwrap();
+    assert_eq!(queued.len(), 1);
+    assert_eq!(queued[0].filename, "master.jpg");
+}
+
+#[test]
+fn a_relay_servant_moves_nothing_in_either_direction() {
+    // P6's contract, now that there is machinery that could break it: relay
+    // means no originals cross, not "originals cross more slowly".
+    let clock = TestClock::new();
+    let master = Master::start(&clock, seeded(90));
+    let servant = Install::new("Laptop");
+    let client = client(&master, &servant, &clock, seeded(91));
+    let outcome = pair(&master, &servant, &client, &clock, "482107", "314159").unwrap();
+
+    master.install.import("master.jpg", b"master bytes");
+    servant.import("laptop.jpg", b"laptop bytes");
+    sync_metadata(&master, &servant, &client, &outcome.key);
+
+    let moved = move_files(&servant, &client, &outcome.key, PeerMode::Relay);
+    assert_eq!(moved, maple_sync::TransferOutcome::default());
+    assert_eq!(photos_in(&servant.library_dir()), vec!["laptop.jpg"]);
+    assert_eq!(photos_in(&master.install.library_dir()), vec!["master.jpg"]);
+    assert_eq!(servant.db().originals_to_fetch(10).unwrap().len(), 1);
+    assert_eq!(master.install.db().originals_to_fetch(10).unwrap().len(), 1);
+}
+
+#[test]
+fn a_companion_raw_travels_with_the_photo_it_belongs_to() {
+    // The Fujifilm case: a JPEG and its RAF are one library row, and a full
+    // sync that moved only the JPEG would silently drop the negative.
+    let clock = TestClock::new();
+    let master = Master::start(&clock, seeded(92));
+    let servant = Install::new("Laptop");
+    let client = client(&master, &servant, &clock, seeded(93));
+    let outcome = pair(&master, &servant, &client, &clock, "482107", "314159").unwrap();
+
+    let jpeg = b"the embedded preview";
+    let negative = b"the raw negative, much larger in real life";
+    let display = servant.library_dir().join("DSCF0001.JPG");
+    let raw = servant.library_dir().join("DSCF0001.RAF");
+    std::fs::write(&display, jpeg).unwrap();
+    std::fs::write(&raw, negative).unwrap();
+    let hash = maple_import::content_hash(&display).unwrap();
+    servant
+        .db()
+        .insert_image_with_raw(&display, &hash, jpeg.len() as u64, Some(&raw))
+        .unwrap();
+
+    sync_metadata(&master, &servant, &client, &outcome.key);
+    // The master learned there *is* a companion — advisory, from the wire —
+    // which is the only reason it will accept one.
+    let queued = master.install.db().originals_to_fetch(10).unwrap();
+    assert_eq!(queued[0].raw_filename.as_deref(), Some("DSCF0001.RAF"));
+
+    let moved = move_files(&servant, &client, &outcome.key, PeerMode::Partial);
+    assert_eq!(moved.uploaded, 1, "one photo, even though two files crossed");
+
+    assert_eq!(
+        photos_in(&master.install.library_dir()),
+        vec!["DSCF0001.JPG", "DSCF0001.RAF"]
+    );
+    assert_eq!(
+        std::fs::read(master.install.library_dir().join("DSCF0001.RAF")).unwrap(),
+        negative
+    );
+    // And the row points at the master's own copy of both.
+    let raw_path = master
+        .install
+        .db()
+        .blob_path(&hash, true)
+        .unwrap()
+        .expect("the master knows where its companion is");
+    assert!(raw_path.starts_with(master.install.library_dir()), "{raw_path:?}");
+    assert!(
+        master.install.db().originals_to_fetch(10).unwrap().is_empty(),
+        "nothing is still waiting"
+    );
+    assert!(
+        master.changes.load(Ordering::Relaxed) > 0,
+        "the master's own grid has to be told a photo landed — it polls nothing"
+    );
+}
+
+#[test]
+fn bytes_that_do_not_hash_to_what_they_were_sent_as_are_refused() {
+    // The upload route verifies as it writes, which is the only reason it can
+    // stream a photograph without checking a MAC over it first.
+    let clock = TestClock::new();
+    let master = Master::start(&clock, seeded(94));
+    let servant = Install::new("Laptop");
+    let client = client(&master, &servant, &clock, seeded(95));
+    let outcome = pair(&master, &servant, &client, &clock, "482107", "314159").unwrap();
+
+    let path = servant.import("laptop.jpg", b"the real photograph");
+    let hash = maple_import::content_hash(&path).unwrap();
+    sync_metadata(&master, &servant, &client, &outcome.key);
+    assert!(master.install.db().row_wanting(&hash).unwrap().is_some());
+
+    let failure = client
+        .upload_orig(&outcome.key, &hash, false, &mut &b"something else entirely"[..])
+        .expect_err("the master must not take these");
+    assert_eq!(failure.code, Some(ErrorCode::BadRequest));
+    assert_eq!(
+        failure.kind,
+        FailureKind::Unreachable,
+        "one bad blob is not a broken pairing"
+    );
+
+    // Nothing was filed, and nothing was left behind in staging either.
+    assert!(photos_in(&master.install.library_dir()).is_empty());
+    assert!(!master
+        .install
+        .layout()
+        .staged_path(&hash, false)
+        .exists());
+    assert!(
+        master.install.db().row_wanting(&hash).unwrap().is_some(),
+        "the row is still waiting for the real bytes"
+    );
+}
+
+#[test]
+fn a_master_will_not_take_a_blob_nothing_here_is_waiting_for() {
+    // The admission rule that keeps this route from being "write a file into
+    // my library": a paired peer can only fill in a row that already exists.
+    let clock = TestClock::new();
+    let master = Master::start(&clock, seeded(96));
+    let servant = Install::new("Laptop");
+    let client = client(&master, &servant, &clock, seeded(97));
+    let outcome = pair(&master, &servant, &client, &clock, "482107", "314159").unwrap();
+
+    let contents = b"a photo the master has never heard of";
+    let hash: [u8; 32] = blake3::hash(contents).into();
+    let failure = client
+        .upload_orig(&outcome.key, &hash, false, &mut &contents[..])
+        .expect_err("unsolicited");
+    assert_eq!(failure.code, Some(ErrorCode::NotFound));
+    assert!(photos_in(&master.install.library_dir()).is_empty());
+}
+
+#[test]
+fn an_unpaired_machine_cannot_upload_anything() {
+    let clock = TestClock::new();
+    let master = Master::start(&clock, seeded(98));
+    let servant = Install::new("Laptop");
+    let client = client(&master, &servant, &clock, seeded(99));
+    let stranger = maple_sync::PeerKey::from_bytes([9u8; 32]);
+
+    let failure = client
+        .upload_orig(&stranger, &[0x11u8; 32], false, &mut &b"bytes"[..])
+        .expect_err("no key for this device");
+    assert_eq!(failure.code, Some(ErrorCode::Unauthorized));
+    assert!(photos_in(&master.install.library_dir()).is_empty());
+}
+
+#[test]
+fn the_servants_mode_reaches_the_masters_peer_list() {
+    // Pairing defaults every peer to relay, because a mode chosen before the
+    // user has picked one must not fill a disk. The servant then says what it
+    // actually is, on every pull, or the master's card lies forever.
+    let clock = TestClock::new();
+    let master = Master::start(&clock, seeded(100));
+    let servant = Install::new("Laptop");
+    let client = client(&master, &servant, &clock, seeded(101));
+    let outcome = pair(&master, &servant, &client, &clock, "482107", "314159").unwrap();
+
+    let peer = master.install.db().sync_peer(&servant.device_id).unwrap().unwrap();
+    assert_eq!(peer.mode, PeerMode::Relay, "the safe default");
+
+    client.pull(&outcome.key, 0, 500, PeerMode::Full).expect("pull");
+
+    let peer = master.install.db().sync_peer(&servant.device_id).unwrap().unwrap();
+    assert_eq!(peer.mode, PeerMode::Full);
+}
+
+#[test]
+fn the_worker_moves_originals_without_being_told_to_twice() {
+    // End to end through the loop itself: the mode comes from the servant's
+    // own `sync_peers` row, the transfer runs as part of a pass, and the
+    // photo lands on disk with nothing driving it by hand.
+    let clock = TestClock::new();
+    let master = Master::start(&clock, seeded(102));
+    let servant = Install::new("Laptop");
+    let client = client(&master, &servant, &clock, seeded(103));
+    let outcome = pair(&master, &servant, &client, &clock, "482107", "314159").unwrap();
+    servant
+        .db()
+        .set_sync_peer_mode(&outcome.device_id, PeerMode::Full)
+        .expect("full mode");
+
+    let contents = b"a photo that should end up on both machines";
+    master.install.import("shared.jpg", contents);
+
+    let status = maple_sync::SyncStatus::cell(maple_state::SyncRole::Servant);
+    let worker = spawn_worker(&master, &servant, &clock, status, Arc::new(|| {}));
+
+    let landed = servant.library_dir().join("shared.jpg");
+    wait_until("the worker to bring the photo across", || landed.exists());
+    worker.stop();
+
+    assert_eq!(std::fs::read(&landed).unwrap(), contents);
+    assert!(servant.db().originals_to_fetch(10).unwrap().is_empty());
 }

@@ -107,10 +107,34 @@ single binary; the backend is fixed at compile time.
   missing and evict their thumbnails. Pixels come from two signed routes on the master —
   `GET /blob/thumb/{hash}` (rendered on a cache miss through a `ThumbRenderer` injected
   from `maple-ui`, because `maple-ui` depends on `maple-sync` and not the reverse) and
-  `GET /blob/orig/{hash}` (streamed **verbatim**; P7 will verify its BLAKE3). The client
-  handle lives in `maple-ui/src/remote.rs` as a process-wide `RemoteBlobs`, written and
-  *cleared* by `SyncSupervisor::restart`. Thumbnails are cached locally; originals are
-  memory-only — that is what makes it a relay.
+  `GET /blob/orig/{hash}` (streamed **verbatim**, so the receiver can verify its
+  BLAKE3). The client handle lives in `maple-ui/src/remote.rs` as a process-wide
+  `RemoteBlobs`, written and *cleared* by `SyncSupervisor::restart`. Thumbnails are
+  cached locally; originals are memory-only — that is what makes it a relay.
+- **Moving originals** (`maple-sync/src/transfer.rs`, P7): what makes `PeerMode::Full`
+  and `Partial` mean something. **Both directions are driven by the servant** — a master
+  has no client and does not know how to reach a servant, so "the master fetches the
+  servant's originals" (§3.8) is really the servant asking `POST /sync/wanted` and
+  uploading with `POST /blob/orig/{hash}`. Three rules that are easy to break:
+  - **The receiver verifies.** A display file's hash is in the (signed) URL and is
+    checked against the bytes before anything is written into a library. That content
+    address is *why* the upload route can sign an empty body and stream a 100 MB raw to
+    disk instead of buffering it to check a MAC. A **companion raw is unverifiable** —
+    the schema hashes the display file only — and is accepted on the pairing's word; an
+    `images.raw_hash` column would close that.
+  - **Only a row that is already waiting can be filled in.** `Database::row_wanting`
+    gates every upload, so a paired peer can complete a photo this library already
+    replicated the metadata of and cannot invent, replace or misplace one.
+  - **Rename and adopt happen under one database lock.** The 60-second scanner inserts
+    any file no row claims and `images.path` is UNIQUE, so a scan landing between the
+    two would take the path and leave `adopt_original` failing on the constraint. Bytes
+    stage in `library_dir/.incoming` (hidden, so the scanner skips it) with no lock held;
+    only the rename and the row update are locked.
+  Anything that reads `images.path` to *open a file* must filter `locality = 'local'` —
+  the AI tagger, face tagger, perceptual hasher, metadata filler and restructure planner
+  all do. `ServerDeps::on_change` is the master's equivalent of the servant worker's:
+  a master polls nothing, so without it a photo a servant sent sits unseen until the app
+  restarts. (The 60-second scanner still refreshes nothing — that gap predates sync.)
 - **Raw file support**: Only Fujifilm RAF currently. Always use `maple_import::loadable_image_bytes(path)` for loading images (handles raw preview extraction transparently). Check format with `maple_import::is_raw_format(path)`.
 
 ### Database

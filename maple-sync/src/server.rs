@@ -22,8 +22,10 @@
 //! POST /pair/claim         unsigned — the §2.1 handshake
 //! POST /sync/pull          signed   — "everything stamped above my watermark"
 //! POST /sync/push          signed   — merge the caller's batch
+//! POST /sync/wanted        signed   — hashes this device lists but lacks
 //! GET  /blob/thumb/{hash}  signed   — WebP thumbnail, rendered on a miss
 //! GET  /blob/orig/{hash}   signed   — the original file, streamed
+//! POST /blob/orig/{hash}   signed   — receive an original (§3.8)
 //! ```
 //!
 //! The blob routes are what make **relay** possible: a servant that stores no
@@ -31,13 +33,28 @@
 //! They are signed like everything else — an unpaired machine on the LAN must
 //! not be able to read the library one photo at a time.
 //!
+//! The last two are P7's, and they are the master's entire part in moving
+//! files *to* it: it cannot dial a servant, so a servant asks what is wanted
+//! and posts it. What that admits is deliberately narrow — a paired peer can
+//! only supply bytes for a row this library already holds the metadata of,
+//! and only bytes that hash to what that row already says. See
+//! [`crate::transfer`].
+//!
 //! # What "signed" costs, in order
 //!
-//! For the two signed routes the body is read *before* anything else looks at
-//! it, because the MAC covers a hash of it — which means an unauthenticated
+//! For the JSON routes the body is read *before* anything else looks at it,
+//! because the MAC covers a hash of it — which means an unauthenticated
 //! caller chooses how much the server allocates. [`MAX_BODY_BYTES`] is the
 //! bound on that, and it is checked against the declared length before the
 //! read rather than after.
+//!
+//! The upload route is the one exception, and has to be: its bodies are
+//! photographs, and buffering one to check a signature would mean holding a
+//! whole raw file in memory before knowing whether the caller is anyone. It
+//! verifies the signature over the *path* with an empty body and streams what
+//! follows to disk — safe only because the path names the content hash, which
+//! is checked against the bytes as they land. See
+//! [`SyncClient::upload_orig`](crate::client::SyncClient::upload_orig).
 //!
 //! The signature is then checked before the JSON is parsed. Parsing first
 //! would run a serde deserializer over attacker-controlled bytes for no
@@ -64,9 +81,10 @@ use crate::auth::{NonceRing, SignedRequest};
 use crate::merge::{apply_and_refresh, may_advance};
 use crate::pairing::{ClaimRequest, PairingSlot};
 use crate::protocol::{
-    route, ErrorBody, ErrorCode, Hello, PullRequest, PushResponse, MAX_BODY_BYTES,
-    PROTOCOL_VERSION,
+    route, ErrorBody, ErrorCode, Hello, PullRequest, PushResponse, UploadResponse, WantedRequest,
+    WantedResponse, MAX_BODY_BYTES, PROTOCOL_VERSION,
 };
+use crate::transfer::{receive_to_file, LibraryLayout, MAX_UPLOAD_BYTES};
 use crate::random::SharedRandom;
 use crate::status::StatusCell;
 use crate::trust::{TrustStore, TrustedPeer};
@@ -133,6 +151,19 @@ pub struct ServerDeps {
     /// The master's own thumbnail store, consulted before rendering anything.
     pub thumbs: Arc<ThumbnailCache>,
     pub render_thumb: ThumbRenderer,
+    /// Where an uploaded original is filed. The same templates the master's
+    /// own imports use, so a photo that arrives from a servant is organised
+    /// as if it had been imported here.
+    pub layout: LibraryLayout,
+    /// Run after a request changed this library, so the caller can reload
+    /// what it is showing.
+    ///
+    /// A master is passive in every other respect, which is exactly why it
+    /// needs this: nothing on this side polls, so a photo a servant pushed
+    /// would sit in the database unseen until the app was restarted. Called
+    /// from the listener thread — a UI caller must marshal
+    /// (`slint::Weak::upgrade_in_event_loop`).
+    pub on_change: Arc<dyn Fn() + Send + Sync>,
 }
 
 /// Everything a request handler needs.
@@ -150,6 +181,8 @@ struct Ctx {
     config: ServerConfig,
     thumbs: Arc<ThumbnailCache>,
     render_thumb: ThumbRenderer,
+    layout: LibraryLayout,
+    on_change: Arc<dyn Fn() + Send + Sync>,
 }
 
 /// A running master listener. Dropping it stops the thread.
@@ -183,6 +216,8 @@ impl SyncServer {
             config,
             thumbs: deps.thumbs,
             render_thumb: deps.render_thumb,
+            layout: deps.layout,
+            on_change: deps.on_change,
         });
 
         let stop = Arc::new(AtomicBool::new(false));
@@ -299,6 +334,7 @@ fn handle(ctx: &Ctx, mut request: tiny_http::Request) {
         ("POST", route::PAIR_CLAIM) => read_body(&mut request).and_then(|body| claim(ctx, &body)),
         ("POST", route::PULL) => signed(ctx, &mut request, &method, &url, pull),
         ("POST", route::PUSH) => signed(ctx, &mut request, &method, &url, push),
+        ("POST", route::WANTED) => signed(ctx, &mut request, &method, &url, wanted),
         ("GET", p) if p.starts_with(route::BLOB_THUMB) => {
             let p = p.to_owned();
             signed(ctx, &mut request, &method, &url, move |ctx, _dev, _body| {
@@ -309,6 +345,12 @@ fn handle(ctx: &Ctx, mut request: tiny_http::Request) {
             let (p, raw) = (p.to_owned(), wants_raw(&url));
             signed(ctx, &mut request, &method, &url, move |ctx, _dev, _body| {
                 blob_orig(ctx, &p, raw)
+            })
+        }
+        ("POST", p) if p.starts_with(route::BLOB_ORIG) => {
+            let (p, raw) = (p.to_owned(), wants_raw(&url));
+            signed_stream(ctx, &mut request, &method, &url, move |ctx, _dev, request| {
+                blob_upload(ctx, request, &p, raw)
             })
         }
         _ => Err(ErrorBody::new(
@@ -353,6 +395,38 @@ fn signed<F>(
 where
     F: FnOnce(&Ctx, &str, &[u8]) -> Result<Payload, ErrorBody>,
 {
+    let credential = credential(request)?;
+    let body = read_body(request)?;
+    verify(ctx, &credential, method, url, &body)?;
+    // Only now is `device_id` more than a claim.
+    f(ctx, &credential.device_id, &body)
+}
+
+/// Verify the signature over an **empty** body, then hand `f` the request
+/// with its body still unread.
+///
+/// Only for the upload route, and only because the blob is content-addressed:
+/// the hash is in the signed path, and `f` checks the bytes against it as it
+/// writes them. Do not reach for this for a route whose body is not
+/// self-verifying — there the MAC is the only thing standing between a paired
+/// peer's request and a forged one.
+fn signed_stream<F>(
+    ctx: &Ctx,
+    request: &mut tiny_http::Request,
+    method: &str,
+    url: &str,
+    f: F,
+) -> Result<Payload, ErrorBody>
+where
+    F: FnOnce(&Ctx, &str, &mut tiny_http::Request) -> Result<Payload, ErrorBody>,
+{
+    let credential = credential(request)?;
+    verify(ctx, &credential, method, url, &[])?;
+    let device_id = credential.device_id.clone();
+    f(ctx, &device_id, request)
+}
+
+fn credential(request: &tiny_http::Request) -> Result<SignedRequest, ErrorBody> {
     let header = request
         .headers()
         .iter()
@@ -360,11 +434,16 @@ where
         .map(|h| h.value.as_str().to_owned())
         .ok_or_else(|| ErrorBody::new(ErrorCode::Malformed, "no Authorization header"))?;
 
-    let credential = SignedRequest::parse(&header)
-        .map_err(|e| ErrorBody::new(ErrorCode::from(e), e.to_string()))?;
+    SignedRequest::parse(&header).map_err(|e| ErrorBody::new(ErrorCode::from(e), e.to_string()))
+}
 
-    let body = read_body(request)?;
-
+fn verify(
+    ctx: &Ctx,
+    credential: &SignedRequest,
+    method: &str,
+    url: &str,
+    body: &[u8],
+) -> Result<(), ErrorBody> {
     // Look the key up and release the trust lock before verifying: the MAC is
     // cheap but the lock is also taken by pairing, which writes a file.
     let key = {
@@ -382,15 +461,10 @@ where
     };
 
     let now = (ctx.clock)();
-    {
-        let mut nonces = lock(&ctx.nonces);
-        credential
-            .verify(&key, method, url, &body, now, &mut nonces)
-            .map_err(|e| ErrorBody::new(ErrorCode::from(e), e.to_string()))?;
-    }
-
-    // Only now is `device_id` more than a claim.
-    f(ctx, &credential.device_id, &body)
+    let mut nonces = lock(&ctx.nonces);
+    credential
+        .verify(&key, method, url, body, now, &mut nonces)
+        .map_err(|e| ErrorBody::new(ErrorCode::from(e), e.to_string()))
 }
 
 // ── Handlers ────────────────────────────────────────────────────
@@ -476,6 +550,17 @@ fn pull(ctx: &Ctx, device_id: &str, body: &[u8]) -> Result<Payload, ErrorBody> {
     let db = lock(&ctx.db);
     let batch = db.collect_changes(request.since, max_revs).map_err(internal)?;
 
+    // The mode is the servant's to choose, so the master takes what it is
+    // told. Recorded before the watermarks because it is what the settings
+    // card renders, and a peer that never gets past the first pull should
+    // still show as what it actually is.
+    if let Some(mode) = request.mode.as_deref() {
+        let reported = PeerMode::parse(mode);
+        if let Err(e) = db.set_sync_peer_mode(device_id, reported) {
+            tracing::warn!("sync server: could not record {device_id}'s mode: {e}");
+        }
+    }
+
     // A pull at watermark N is the peer telling us it holds everything we
     // stamped at or below N. That is the only signal the master gets in this
     // direction, and §3.3's tombstone pruning needs it.
@@ -503,10 +588,136 @@ fn push(ctx: &Ctx, device_id: &str, body: &[u8]) -> Result<Payload, ErrorBody> {
         tracing::warn!("sync server: could not touch {device_id}: {e}");
     }
 
+    // The lock goes before the callback: a UI reload reads the same database,
+    // and handing it the mutex we are still holding would deadlock it.
+    let changed = report.changed();
+    drop(db);
+    if changed {
+        (ctx.on_change)();
+    }
+
     encode(&PushResponse {
         applied: report.inserted + report.updated + report.deleted + report.resurrected,
         deferred: report.deferred,
         acked_rev: batch.next_rev,
+    })
+}
+
+/// `POST /sync/wanted` — the hashes this device lists but does not hold.
+///
+/// The master's whole part in receiving files. It cannot dial a servant, so
+/// it publishes what it is short of and lets whoever can supply it do so.
+/// Answering costs one indexed scan of the relayed rows, and it tells a
+/// caller nothing it did not already learn from the metadata it pulled.
+fn wanted(ctx: &Ctx, _device_id: &str, body: &[u8]) -> Result<Payload, ErrorBody> {
+    let request: WantedRequest = parse(body)?;
+    let limit = if request.limit == 0 {
+        crate::transfer::MAX_TRANSFERS_PER_PASS
+    } else {
+        request.limit.min(crate::transfer::MAX_TRANSFERS_PER_PASS * 4)
+    };
+
+    let db = lock(&ctx.db);
+    let hashes = db.wanted_hashes(limit).map_err(internal)?;
+    encode(&WantedResponse {
+        hashes: hashes.iter().map(route::hex).collect(),
+    })
+}
+
+/// `POST /blob/orig/{hash}[?raw=1]` — take delivery of an original.
+///
+/// # What this is allowed to write
+///
+/// Only a file some row here is already waiting for. The hash must name a
+/// `locality = 'remote'` row, and the bytes must hash to it — so a paired
+/// peer can fill in a photo this library already knows about and cannot
+/// invent a new one, replace an existing one, or choose a path. That is a
+/// tighter grant than the peer already has over metadata, and it is what
+/// makes accepting writes over the network defensible at all.
+///
+/// # Why a companion is staged rather than filed
+///
+/// A row names one display file and one companion, and adopting the display
+/// file is what flips it to local. Filing the companion afterwards would find
+/// nothing waiting for it, so a raw arrives *first*, waits in `.incoming`,
+/// and is placed in the same breath as the display file it belongs to.
+fn blob_upload(
+    ctx: &Ctx,
+    request: &mut tiny_http::Request,
+    path: &str,
+    raw: bool,
+) -> Result<Payload, ErrorBody> {
+    let hash = blob_hash(path, route::BLOB_ORIG)?;
+
+    let row = {
+        let db = lock(&ctx.db);
+        db.row_wanting(&hash).map_err(internal)?
+    };
+    let Some(row) = row else {
+        // Not an error on the sender's part: it asked what was wanted, and
+        // between then and now another servant may have supplied this very
+        // photo. `NotFound` is the code that has it drop this file and keep
+        // the link.
+        return Err(ErrorBody::new(
+            ErrorCode::NotFound,
+            "nothing here is waiting for that hash",
+        ));
+    };
+    if raw && row.raw_filename.is_none() {
+        return Err(ErrorBody::new(
+            ErrorCode::BadRequest,
+            "that photo has no companion here",
+        ));
+    }
+
+    let staged = ctx.layout.staged_path(&hash, raw);
+    let written = receive_to_file(request.as_reader(), &staged, MAX_UPLOAD_BYTES).map_err(|e| {
+        let _ = std::fs::remove_file(&staged);
+        internal(e)
+    })?;
+
+    if raw {
+        // Unverifiable — the schema hashes the display file, not its
+        // companion — so this one is taken on the pairing's word. See the
+        // `transfer` module docs.
+        return encode(&UploadResponse {
+            stored: false,
+            path: None,
+        });
+    }
+    if written != hash {
+        let _ = std::fs::remove_file(&staged);
+        return Err(ErrorBody::new(
+            ErrorCode::BadRequest,
+            "those bytes do not hash to the blob they were sent as",
+        ));
+    }
+
+    // Filing and adopting under one lock, deliberately: this master's own
+    // library scanner inserts any file no row claims, and `images.path` is
+    // UNIQUE, so a scan landing between the two would take the path and leave
+    // the adoption to fail on the constraint. See `crate::transfer`.
+    let placed = {
+        let db = lock(&ctx.db);
+        let placed = ctx.layout.place(&staged, &row.filename).map_err(internal)?;
+        let staged_raw = ctx.layout.staged_path(&hash, true);
+        let placed_raw = match (&row.raw_filename, staged_raw.exists()) {
+            (Some(name), true) => Some(ctx.layout.place(&staged_raw, name).map_err(internal)?),
+            _ => None,
+        };
+        db.adopt_original(row.id, &placed, placed_raw.as_deref())
+            .map_err(internal)?;
+        placed
+    };
+    ctx.layout.discard(&hash);
+    tracing::info!("sync server: received {} → {}", row.filename, placed.display());
+    // The row stopped being relayed and now has a file behind it, which is a
+    // different tile in the grid.
+    (ctx.on_change)();
+
+    encode(&UploadResponse {
+        stored: true,
+        path: Some(placed.display().to_string()),
     })
 }
 

@@ -148,6 +148,81 @@ where
     })
 }
 
+/// Move one already-materialised file into a library, organised by the same
+/// templates a card import uses.
+///
+/// This is the seam sync needs and [`copy_images`] cannot provide. A
+/// downloaded original arrives as bytes with a *sender's* filename attached
+/// and no path of its own; the caller stages it somewhere (verifying its
+/// hash while it does), and this puts it where the library's own rules say it
+/// belongs. Doing it any other way — a flat drop, or a path echoing the
+/// sender's folders — would leave two machines in "full" mode organised
+/// differently, which is the one thing §3.8 asks for.
+///
+/// `original_name` is the *sender's* file name, extension included: it
+/// supplies the `{original}` token and the extension the copy keeps. The
+/// date and camera tokens are read from `staged` itself, so a photo files
+/// under the day it was taken on both machines rather than the day it
+/// happened to arrive.
+///
+/// `staged` is **moved**, not copied — a rename within the library directory
+/// is atomic and does not double the disk cost of a large raw file. It falls
+/// back to copy-and-remove when the two are on different filesystems, which
+/// is what a caller staging in a system temp dir will hit.
+///
+/// The `{counter}` token renders as 1: there is no batch here, only ever one
+/// file. A template that leans entirely on it collides, and
+/// [`unique_dest_path`] resolves that the same way it does for an import.
+pub fn place_file(
+    staged: &Path,
+    destination: &Path,
+    folder_template: &str,
+    filename_template: &str,
+    original_name: &str,
+) -> anyhow::Result<PathBuf> {
+    let original = Path::new(original_name);
+    let original_stem = original
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("file");
+    let extension = original.extension().and_then(|e| e.to_str()).unwrap_or("");
+
+    let (datetime, camera) = read_exif_context(staged);
+    let datetime = datetime.or_else(|| mtime_fallback(staged));
+    let ctx = TemplateContext {
+        datetime,
+        original_stem,
+        counter: 1,
+        camera: camera.as_deref(),
+    };
+
+    let target_dir = if folder_template.is_empty() {
+        destination.to_path_buf()
+    } else {
+        destination.join(path_template::render_folder(folder_template, &ctx))
+    };
+    std::fs::create_dir_all(&target_dir)
+        .map_err(|e| anyhow::anyhow!("failed to create {}: {e}", target_dir.display()))?;
+
+    let stem = path_template::render_filename_stem(filename_template, &ctx);
+    let stem = if stem.is_empty() { original_stem.to_owned() } else { stem };
+    let dest = unique_dest_path(&stem, extension, &target_dir);
+
+    if std::fs::rename(staged, &dest).is_err() {
+        // Different filesystems, most likely. Copy first and only then drop
+        // the staged file, so a failure here leaves the caller's bytes intact
+        // rather than losing a download that has already been verified.
+        std::fs::copy(staged, &dest).map_err(|e| {
+            anyhow::anyhow!("failed to place {} at {}: {e}", staged.display(), dest.display())
+        })?;
+        if let Err(e) = std::fs::remove_file(staged) {
+            tracing::warn!("could not remove staged file {}: {e}", staged.display());
+        }
+    }
+    tracing::info!("Placed {} → {}", original_name, dest.display());
+    Ok(dest)
+}
+
 /// Read EXIF `DateTimeOriginal` and Make/Model (for the `{camera}` token)
 /// from `path` in a single reader pass. For raw files, reads from the
 /// embedded preview (raw containers aren't parsed directly) — see
@@ -277,6 +352,51 @@ mod tests {
         assert!(dst_dir.path().join("a.jpg").exists());
         assert!(dst_dir.path().join("b.png").exists());
         assert_eq!(progress_calls, vec![(1, 2), (2, 2)]);
+    }
+
+    #[test]
+    fn place_file_moves_the_staged_file_under_the_template() {
+        let staged_dir = tempfile::tempdir().unwrap();
+        let lib = tempfile::tempdir().unwrap();
+        let staged = staged_dir.path().join("blob.part");
+        fs::write(&staged, b"downloaded bytes").unwrap();
+        // No EXIF in those bytes, so the mtime fallback supplies the date —
+        // which is why the assertion below is on the name, not the folder.
+        let dest = place_file(&staged, lib.path(), "", "{original}", "DSCF0001.JPG").unwrap();
+
+        assert_eq!(dest, lib.path().join("DSCF0001.JPG"));
+        assert_eq!(fs::read(&dest).unwrap(), b"downloaded bytes");
+        assert!(!staged.exists(), "the staged file is moved, not copied");
+    }
+
+    #[test]
+    fn place_file_keeps_the_senders_extension_and_avoids_collisions() {
+        let staged_dir = tempfile::tempdir().unwrap();
+        let lib = tempfile::tempdir().unwrap();
+        fs::write(lib.path().join("DSCF0001.RAF"), b"already here").unwrap();
+
+        let staged = staged_dir.path().join("blob.part");
+        fs::write(&staged, b"the raw file").unwrap();
+        let dest = place_file(&staged, lib.path(), "", "{original}", "DSCF0001.RAF").unwrap();
+
+        assert_eq!(dest, lib.path().join("DSCF0001_1.RAF"));
+        assert_eq!(fs::read(lib.path().join("DSCF0001.RAF")).unwrap(), b"already here");
+    }
+
+    #[test]
+    fn place_file_creates_the_folders_the_template_asks_for() {
+        let staged_dir = tempfile::tempdir().unwrap();
+        let lib = tempfile::tempdir().unwrap();
+        let staged = staged_dir.path().join("blob.part");
+        fs::write(&staged, b"bytes").unwrap();
+
+        // The mtime of a file written a moment ago is "now", so the year
+        // folder is whatever year it is — assert on the shape, not a literal.
+        let dest = place_file(&staged, lib.path(), "{YYYY}/{MM}", "{original}", "a.jpg").unwrap();
+        let relative = dest.strip_prefix(lib.path()).unwrap();
+        let parts: Vec<_> = relative.components().collect();
+        assert_eq!(parts.len(), 3, "{}", relative.display());
+        assert!(dest.exists());
     }
 
     #[test]

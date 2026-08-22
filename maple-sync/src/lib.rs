@@ -45,6 +45,7 @@ pub mod protocol;
 pub mod random;
 pub mod server;
 pub mod status;
+pub mod transfer;
 pub mod trust;
 pub mod worker;
 
@@ -61,4 +62,5 @@ pub use worker::{SyncWorker, WorkerConfig};
 pub use status::{
     relative_time, StatusCell, StatusDisplay, StatusTone, SyncRole, SyncState, SyncStatus,
 };
+pub use transfer::{LibraryLayout, TransferOutcome};
 pub use trust::{PeerKey, TrustFile, TrustStore, TrustedPeer};

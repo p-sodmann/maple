@@ -3369,6 +3369,7 @@ dependencies = [
  "base64 0.22.1",
  "blake3",
  "maple-db",
+ "maple-import",
  "maple-state",
  "serde",
  "serde_json",

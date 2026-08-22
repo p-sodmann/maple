@@ -557,19 +557,24 @@ impl Database {
                 } else {
                     format!("maple-remote://{}/{}", r.guid, name)
                 };
+                // `raw_path` holds the origin's path for the same reason
+                // `path` does, and with the same rule: never opened here. It
+                // is what tells a full-mode transfer that this photo has a
+                // companion worth asking for — without it the servant would
+                // have to guess, and guessing costs a round trip per JPEG.
                 self.conn.execute(
                     "INSERT INTO images
                          (path, hash, file_size, added_at, status, filename, taken_at,
                           make, model, lens, focal_length, aperture, iso, width, height,
                           orientation, exif_extracted, guid, rev, rev_dev,
-                          locality, origin_device)
+                          locality, origin_device, raw_path)
                      VALUES (?1, ?2, ?3, ?4, 'present', ?5, ?6, ?7, ?8, ?9, ?10, ?11,
-                             ?12, ?13, ?14, ?15, 1, ?16, ?17, ?18, 'remote', ?19)",
+                             ?12, ?13, ?14, ?15, 1, ?16, ?17, ?18, 'remote', ?19, ?20)",
                     params![
                         path, r.hash.as_slice(), r.file_size, now_secs(), name, r.taken_at,
                         r.make, r.model, r.lens, r.focal_length, r.aperture, r.iso,
                         r.width, r.height, r.orientation, r.guid, r.stamp.rev, r.stamp.rev_dev,
-                        ctx.origin_device
+                        ctx.origin_device, r.origin_raw_path
                     ],
                 )?;
             }

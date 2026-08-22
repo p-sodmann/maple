@@ -13,6 +13,7 @@
 //! hello            → is anything there, and can we merge with it
 //! pull  → apply    → repeat while the master still has more
 //! collect → push   → repeat while we still have more
+//! transfer         → move originals, if this link's mode moves any
 //! ```
 //!
 //! Pull runs before push so that a conflicting edit is resolved against the
@@ -46,9 +47,10 @@ use crate::backoff::{Backoff, FailureKind, Retry};
 use crate::client::{SyncClient, SyncFailure};
 use crate::merge::{apply_and_refresh, may_advance};
 use crate::server::Clock;
+use crate::transfer::{self, LibraryLayout};
 use crate::status::{StatusCell, SyncState};
 use crate::trust::{PeerKey, TrustStore};
-use maple_state::SyncRole;
+use maple_state::{PeerMode, SyncRole};
 
 /// Most pull-or-push rounds in a single pass.
 ///
@@ -82,7 +84,18 @@ pub struct WorkerConfig {
     /// backoff schedule.
     pub interval: Duration,
     pub max_revs: usize,
+    /// Where a downloaded original is filed, when the mode says to keep one.
+    pub layout: LibraryLayout,
 }
+
+/// How long to wait before a pass that still has files queued.
+///
+/// A first sync in **full** mode is thousands of photos and each pass moves
+/// at most [`transfer::MAX_TRANSFERS_PER_PASS`] of them; waiting out the
+/// five-minute idle interval between batches would turn an afternoon into a
+/// fortnight. Not zero, so the loop still yields and a quit is still noticed
+/// promptly.
+const CATCHUP_INTERVAL: Duration = Duration::from_secs(2);
 
 /// A running servant loop. Dropping it stops the thread.
 pub struct SyncWorker {
@@ -121,6 +134,8 @@ struct PassOutcome {
     pending: usize,
     /// Whether anything landed locally — the signal to refresh the UI.
     changed: bool,
+    /// Whether the file half of the pass stopped with work still queued.
+    more_files: bool,
 }
 
 /// Start syncing with a master.
@@ -169,7 +184,12 @@ pub fn spawn(config: WorkerConfig, deps: WorkerDeps) -> SyncWorker {
                             on_change();
                         }
                         recovering = false;
-                        match stop_rx.recv_timeout(config.interval) {
+                        let wait = if outcome.more_files {
+                            CATCHUP_INTERVAL
+                        } else {
+                            config.interval
+                        };
+                        match stop_rx.recv_timeout(wait) {
                             Ok(_) | Err(RecvTimeoutError::Disconnected) => break,
                             Err(RecvTimeoutError::Timeout) => {}
                         }
@@ -258,6 +278,7 @@ fn run_pass(
     }
 
     let key = peer_key(trust, &config.master_device_id)?;
+    let mode = peer_mode(db, &config.master_device_id);
     let mut outcome = PassOutcome::default();
 
     // ── Pull ────────────────────────────────────────────────────
@@ -265,7 +286,7 @@ fn run_pass(
     for _ in 0..MAX_ROUNDS {
         check_stop(stop_rx)?;
         let since = watermark(db, &config.master_device_id).0;
-        let batch = client.pull(&key, since, config.max_revs)?;
+        let batch = client.pull(&key, since, config.max_revs, mode)?;
         if batch.next_rev <= since {
             break;
         }
@@ -342,7 +363,63 @@ fn run_pass(
         outcome.pending = 0;
     }
 
+    // ── Files ───────────────────────────────────────────────────
+    //
+    // After metadata, never before: a photo can only be downloaded once its
+    // row exists to be filled in, and can only be uploaded once the master
+    // has a row to want it. On a first sync the two happen in the same pass,
+    // in this order.
+    check_stop(stop_rx)?;
+    let files = transfer::transfer(
+        db,
+        client,
+        &key,
+        mode,
+        &config.layout,
+        &|| matches!(stop_rx.try_recv(), Ok(_) | Err(TryRecvError::Disconnected)),
+        &|done, total| {
+            set_state(
+                status,
+                SyncState::Running {
+                    done: done as u32,
+                    total: total as u32,
+                },
+                None,
+            );
+        },
+    )?;
+    if files.moved() > 0 || files.skipped > 0 {
+        tracing::info!(
+            "sync worker: {} downloaded, {} uploaded, {} skipped",
+            files.downloaded,
+            files.uploaded,
+            files.skipped
+        );
+    }
+    outcome.more_files = files.more_pending;
+    // A downloaded photo stops being a relayed one: its tile now has a file
+    // behind it, so the grid has to re-read the row it is drawing.
+    outcome.changed |= files.downloaded > 0;
+
     Ok(outcome)
+}
+
+/// This link's file mode, as the *servant* has it set.
+///
+/// The servant's disk is the one that fills, so the servant's setting governs
+/// — and it is the servant's settings card that offers the choice. An
+/// unreadable or absent peer row reads as [`PeerMode::Relay`], the mode that
+/// moves nothing: a missing setting must not start filling a disk.
+fn peer_mode(db: &Arc<Mutex<Database>>, master_device_id: &str) -> PeerMode {
+    let guard = lock(db);
+    match guard.sync_peer(master_device_id) {
+        Ok(Some(peer)) => peer.mode,
+        Ok(None) => PeerMode::Relay,
+        Err(e) => {
+            tracing::warn!("sync worker: could not read the peer's mode: {e}");
+            PeerMode::Relay
+        }
+    }
 }
 
 /// `(last_pull_rev, last_push_rev)` for the master, defaulting to zero.
@@ -399,7 +476,15 @@ fn internal(error: impl std::fmt::Display) -> PassError {
 
 fn publish_success(status: &StatusCell, outcome: &PassOutcome, now_ms: i64) {
     let mut guard = lock(status);
-    guard.state = SyncState::Idle;
+    // "Synced" only when there is genuinely nothing left. A first full sync
+    // finishes its metadata in seconds and its photographs in hours, and a
+    // green idle pill through all of that would be a lie the user has no way
+    // to check. With files still queued the state is left exactly as the last
+    // transfer set it — rewriting it to a fresh `0/0` every two seconds would
+    // make the count flicker rather than climb.
+    if !outcome.more_files {
+        guard.state = SyncState::Idle;
+    }
     guard.peers_online = 1;
     guard.last_sync_ms = Some(now_ms);
     guard.pending = outcome.pending as u32;

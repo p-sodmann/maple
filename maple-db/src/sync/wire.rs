@@ -18,6 +18,12 @@
 //!   sentence vectors, centroids and `representative_*_id` are all recomputed
 //!   locally, and the last two are local rowids besides.
 //!
+//!   The two path columns travel in a weakened form — `origin_path` and
+//!   `origin_raw_path` — which is not the same thing as replicating them:
+//!   they are read when *creating* a row nobody here has seen (to name it,
+//!   and to know a raw companion exists to fetch) and never written over a
+//!   path this machine chose. See [`ImageRow::origin_path`].
+//!
 //! The one deliberate exception is EXIF: `taken_at`, `make`, `model` and the
 //! rest *do* replicate, because a relay servant holds no file to extract them
 //! from. Extraction is deterministic, so two devices that both have the
@@ -133,6 +139,17 @@ pub struct ImageRow {
     /// Advisory, same rule as `origin_path`; lets a relay servant show a size
     /// and lets a transfer plan estimate its cost before fetching anything.
     pub file_size: i64,
+    /// Where the origin keeps this photo's companion raw file, if it has one.
+    /// Advisory like the two above, and the only way a receiving device can
+    /// know a companion exists at all: a `?raw=1` fetch is worth making only
+    /// for a photo that has one, and blind-asking for every photo would cost
+    /// a round trip per JPEG in the library.
+    ///
+    /// `default` rather than required, so a master that predates this field
+    /// still parses — its rows simply carry no companion, which is what a
+    /// device that never sent one means.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origin_raw_path: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -403,11 +420,27 @@ mod tests {
             stack_guid: None,
             origin_path: "/photos/a.jpg".into(),
             file_size: 1234,
+            origin_raw_path: Some("/photos/a.raf".into()),
         };
         let text = serde_json::to_string(&row).expect("serialize");
         assert!(text.contains(&"ab".repeat(32)), "hash should be hex");
         let back: ImageRow = serde_json::from_str(&text).expect("deserialize");
         assert_eq!(row, back);
+    }
+
+    #[test]
+    fn a_row_from_a_peer_that_never_heard_of_raw_companions_still_parses() {
+        // P7 added `origin_raw_path`. A master still on the P6 build sends
+        // rows without it, and refusing those would break the link on an
+        // upgrade rather than on a protocol change — which is precisely what
+        // `serde(default)` is here to prevent.
+        let hash = "ab".repeat(32);
+        let text = format!(r#"{{"guid":"g","rev":1,"rev_dev":"dev","hash":"{hash}","orientation":null,
+            "taken_at":null,"make":null,"model":null,"lens":null,"focal_length":null,
+            "aperture":null,"iso":null,"width":null,"height":null,"stack_guid":null,
+            "origin_path":"/photos/a.jpg","file_size":9}}"#);
+        let row: ImageRow = serde_json::from_str(&text).expect("deserialize");
+        assert_eq!(row.origin_raw_path, None);
     }
 
     #[test]

@@ -72,7 +72,20 @@ pub mod route {
     pub const BLOB_THUMB: &str = "/blob/thumb/";
     /// `GET /blob/orig/{hex_hash}[?raw=1]` → the original file's bytes,
     /// streamed. `?raw=1` asks for the companion raw file instead.
+    ///
+    /// `POST` to the same URL **sends** those bytes, which is how a photo
+    /// gets from a servant to its master (§3.8). One URL for both directions
+    /// is not a shortcut: the hash in it is what the receiver checks the
+    /// bytes against, so read and write name a blob the same way or neither
+    /// can be verified.
     pub const BLOB_ORIG: &str = "/blob/orig/";
+
+    /// `POST /sync/wanted` → the hashes the answering device is missing.
+    ///
+    /// A master never dials a servant — it does not know how to reach one —
+    /// so "the master fetches the servant's originals" happens as the servant
+    /// asking what is wanted and uploading it.
+    pub const WANTED: &str = "/sync/wanted";
 
     /// Build a blob path. The MAC covers the path exactly as written here,
     /// query string included, so client and server must never build it two
@@ -80,28 +93,41 @@ pub mod route {
     pub fn blob(prefix: &str, hash: &[u8; 32], raw: bool) -> String {
         let mut out = String::with_capacity(prefix.len() + 64 + 6);
         out.push_str(prefix);
-        for byte in hash {
-            out.push_str(&format!("{byte:02x}"));
-        }
+        out.push_str(&hex(hash));
         if raw {
             out.push_str("?raw=1");
         }
         out
     }
 
-    /// Parse the hex hash out of a blob path. `None` if it is not 64 hex
-    /// characters — a hash is fixed-width, so anything else is a malformed
-    /// request rather than a miss.
-    pub fn blob_hash(path: &str, prefix: &str) -> Option<[u8; 32]> {
-        let hex = path.strip_prefix(prefix)?;
-        if hex.len() != 64 {
+    /// A hash as it appears in a URL or a `wanted` list.
+    pub fn hex(hash: &[u8; 32]) -> String {
+        let mut out = String::with_capacity(64);
+        for byte in hash {
+            out.push_str(&format!("{byte:02x}"));
+        }
+        out
+    }
+
+    /// Inverse of [`hex`]. `None` for anything that is not 64 hex characters,
+    /// on the same reasoning as [`blob_hash`]: a hash is fixed-width, so a
+    /// short one is a malformed request rather than a miss.
+    pub fn unhex(text: &str) -> Option<[u8; 32]> {
+        if text.len() != 64 {
             return None;
         }
         let mut out = [0u8; 32];
         for (i, byte) in out.iter_mut().enumerate() {
-            *byte = u8::from_str_radix(hex.get(i * 2..i * 2 + 2)?, 16).ok()?;
+            *byte = u8::from_str_radix(text.get(i * 2..i * 2 + 2)?, 16).ok()?;
         }
         Some(out)
+    }
+
+    /// Parse the hex hash out of a blob path. `None` if it is not 64 hex
+    /// characters — a hash is fixed-width, so anything else is a malformed
+    /// request rather than a miss.
+    pub fn blob_hash(path: &str, prefix: &str) -> Option<[u8; 32]> {
+        unhex(path.strip_prefix(prefix)?)
     }
 }
 
@@ -137,6 +163,55 @@ pub struct PullRequest {
     /// `maple_db::sync::collect`, where the batch boundary is a stamp value
     /// rather than a row count so a stamp group is never split.
     pub max_revs: usize,
+    /// The caller's file mode for this link, as `PeerMode::as_str`.
+    ///
+    /// The mode is the *servant's* setting — it is the servant's disk that
+    /// fills or does not — and it is chosen in the servant's settings card.
+    /// Reporting it here is what keeps the master's own peer list honest
+    /// instead of showing the `relay` that pairing defaulted to forever.
+    /// Optional so a master can read a P6 servant's request.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mode: Option<String>,
+}
+
+/// `POST /sync/wanted` — "which hashes are you missing?".
+///
+/// Asked by a servant in **full** or **partial** mode, which is why the
+/// answer needs no mode of its own: a device that is not going to upload
+/// anything never asks.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct WantedRequest {
+    /// How many hashes to name. The server clamps it.
+    pub limit: usize,
+}
+
+/// The answer: hashes of photos the master lists but does not hold.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct WantedResponse {
+    /// Hex, lower case, 64 characters each — [`route::hex`].
+    pub hashes: Vec<String>,
+}
+
+impl WantedResponse {
+    /// Decode, dropping anything malformed rather than failing the pass.
+    ///
+    /// A hash that does not parse is one blob not transferred; refusing the
+    /// whole list would stop a working link over a single bad entry.
+    pub fn decoded(&self) -> Vec<[u8; 32]> {
+        self.hashes.iter().filter_map(|h| route::unhex(h)).collect()
+    }
+}
+
+/// `POST /blob/orig/{hash}` — what the receiver did with the bytes.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct UploadResponse {
+    /// Whether the file was filed into the library. `false` for a companion
+    /// raw, which waits, staged, for the display file it belongs to.
+    pub stored: bool,
+    /// Where it landed, for the log on the sending side. Never used to
+    /// derive anything — it names a path on the *other* machine.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
 }
 
 /// `POST /sync/push` — the result of merging the caller's batch.
