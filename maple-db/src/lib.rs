@@ -14,6 +14,7 @@ mod schema;
 mod semantic_db;
 pub mod sync;
 mod sync_identity;
+mod sync_peers;
 mod thumb_cache;
 pub mod worker;
 
@@ -41,6 +42,7 @@ pub use scanner::{set_scanner_paused, LibraryScanner};
 pub use schema::SYNCED_TABLES;
 pub use sync::{ApplyReport, SyncBatch, SyncRow, Tombstone};
 pub use sync_identity::SyncIdentity;
+pub use sync_peers::SyncPeer;
 pub use thumb_cache::ThumbnailCache;
 pub use semantic::{spawn_sentence_embedder, split_sentences, SemanticEncoder, SentenceEmbedder};
 
@@ -265,6 +267,16 @@ impl Database {
     /// Advance the local clock past a stamp received from a peer.
     pub fn observe_remote_rev(&self, rev: i64) {
         self.identity.observe(rev);
+    }
+
+    /// The schema version this library is at (`PRAGMA user_version`).
+    ///
+    /// Sync reports it in its handshake: two installations that differ here
+    /// may disagree about what a replicated row even contains, and the
+    /// honest response is to refuse the link rather than merge rows one side
+    /// cannot represent.
+    pub fn schema_version(&self) -> anyhow::Result<i64> {
+        Ok(self.conn.query_row("PRAGMA user_version", [], |r| r.get(0))?)
     }
 
     /// Generate a fresh row guid.

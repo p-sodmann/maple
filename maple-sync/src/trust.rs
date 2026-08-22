@@ -197,6 +197,100 @@ impl TrustFile {
     }
 }
 
+
+// ── The store ───────────────────────────────────────────────────
+
+/// A [`TrustFile`] that remembers where it came from.
+///
+/// `TrustFile::save` writes to [`TrustFile::path`], which is derived from
+/// `config_dir()` and therefore from `HOME`. That is right for the running
+/// app and wrong for everything else: a test that exercised pairing would
+/// quietly overwrite the developer's own keys, and a second library opened
+/// from a different directory would share one credential store with the
+/// first.
+///
+/// Pairing writes secrets, so "remember to call `save_to` with the right
+/// path" is not a safe interface. This one carries the path with the data and
+/// persists on every mutation, so there is no unsaved state to lose and no
+/// path to get wrong.
+pub struct TrustStore {
+    path: PathBuf,
+    file: TrustFile,
+}
+
+impl TrustStore {
+    /// Load the store at `path`, creating an empty one for this device if the
+    /// file does not exist yet.
+    ///
+    /// A *corrupt* file is still an error — see [`TrustFile::load_from`].
+    /// Starting fresh there would present as "every device needs re-pairing"
+    /// while hiding the reason.
+    pub fn open(
+        path: PathBuf,
+        device_id: impl Into<String>,
+        device_name: impl Into<String>,
+    ) -> anyhow::Result<Self> {
+        let file = TrustFile::load_from(&path)?
+            .unwrap_or_else(|| TrustFile::new(device_id, device_name));
+        Ok(Self { path, file })
+    }
+
+    /// The store at the default location.
+    pub fn open_default(
+        device_id: impl Into<String>,
+        device_name: impl Into<String>,
+    ) -> anyhow::Result<Self> {
+        Self::open(TrustFile::path(), device_id, device_name)
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    pub fn device_id(&self) -> &str {
+        &self.file.device_id
+    }
+
+    pub fn peer(&self, device_id: &str) -> Option<&TrustedPeer> {
+        self.file.peer(device_id)
+    }
+
+    pub fn peers(&self) -> &[TrustedPeer] {
+        &self.file.peers
+    }
+
+    /// Store a peer's key and persist immediately.
+    pub fn upsert_peer(&mut self, peer: TrustedPeer) -> anyhow::Result<()> {
+        self.file.upsert_peer(peer);
+        self.file.save_to(&self.path)
+    }
+
+    /// Forget a peer. Returns whether it was there.
+    pub fn remove_peer(&mut self, device_id: &str) -> anyhow::Result<bool> {
+        let removed = self.file.remove_peer(device_id);
+        if removed {
+            self.file.save_to(&self.path)?;
+        }
+        Ok(removed)
+    }
+
+    /// Record the address a peer was last reached at, if it changed.
+    ///
+    /// Skips the write when nothing moved: this is called after every
+    /// successful pass, and rewriting a key file every few minutes for no
+    /// reason is a needless chance to be interrupted mid-rename.
+    pub fn note_address(&mut self, device_id: &str, address: &str) -> anyhow::Result<()> {
+        let Some(peer) = self.file.peers.iter_mut().find(|p| p.device_id == device_id) else {
+            return Ok(());
+        };
+        if peer.address.as_deref() == Some(address) {
+            return Ok(());
+        }
+        peer.address = Some(address.to_owned());
+        self.file.save_to(&self.path)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -310,5 +404,96 @@ mod tests {
         )
         .unwrap();
         assert!(TrustFile::load_from(&path).is_err());
+    }
+}
+
+#[cfg(test)]
+mod store_tests {
+    use super::*;
+
+    fn store(dir: &tempfile::TempDir) -> TrustStore {
+        TrustStore::open(dir.path().join("sync_trust.json"), "dev-a", "Workstation").expect("open")
+    }
+
+    #[test]
+    fn a_missing_file_opens_as_an_empty_store_for_this_device() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(&dir);
+        assert_eq!(store.device_id(), "dev-a");
+        assert!(store.peers().is_empty());
+        assert!(!store.path().exists(), "opening must not create the file");
+    }
+
+    #[test]
+    fn upsert_persists_immediately_and_survives_a_reopen() {
+        // The point of the type: there is no unsaved state to lose, so a
+        // pairing completed a millisecond before a crash is still a pairing.
+        let dir = tempfile::tempdir().unwrap();
+        let mut first = store(&dir);
+        first
+            .upsert_peer(TrustedPeer {
+                device_id: "dev-b".into(),
+                key: PeerKey::from_bytes([9u8; 32]),
+                address: None,
+            })
+            .unwrap();
+        drop(first);
+
+        let reopened = store(&dir);
+        assert_eq!(
+            reopened.peer("dev-b").expect("peer survived").key.as_bytes(),
+            &[9u8; 32]
+        );
+    }
+
+    #[test]
+    fn writes_land_at_the_stores_own_path_not_the_config_dir() {
+        // The regression this guards: `TrustFile::save` keys off HOME, so a
+        // test exercising pairing would overwrite the developer's own keys.
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = store(&dir);
+        store
+            .upsert_peer(TrustedPeer {
+                device_id: "dev-b".into(),
+                key: PeerKey::from_bytes([1u8; 32]),
+                address: None,
+            })
+            .unwrap();
+        assert!(dir.path().join("sync_trust.json").exists());
+    }
+
+    #[test]
+    fn note_address_only_writes_when_something_moved() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = store(&dir);
+        store
+            .upsert_peer(TrustedPeer {
+                device_id: "dev-b".into(),
+                key: PeerKey::from_bytes([2u8; 32]),
+                address: None,
+            })
+            .unwrap();
+
+        store.note_address("dev-b", "192.168.1.31:7645").unwrap();
+        let stamp = std::fs::metadata(store.path()).unwrap().modified().unwrap();
+
+        // A no-op update must not rewrite the file at all.
+        store.note_address("dev-b", "192.168.1.31:7645").unwrap();
+        assert_eq!(
+            std::fs::metadata(store.path()).unwrap().modified().unwrap(),
+            stamp
+        );
+        assert_eq!(
+            store.peer("dev-b").unwrap().address.as_deref(),
+            Some("192.168.1.31:7645")
+        );
+    }
+
+    #[test]
+    fn removing_an_unknown_peer_neither_errors_nor_writes() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = store(&dir);
+        assert!(!store.remove_peer("nobody").unwrap());
+        assert!(!store.path().exists());
     }
 }

@@ -37,11 +37,28 @@
 //! device ids and row guids are already minted.
 
 pub mod auth;
+pub mod backoff;
+pub mod client;
+pub mod merge;
 pub mod pairing;
+pub mod protocol;
 pub mod random;
+pub mod server;
+pub mod status;
 pub mod trust;
+pub mod worker;
 
 pub use auth::{now_ms, NonceRing, SignedRequest};
-pub use pairing::{pair_secret, ClaimRequest, ClaimResponse, Initiator, PairCode, PairingWindow};
-pub use random::{FnRandom, RandomSource};
-pub use trust::{PeerKey, TrustFile, TrustedPeer};
+pub use backoff::{Backoff, FailureKind, Retry};
+pub use pairing::{
+    pair_secret, ClaimRequest, ClaimResponse, Initiator, PairCode, PairingSlot, PairingWindow,
+};
+pub use protocol::{ErrorBody, ErrorCode, Hello, PullRequest, PushResponse, PROTOCOL_VERSION};
+pub use random::{FnRandom, RandomSource, SharedRandom};
+pub use client::{SyncClient, SyncFailure};
+pub use server::{Clock, SyncServer};
+pub use worker::{SyncWorker, WorkerConfig};
+pub use status::{
+    relative_time, StatusCell, StatusDisplay, StatusTone, SyncRole, SyncState, SyncStatus,
+};
+pub use trust::{PeerKey, TrustFile, TrustStore, TrustedPeer};

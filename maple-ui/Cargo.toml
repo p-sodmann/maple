@@ -7,6 +7,7 @@ edition.workspace = true
 maple-state = { path = "../maple-state" }
 maple-import = { path = "../maple-import" }
 maple-db = { path = "../maple-db", default-features = false }
+maple-sync = { path = "../maple-sync", default-features = false }
 slint = { workspace = true }
 rfd = { workspace = true }
 open = { workspace = true }
@@ -23,6 +24,9 @@ slint-build = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
+# The pairing controller's tests need a reproducible byte stream;
+# maple-sync's own seeded source is private to that crate.
+blake3 = { workspace = true }
 criterion = { workspace = true }
 
 [[bench]]
@@ -31,5 +35,5 @@ harness = false
 
 [features]
 default = ["cpu"]
-cpu = ["maple-db/cpu"]
-gpu = ["maple-db/gpu"]
+cpu = ["maple-db/cpu", "maple-sync/cpu"]
+gpu = ["maple-db/gpu", "maple-sync/gpu"]

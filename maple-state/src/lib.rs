@@ -4,8 +4,10 @@
 //! Phase 0: Config struct only.
 
 mod seen;
+pub mod sync;
 
 pub use seen::SeenSet;
+pub use sync::{PeerMode, SyncRole, SyncSettings};
 
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
@@ -603,6 +605,10 @@ pub struct Settings {
     /// Stack detection settings.
     #[serde(default)]
     pub stacks: StackSettings,
+    /// Machine-local sync configuration. Role, device name and per-peer mode
+    /// deliberately live in the database instead — see [`sync`].
+    #[serde(default)]
+    pub sync: SyncSettings,
 }
 
 impl Settings {
@@ -691,6 +697,7 @@ impl Default for Settings {
             semantic: SemanticSettings::default(),
             thumbnails: ThumbnailSettings::default(),
             stacks: StackSettings::default(),
+            sync: SyncSettings::default(),
         }
     }
 }
@@ -901,5 +908,49 @@ mod tests {
         assert_eq!(loaded.preview_buffer_size, 13);
         assert_eq!(loaded.library_dir, PathBuf::from("/custom/lib"));
         assert_eq!(loaded.database_path, PathBuf::from("/custom/lib/library.db"));
+    }
+
+    #[test]
+    fn sync_section_roundtrips() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.toml");
+
+        let s = Settings {
+            sync: SyncSettings {
+                listen_addr: "192.168.1.20:9000".into(),
+                interval_secs: 45,
+            },
+            ..Settings::default()
+        };
+        s.save_to(&path).unwrap();
+
+        let loaded = Settings::load_from(&path);
+        assert_eq!(loaded.sync.listen_addr, "192.168.1.20:9000");
+        assert_eq!(loaded.sync.interval_secs, 45);
+    }
+
+    #[test]
+    fn settings_without_a_sync_section_load_defaults() {
+        // Every existing installation's settings.toml predates `[sync]`, so
+        // loading one must yield defaults rather than failing outright and
+        // dropping the user back to a wholly default configuration.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.toml");
+        std::fs::write(&path, "preview_buffer_size = 7\n").unwrap();
+
+        let loaded = Settings::load_from(&path);
+        assert_eq!(loaded.preview_buffer_size, 7, "the rest of the file must still parse");
+        assert_eq!(loaded.sync.listen_addr, SyncSettings::default().listen_addr);
+        assert_eq!(loaded.sync.interval_secs, SyncSettings::default().interval_secs);
+    }
+
+    #[test]
+    fn bundled_defaults_parse_and_match_the_sync_defaults() {
+        // defaults.toml is written to disk verbatim on first launch, so a
+        // value there that disagrees with the Rust default would silently
+        // become the real default for every new installation.
+        let parsed: Settings = toml::from_str(DEFAULTS_TOML).expect("defaults.toml must parse");
+        assert_eq!(parsed.sync.listen_addr, SyncSettings::default().listen_addr);
+        assert_eq!(parsed.sync.interval_secs, SyncSettings::default().interval_secs);
     }
 }

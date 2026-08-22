@@ -5,6 +5,10 @@ edition.workspace = true
 
 [dependencies]
 maple-state = { path = "../maple-state" }
+# The merge engine lives in maple-db (it needs transactional SQL against that
+# schema), so transport depends on it rather than the other way round. The
+# ONNX feature has to be forwarded because maple-db's is not additive.
+maple-db = { path = "../maple-db", default-features = false }
 # blake3 covers both primitives this crate needs: derive_key is HKDF and
 # keyed_hash is a MAC, so pairing and request signing add no crypto dependency.
 blake3 = { workspace = true }
@@ -13,6 +17,13 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 anyhow = { workspace = true }
 tracing = { workspace = true }
+ureq = { workspace = true }
+tiny_http = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
+
+[features]
+default = ["cpu"]
+cpu = ["maple-db/cpu"]
+gpu = ["maple-db/gpu"]

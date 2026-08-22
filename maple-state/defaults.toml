@@ -167,3 +167,22 @@ device = "cpu"
 
 # How many nearest sentence vectors to retrieve per query before merging.
 knn_k = 200
+
+# ── Sync ────────────────────────────────────────────────────────
+# Library sync between a master installation and its servants.
+#
+# Only machine configuration lives here. This device's *role* (off / master /
+# servant), its display name, and each paired device's file mode (full /
+# partial / relay) are stored in the library database instead, so they stay
+# transactional with the rows they describe — set them in Settings → Sync.
+# Pairing keys live in sync_trust.json, never in this file.
+
+[sync]
+# Address the master's sync listener binds to.  0.0.0.0 accepts connections on
+# every interface; narrow it to one LAN address if you prefer.  Port 7645 is
+# unassigned by IANA.  Ignored unless this device's role is "master".
+listen_addr = "0.0.0.0:7645"
+
+# Seconds between sync passes on a servant.  A failed pass retries sooner, on a
+# 1 → 2 → 5 → 15 → 30 → 60 second backoff, so this is the *idle* cadence.
+interval_secs = 300

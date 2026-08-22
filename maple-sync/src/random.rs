@@ -21,10 +21,33 @@ pub trait RandomSource {
     fn fill(&self, buf: &mut [u8]) -> anyhow::Result<()>;
 
     /// Convenience for the fixed-size cases (nonces, keys).
-    fn array<const N: usize>(&self) -> anyhow::Result<[u8; N]> {
+    ///
+    /// `Sized` so the trait stays object-safe despite the const generic —
+    /// see [`SharedRandom`], which needs `dyn RandomSource` to exist.
+    fn array<const N: usize>(&self) -> anyhow::Result<[u8; N]>
+    where
+        Self: Sized,
+    {
         let mut out = [0u8; N];
         self.fill(&mut out)?;
         Ok(out)
+    }
+}
+
+/// A random source shared across threads.
+///
+/// The sync server hands its listener thread the same SQLite-backed source
+/// the UI uses, and a generic parameter would have to be threaded through
+/// every type that touches it. Erasing it here keeps `SyncServer` a plain
+/// struct.
+pub type SharedRandom = std::sync::Arc<dyn RandomSource + Send + Sync>;
+
+/// So a [`SharedRandom`] can be passed wherever an `impl RandomSource` is
+/// wanted — including [`array`](RandomSource::array), which the erased form
+/// cannot offer on its own.
+impl RandomSource for SharedRandom {
+    fn fill(&self, buf: &mut [u8]) -> anyhow::Result<()> {
+        (**self).fill(buf)
     }
 }
 

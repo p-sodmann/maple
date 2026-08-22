@@ -423,6 +423,200 @@ impl PairingWindow {
     }
 }
 
+
+// ── Sharing one window between two threads ──────────────────────
+
+/// A [`PairingWindow`] reachable from both the UI thread and the server
+/// thread.
+///
+/// The two halves of a pairing genuinely happen on different threads: a
+/// person types the peer's code into the modal, and some milliseconds later
+/// an HTTP request arrives on the listener wanting to verify a proof against
+/// exactly that code. Handing the server its own copy of the window would
+/// mean the code the user typed never reaches the check, and duplicating the
+/// attempt counter would double the number of guesses an attacker gets.
+///
+/// So there is one window behind one mutex, and this type is the only way to
+/// touch it. Cloning shares rather than copies.
+#[derive(Clone, Default)]
+pub struct PairingSlot {
+    inner: std::sync::Arc<std::sync::Mutex<SlotState>>,
+}
+
+#[derive(Default)]
+struct SlotState {
+    window: Option<PairingWindow>,
+    /// A completed pairing waiting to be persisted by whichever side asks
+    /// for it first. Held rather than acted on here because writing the
+    /// trust file and the `sync_peers` row is the caller's business, and
+    /// this crate does not own the database.
+    outcome: Option<PairOutcome>,
+    /// Why the window closed, when it closed itself.
+    ///
+    /// The slot burns the window the instant a fifth wrong code arrives —
+    /// on the *listener's* thread, milliseconds before the modal's next
+    /// tick. Without this the UI would find the window simply gone and have
+    /// no way to tell an abort from an expiry, or from a cancel it issued
+    /// itself. Drained by the UI.
+    closed: Option<PairError>,
+    /// The peer's name, for the modal to announce.
+    ///
+    /// Separate from `outcome` because the two are drained by different
+    /// threads for different reasons: the server takes the outcome the
+    /// instant it answers, so it can persist the key before the response can
+    /// be lost, while the UI notices on its next one-second tick. One field
+    /// drained twice would mean whichever ran first silently robbed the
+    /// other — and the half that got nothing is the half that writes the key.
+    completed: Option<String>,
+}
+
+/// What the modal needs to draw, read out under the lock in one go so the
+/// countdown and the attempt count cannot come from two different instants.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SlotView {
+    pub own_code: String,
+    pub remaining_ms: i64,
+    pub attempts: u32,
+    /// Whether this side's user has typed the peer's code yet.
+    pub armed: bool,
+}
+
+impl PairingSlot {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// A poisoned mutex here means a thread panicked mid-pairing. The window
+    /// is a few plain integers and strings with no invariant that a panic
+    /// could have half-broken, so recovering beats propagating a panic into
+    /// the UI thread or the listener.
+    fn lock(&self) -> std::sync::MutexGuard<'_, SlotState> {
+        match self.inner.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        }
+    }
+
+    /// Open a window, replacing any already there.
+    pub fn open(
+        &self,
+        device_id: impl Into<String>,
+        name: impl Into<String>,
+        own_code: PairCode,
+        now_ms: i64,
+    ) {
+        let mut state = self.lock();
+        state.window = Some(PairingWindow::open(device_id, name, own_code, now_ms));
+        state.outcome = None;
+        state.completed = None;
+        state.closed = None;
+    }
+
+    /// Discard the window and everything in it — both codes included.
+    pub fn close(&self) {
+        self.lock().window = None;
+    }
+
+    pub fn is_open(&self) -> bool {
+        self.lock().window.is_some()
+    }
+
+    /// The user typed the other device's code.
+    pub fn enter_peer_code(&self, code: PairCode) {
+        if let Some(window) = self.lock().window.as_mut() {
+            window.enter_peer_code(code);
+        }
+    }
+
+    /// Everything the modal renders, or `None` if no window is open.
+    pub fn view(&self, now_ms: i64) -> Option<SlotView> {
+        let state = self.lock();
+        let window = state.window.as_ref()?;
+        Some(SlotView {
+            own_code: window.own_code().as_str().to_owned(),
+            remaining_ms: window.remaining_ms(now_ms),
+            attempts: window.attempts(),
+            armed: window.peer_code.is_some(),
+        })
+    }
+
+    /// Answer a `/pair/claim`, keeping the resulting key for the caller that
+    /// persists it.
+    ///
+    /// Returns [`PairError::Expired`] when no window is open, which is the
+    /// truthful answer to a claim aimed at a master whose user never started
+    /// pairing — from the client's side the two are indistinguishable, and
+    /// both mean "stop asking".
+    pub fn handle_claim(
+        &self,
+        request: &ClaimRequest,
+        now_ms: i64,
+        rng: &impl RandomSource,
+    ) -> anyhow::Result<Result<ClaimResponse, PairError>> {
+        let mut state = self.lock();
+        let Some(window) = state.window.as_mut() else {
+            return Ok(Err(PairError::Expired));
+        };
+        match window.handle_claim(request, now_ms, rng)? {
+            Ok((response, outcome)) => {
+                state.completed = Some(if outcome.name.trim().is_empty() {
+                    outcome.device_id.clone()
+                } else {
+                    outcome.name.clone()
+                });
+                state.outcome = Some(outcome);
+                // The window stays open until the caller closes it: the
+                // response can be lost in flight, and a retry must still be
+                // answerable. See `PairingWindow::handle_claim`.
+                Ok(Ok(response))
+            }
+            Err(error) => {
+                if matches!(error, PairError::Aborted) {
+                    // Burnt — drop the codes rather than leave them on a
+                    // screen where someone will try to use them.
+                    state.window = None;
+                    state.closed = Some(PairError::Aborted);
+                }
+                Ok(Err(error))
+            }
+        }
+    }
+
+    /// Take a completed pairing, if one is waiting. Drains, so the caller
+    /// persists it exactly once.
+    pub fn take_outcome(&self) -> Option<PairOutcome> {
+        self.lock().outcome.take()
+    }
+
+    /// Take the name of a peer that just paired, for the modal to announce.
+    /// Drains, so the message is shown once.
+    pub fn take_completed(&self) -> Option<String> {
+        self.lock().completed.take()
+    }
+
+    /// Take the reason the window closed itself, if it did. Drains.
+    pub fn take_closed(&self) -> Option<PairError> {
+        self.lock().closed.take()
+    }
+
+    /// Close the window if its deadline has passed, reporting whether it did.
+    ///
+    /// Expiry is noticed here rather than by a timer of its own: whichever
+    /// side looks first — the modal on its one-second tick or a claim
+    /// arriving on the listener — closes it for both.
+    pub fn expire_if_due(&self, now_ms: i64) -> bool {
+        let mut state = self.lock();
+        match state.window.as_ref() {
+            Some(window) if !window.is_open(now_ms) => {
+                state.window = None;
+                state.closed = Some(PairError::Expired);
+                true
+            }
+            _ => false,
+        }
+    }
+}
+
 // ── Primitives ──────────────────────────────────────────────────
 
 /// `keyed_hash(secret, label || parts...)`.

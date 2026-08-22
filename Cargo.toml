@@ -78,6 +78,9 @@ anyhow = "1"
 
 # HTTP (blocking, for AI API calls)
 ureq = { version = "3", features = ["json"] }
+# Blocking HTTP server for the sync master — one thread, no tokio, matching
+# the architecture the rest of the workspace commits to.
+tiny_http = "0.12"
 
 # Thumbnail cache
 redb = "4"

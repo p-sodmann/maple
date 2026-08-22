@@ -1,6 +1,18 @@
 // Settings window — CI design system.
 import { Theme } from "theme.slint";
-import { ScrollView } from "std-widgets.slint";
+import { ScrollView, LineEdit } from "std-widgets.slint";
+
+// One paired device, as the Sync card renders it. `mode` and `last-seen` are
+// pre-formatted in Rust — the markup holds presentation, never the mapping
+// from a stored `'relay'` to the word the user reads.
+export struct SyncPeerItem {
+    device-id: string,
+    name: string,
+    mode: string,
+    mode-hint: string,
+    last-seen: string,
+    online: bool,
+}
 
 // Key-value display row inside a section card.
 component SettingsRow {
@@ -74,6 +86,148 @@ component ActionButton inherits Rectangle {
     btn-ta := TouchArea { clicked => { root.clicked(); } }
 }
 
+// One of the three mutually-exclusive sync roles. A radio rather than a pair
+// of toggles because master and servant are exclusive by construction — the
+// merge engine is built for a star topology, and a machine that were both
+// would relay its own writes back to itself.
+component RoleOption inherits Rectangle {
+    in property <string> label: "";
+    in property <string> detail: "";
+    in property <bool>   active: false;
+    callback clicked;
+
+    height: 38px;
+    border-radius: Theme.radius-btn;
+    background: root.active
+        ? Theme.accent-tint
+        : (role-ta.has-hover ? Theme.border.with-alpha(0.4) : transparent);
+    animate background { duration: 100ms; }
+
+    HorizontalLayout {
+        padding-left: 10px;
+        padding-right: 10px;
+        spacing: 10px;
+
+        // Radio dot
+        Rectangle {
+            width: 15px; height: 15px;
+            y: (parent.height - self.height) / 2;
+            border-radius: 8px;
+            border-width: 1.5px;
+            border-color: root.active ? Theme.accent : Theme.ink-3;
+            background: transparent;
+            Rectangle {
+                width: 7px; height: 7px;
+                x: (parent.width - self.width) / 2;
+                y: (parent.height - self.height) / 2;
+                border-radius: 4px;
+                background: root.active ? Theme.accent : transparent;
+            }
+        }
+        Text {
+            text: root.label;
+            color: root.active ? Theme.accent-text : Theme.ink;
+            font-size: 13px;
+            font-weight: root.active ? 600 : 500;
+            vertical-alignment: center;
+            horizontal-stretch: 0;
+        }
+        Text {
+            text: root.detail;
+            color: Theme.ink-3;
+            font-size: 12px;
+            vertical-alignment: center;
+            horizontal-stretch: 1;
+            overflow: elide;
+        }
+    }
+
+    role-ta := TouchArea { clicked => { root.clicked(); } }
+}
+
+// One paired device: status dot, name, click-to-cycle file mode, last seen,
+// and an unpair button.
+component SyncPeerRow inherits Rectangle {
+    in property <SyncPeerItem> peer;
+    callback mode-cycled;
+    callback unpair;
+
+    height: 44px;
+
+    HorizontalLayout {
+        padding-left: 16px;
+        padding-right: 16px;
+        padding-top: 8px;
+        padding-bottom: 8px;
+        spacing: 10px;
+
+        // Online dot
+        Rectangle {
+            width: 8px; height: 8px;
+            y: (parent.height - self.height) / 2;
+            border-radius: 4px;
+            background: root.peer.online ? Theme.success : Theme.ink-3;
+        }
+        Text {
+            text: root.peer.name;
+            color: Theme.ink;
+            font-size: 13px;
+            font-weight: 500;
+            vertical-alignment: center;
+            width: 130px;
+            overflow: elide;
+        }
+        // Mode chip — clicking cycles Full → Partial → Relay.
+        Rectangle {
+            width: 74px;
+            horizontal-stretch: 0;
+            border-radius: 6px;
+            border-width: 1px;
+            border-color: Theme.border;
+            background: mode-ta.has-hover ? Theme.border.with-alpha(0.6) : Theme.field;
+            y: (parent.height - self.height) / 2;
+            height: 26px;
+            animate background { duration: 100ms; }
+            Text {
+                text: root.peer.mode;
+                color: Theme.ink-2;
+                font-size: 12px;
+                horizontal-alignment: center;
+                vertical-alignment: center;
+            }
+            mode-ta := TouchArea { clicked => { root.mode-cycled(); } }
+        }
+        Text {
+            text: root.peer.last-seen;
+            color: Theme.ink-3;
+            font-size: 12px;
+            vertical-alignment: center;
+            horizontal-stretch: 1;
+            overflow: elide;
+        }
+        // Unpair ✕
+        Rectangle {
+            width: 26px; height: 26px;
+            horizontal-stretch: 0;
+            y: (parent.height - self.height) / 2;
+            border-radius: 6px;
+            background: unpair-ta.has-hover ? #e74c3c25 : transparent;
+            animate background { duration: 100ms; }
+            Path {
+                width: 10px; height: 10px;
+                x: (parent.width  - self.width)  / 2;
+                y: (parent.height - self.height) / 2;
+                viewbox-width: 24; viewbox-height: 24;
+                fill: transparent;
+                stroke: unpair-ta.has-hover ? #c0392b : Theme.ink-3;
+                stroke-width: 2.4px;
+                commands: "M6 6L18 18M18 6L6 18";
+            }
+            unpair-ta := TouchArea { clicked => { root.unpair(); } }
+        }
+    }
+}
+
 export component SettingsWindow inherits Window {
     title: "Maple — Settings";
     preferred-width: 560px;
@@ -100,7 +254,36 @@ export component SettingsWindow inherits Window {
     property <string>        confirm-message:       "";
     property <string>        confirm-action-label:  "Delete";
 
+    // ── Sync ──────────────────────────────────────────────────────
+    // `sync-role` is the stored form ("off" / "master" / "servant") rather
+    // than an enum, so the markup and the database column cannot drift apart
+    // without a test noticing.
+    in-out property <string> sync-device-name:  "";
+    in property <string>     sync-role:         "off";
+    in property <string>     sync-role-detail:  "";
+    in property <[SyncPeerItem]> sync-peers:    [];
+
+    in-out property <bool>   pairing-open:      false;
+    in property <string>     pairing-own-code:  "";
+    in-out property <string> pairing-entered:   "";
+    in-out property <string> pairing-address:   "";
+    in property <string>     pairing-countdown: "";
+    in property <string>     pairing-message:   "";
+    in property <bool>       pairing-can-submit: false;
+    // Only a servant dials, so only a servant needs somewhere to dial to.
+    // Until mDNS lands in P8 this is typed by hand.
+    in property <bool>       pairing-needs-address: false;
+
     callback close-requested;
+    callback sync-role-selected(string);
+    callback sync-rename-device(string);
+    callback sync-peer-mode-cycled(string);
+    callback sync-unpair(string);
+    callback pairing-begin;
+    callback pairing-code-edited(string);
+    callback pairing-address-edited(string);
+    callback pairing-submit;
+    callback pairing-cancel;
     callback clear-ai-descriptions;
     callback clear-thumbnail-cache;
     callback delete-all-face-data;
@@ -114,7 +297,12 @@ export component SettingsWindow inherits Window {
 
         key-pressed(event) => {
             if event.text == Key.Escape {
-                if root.confirm-open {
+                // Innermost layer first: Escape dismisses the pairing modal,
+                // then the confirm modal, and only closes the window when
+                // neither is up.
+                if root.pairing-open {
+                    root.pairing-cancel();
+                } else if root.confirm-open {
                     root.confirm-open = false;
                 } else {
                     root.close-requested();
@@ -294,6 +482,141 @@ export component SettingsWindow inherits Window {
                         }
                     }
 
+                    // ── Sync ──────────────────────────────────────
+                    VerticalLayout {
+                        spacing: 6px;
+                        Text {
+                            text: "SYNC";
+                            color: Theme.ink-3;
+                            font-size: 11px; font-weight: 600; letter-spacing: 0.7px;
+                            height: 24px; vertical-alignment: center;
+                        }
+                        Rectangle {
+                            border-radius: 10px;
+                            border-width: 1px; border-color: Theme.border;
+                            background: Theme.surface;
+                            clip: true;
+                            VerticalLayout {
+
+                                // This device's name — Enter commits.
+                                HorizontalLayout {
+                                    padding-left: 16px;
+                                    padding-right: 16px;
+                                    padding-top: 12px;
+                                    padding-bottom: 6px;
+                                    spacing: 12px;
+                                    Text {
+                                        text: "This device";
+                                        color: Theme.ink-2;
+                                        font-size: 13px;
+                                        font-weight: 500;
+                                        vertical-alignment: center;
+                                        width: 150px;
+                                    }
+                                    LineEdit {
+                                        text <=> root.sync-device-name;
+                                        placeholder-text: "Name this device";
+                                        horizontal-stretch: 1;
+                                        accepted(value) => { root.sync-rename-device(value); }
+                                    }
+                                }
+                                HorizontalLayout {
+                                    padding-left: 178px;
+                                    padding-right: 16px;
+                                    padding-bottom: 8px;
+                                    height: 24px;
+                                    Text {
+                                        text: "Peers see this name when pairing. Press Enter to save.";
+                                        color: Theme.ink-3;
+                                        font-size: 11px;
+                                        vertical-alignment: center;
+                                        overflow: elide;
+                                    }
+                                }
+
+                                Rectangle {
+                                    height: 1px;
+                                    background: Theme.border;
+                                }
+
+                                // Role — exclusive by construction.
+                                VerticalLayout {
+                                    padding-left: 10px;
+                                    padding-right: 10px;
+                                    padding-top: 8px;
+                                    padding-bottom: 4px;
+                                    spacing: 2px;
+                                    RoleOption {
+                                        label: "Off";
+                                        detail: "No sync";
+                                        active: root.sync-role == "off";
+                                        clicked => { root.sync-role-selected("off"); }
+                                    }
+                                    RoleOption {
+                                        label: "Master";
+                                        detail: root.sync-role == "master" ? root.sync-role-detail : "Holds the library others sync to";
+                                        active: root.sync-role == "master";
+                                        clicked => { root.sync-role-selected("master"); }
+                                    }
+                                    RoleOption {
+                                        label: "Servant";
+                                        detail: root.sync-role == "servant" ? root.sync-role-detail : "Syncs from a master";
+                                        active: root.sync-role == "servant";
+                                        clicked => { root.sync-role-selected("servant"); }
+                                    }
+                                }
+
+                                Rectangle {
+                                    height: 1px;
+                                    background: Theme.border;
+                                }
+
+                                // Paired devices
+                                HorizontalLayout {
+                                    padding-left: 16px;
+                                    padding-top: 12px;
+                                    padding-bottom: 2px;
+                                    height: 30px;
+                                    Text {
+                                        text: "PAIRED DEVICES";
+                                        color: Theme.ink-3;
+                                        font-size: 10.5px; font-weight: 600; letter-spacing: 0.6px;
+                                        vertical-alignment: center;
+                                    }
+                                }
+
+                                if root.sync-peers.length == 0: HorizontalLayout {
+                                    padding-left: 16px;
+                                    height: 34px;
+                                    Text {
+                                        text: "No devices paired yet.";
+                                        color: Theme.ink-3;
+                                        font-size: 12px;
+                                        vertical-alignment: center;
+                                    }
+                                }
+
+                                for peer in root.sync-peers: SyncPeerRow {
+                                    peer: peer;
+                                    mode-cycled => { root.sync-peer-mode-cycled(peer.device-id); }
+                                    unpair => { root.sync-unpair(peer.device-id); }
+                                }
+
+                                HorizontalLayout {
+                                    padding-left: 16px;
+                                    padding-right: 16px;
+                                    padding-bottom: 14px;
+                                    padding-top: 6px;
+                                    ActionButton {
+                                        text: "+ Pair a new device";
+                                        clicked => { root.pairing-begin(); }
+                                    }
+                                    Rectangle { horizontal-stretch: 1; }
+                                }
+                            }
+                        }
+                    }
+
                     // ── Actions ───────────────────────────────────
                     VerticalLayout {
                         spacing: 6px;
@@ -408,6 +731,139 @@ export component SettingsWindow inherits Window {
                             clicked => {
                                 root.confirm-open = false;
                                 root.delete-all-face-data();
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // ── Pairing modal ─────────────────────────────────────────
+        // Same shape as the confirmation modal above: a full-bleed scrim with
+        // its own TouchArea to swallow clicks aimed at the window behind it,
+        // and a centred card sized by its layout.
+        if root.pairing-open: Rectangle {
+            width: 100%; height: 100%;
+            background: #000000bb;
+            TouchArea { }
+
+            Rectangle {
+                x: (parent.width  - self.width)  / 2;
+                y: (parent.height - self.height) / 2;
+                width: 400px;
+                height: pairing-layout.preferred-height;
+                background: Theme.surface;
+                border-radius: 12px;
+                border-width: 1px;
+                border-color: Theme.border;
+                drop-shadow-blur: 24px;
+                drop-shadow-offset-y: 4px;
+                drop-shadow-color: #00000025;
+
+                pairing-layout := VerticalLayout {
+                    padding: 22px;
+                    spacing: 14px;
+
+                    Text {
+                        text: "Pair a device";
+                        color: Theme.ink;
+                        font-size: 16px;
+                        font-weight: 700;
+                    }
+
+                    Text {
+                        text: "On this device";
+                        color: Theme.ink-2;
+                        font-size: 12px;
+                        font-weight: 500;
+                    }
+                    Rectangle {
+                        height: 58px;
+                        border-radius: 10px;
+                        background: Theme.field;
+                        border-width: 1px;
+                        border-color: Theme.border;
+                        Text {
+                            text: root.pairing-own-code;
+                            color: Theme.ink;
+                            font-size: 30px;
+                            font-weight: 700;
+                            letter-spacing: 4px;
+                            horizontal-alignment: center;
+                            vertical-alignment: center;
+                        }
+                    }
+                    Text {
+                        text: "Type this code on the other machine.";
+                        color: Theme.ink-3;
+                        font-size: 11.5px;
+                    }
+
+                    if root.pairing-needs-address: Text {
+                        text: "Master address";
+                        color: Theme.ink-2;
+                        font-size: 12px;
+                        font-weight: 500;
+                    }
+                    if root.pairing-needs-address: LineEdit {
+                        text <=> root.pairing-address;
+                        placeholder-text: "192.168.1.20:7645";
+                        edited(value) => { root.pairing-address-edited(value); }
+                    }
+
+                    Text {
+                        text: "Code from the other device";
+                        color: Theme.ink-2;
+                        font-size: 12px;
+                        font-weight: 500;
+                    }
+                    LineEdit {
+                        text <=> root.pairing-entered;
+                        placeholder-text: "6 digits";
+                        edited(value) => { root.pairing-code-edited(value); }
+                        accepted(value) => {
+                            if (root.pairing-can-submit) { root.pairing-submit(); }
+                        }
+                    }
+
+                    HorizontalLayout {
+                        spacing: 10px;
+                        Text {
+                            text: "⏱ Expires in " + root.pairing-countdown;
+                            color: Theme.ink-2;
+                            font-size: 12px;
+                            vertical-alignment: center;
+                            horizontal-stretch: 0;
+                        }
+                        Text {
+                            text: root.pairing-message;
+                            color: Theme.ink-3;
+                            font-size: 12px;
+                            vertical-alignment: center;
+                            horizontal-alignment: right;
+                            horizontal-stretch: 1;
+                            overflow: elide;
+                        }
+                    }
+
+                    HorizontalLayout {
+                        spacing: 8px;
+                        Rectangle { horizontal-stretch: 1; }
+                        ActionButton {
+                            text: "Cancel";
+                            clicked => { root.pairing-cancel(); }
+                        }
+                        // Dimmed rather than hidden until six digits are in:
+                        // a button that appears mid-typing moves the row it
+                        // sits in, under a cursor already heading for it.
+                        Rectangle {
+                            opacity: root.pairing-can-submit ? 1.0 : 0.45;
+                            horizontal-stretch: 0;
+                            ActionButton {
+                                text: "Pair";
+                                clicked => {
+                                    if (root.pairing-can-submit) { root.pairing-submit(); }
+                                }
                             }
                         }
                     }

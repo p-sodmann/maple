@@ -31,6 +31,9 @@ mod people_page;
 mod rep_crop;
 mod services;
 mod settings_window;
+mod sync_pairing;
+mod sync_status;
+mod sync_supervisor;
 pub mod thumbnail;
 mod transforms;
 
@@ -67,6 +70,9 @@ pub(crate) struct AppCtx {
     coll_crop_cache: rep_crop::CropCache,
     thumb_px: u32,
     thumb_quality: u8,
+    /// Owns the sync listener or worker, whichever this device's role calls
+    /// for, and restarts them when that changes.
+    sync: Rc<sync_supervisor::SyncSupervisor>,
 }
 
 /// Boot the UI. Blocks until the window closes.
@@ -137,6 +143,47 @@ pub fn run() -> anyhow::Result<()> {
         })
     };
 
+    // ── Sync ───────────────────────────────────────────────────────
+    // Seeded from the stored role, so an installation that has never been set
+    // up starts grey rather than claiming to be connecting to nothing.
+    let (device_id, device_name, sync_role) = {
+        let guard = maple_db::lock_db(&db);
+        (
+            guard.device_id().to_owned(),
+            guard.device_name().unwrap_or_default(),
+            guard.sync_role().unwrap_or_default(),
+        )
+    };
+    let sync_status = maple_sync::SyncStatus::cell(sync_role);
+    let trust = match maple_sync::TrustStore::open_default(&device_id, &device_name) {
+        Ok(store) => Arc::new(Mutex::new(store)),
+        Err(e) => {
+            // A corrupt trust file is surfaced, not overwritten: it holds
+            // every paired device's key, and silently starting fresh would
+            // present as "everything needs re-pairing" while hiding why.
+            tracing::error!("Sync disabled — could not read the key store: {e}");
+            sync_status
+                .lock()
+                .map(|mut s| s.last_error = Some(e.to_string()))
+                .unwrap_or_default();
+            Arc::new(Mutex::new(
+                maple_sync::TrustStore::open(
+                    std::env::temp_dir().join("maple_sync_trust_fallback.json"),
+                    &device_id,
+                    &device_name,
+                )
+                .expect("a fresh fallback store cannot be corrupt"),
+            ))
+        }
+    };
+    let sync = sync_supervisor::SyncSupervisor::new(
+        db.clone(),
+        trust,
+        maple_sync::PairingSlot::new(),
+        sync_status.clone(),
+        sync_pairing::db_random(db.clone()),
+    );
+
     let ctx = AppCtx {
         db: db.clone(),
         cache: cache.clone(),
@@ -148,6 +195,7 @@ pub fn run() -> anyhow::Result<()> {
         coll_crop_cache: Arc::new(Mutex::new(HashMap::new())),
         thumb_px: settings.thumbnails.size,
         thumb_quality: settings.thumbnails.quality,
+        sync: sync.clone(),
     };
 
     // Let other windows (rotation, library restructure, …) request a grid
@@ -183,7 +231,23 @@ pub fn run() -> anyhow::Result<()> {
     // ── Other secondary windows ────────────────────────────────────
     wire_secondary_windows(&window, &ctx);
 
+    // ── Sync status pill ───────────────────────────────────────────
+    // Held for the life of `run`: a `slint::Timer` that is dropped stops, so
+    // letting this handle fall out of scope would freeze the pill on whatever
+    // it showed at startup.
+    let _sync_pill = sync_status::wire(&window, sync_status, maple_sync::now_ms);
+
+    // Starts the listener or the worker, per the stored role. After
+    // `grid::register`, because a first pass can finish before `run()` does
+    // and calls `request_reload`.
+    sync.restart();
+
     window.run()?;
+
+    // The listener and the worker both hold the database mutex during a
+    // merge; stopping them before `run` returns keeps one from being
+    // mid-transaction while the connection is torn down.
+    sync.stop();
     Ok(())
 }
 
@@ -267,10 +331,11 @@ fn wire_theme(window: &AppWindow) {
 fn wire_secondary_windows(window: &AppWindow, ctx: &AppCtx) {
     window.on_settings_clicked({
         let db = ctx.db.clone();
+        let sync = ctx.sync.clone();
         let w = ctx.window.clone();
         move || {
             let is_dark = w.upgrade().map(|w| w.get_dark()).unwrap_or(false);
-            settings_window::open(db.clone(), is_dark);
+            settings_window::open(db.clone(), sync.clone(), is_dark);
         }
     });
     window.on_tag_faces_clicked({
