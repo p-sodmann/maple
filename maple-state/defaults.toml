@@ -59,6 +59,14 @@ decode_threads = 4
 # logged under the `maple::import::unreadable` target.
 read_timeout_secs = 30
 
+# Decoded previews held in memory at once. Minimum 16.
+# A 256 px preview is about 196 KB decoded, so the default is roughly 25 MB.
+# The scan only decodes what is near the part of the strip you are looking
+# at; past this ceiling the preview you have not looked at for longest is
+# dropped down to a WebP copy of itself (~15 KB) and re-inflated from there
+# if you scroll back to it, so eviction never sends the app back to the card.
+max_loaded_previews = 128
+
 # ── AI image description ────────────────────────────────────────
 
 [ai]

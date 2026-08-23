@@ -187,6 +187,25 @@ single binary; the backend is fixed at compile time.
   **display file's** hash, since that is what the library row and `SeenSet` are keyed on,
   and it is not attempted after a *timeout* — the card is already not answering, and
   asking twice would double the stall.
+- **Import previews are decoded on demand** (`maple-ui/src/import_previews.rs`): a card
+  of a few thousand photos will not fit in memory as decoded frames (~196 KB each) and
+  almost none of them are on screen, so the browser decodes what the user is *looking at*.
+  Two ideas carry it. **Priority is evaluated when a worker picks up work, not when it is
+  queued**: the queue holds wanted indices plus one `focus`, and a worker always takes the
+  pending index nearest it, so scrolling re-prioritises everything already queued by
+  writing a single number — no re-sorting, no cancelling, and no waiting out a backlog of
+  photos that scrolled past before the ones now on screen get decoded. **Retention is
+  two-tier**: `Retained` is an LRU of decoded frames capped by `[import]
+  max_loaded_previews`, keyed on *when the photo was last in view* (scrolling back to one
+  saves it), and eviction drops the pixels down to a ~15 KB WebP kept from the first
+  decode — so scrolling back re-inflates from memory and never returns to the card.
+  Reading still happens one file at a time (same bus argument as the scan); only the
+  decode fans out. The scan itself no longer produces tile pixels at all: it sends the
+  full listing up front (so the count and every filename are right from the first frame),
+  then reads and hashes, and only decodes when burst detection needs pixels for the
+  embedder. `ImportItem::loaded` therefore means "has a decoded preview", not "has been
+  scanned", and goes false again on eviction. Requests are clamped to the retention cap —
+  a window wider than what can be held would have the tail evicting the head forever.
 - **The import record lives on the medium** (`maple-state/src/seen.rs`, P9): the scan's
   "already imported" badge reads `<source>/.maple_seen.bin`, written to the card itself
   so it carries its own history to the next machine — beside `.maple_embed_cache.bin`,

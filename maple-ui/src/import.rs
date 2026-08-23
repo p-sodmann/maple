@@ -18,6 +18,7 @@ use std::time::Duration;
 use image::{DynamicImage, RgbImage};
 use slint::{ComponentHandle, Model, ModelRc, SharedString, Timer, TimerMode, VecModel};
 
+use crate::import_previews::{PhotoRef, PreviewMsg, PreviewService, Retained};
 use crate::services::import::{insert_imported_images, ImportEntry};
 use crate::thumbnail;
 use crate::{ImportItem, ImportWindow};
@@ -30,6 +31,12 @@ const EMBED_CACHE_FILE: &str = ".maple_embed_cache.bin";
 /// How many newly-computed embeddings accumulate before the SD-card cache is
 /// flushed to disk (mirrors `maple-db::hasher`'s `BATCH_SIZE` convention).
 const EMBED_CACHE_FLUSH_EVERY: usize = 20;
+
+/// Rows to decode before the strip has reported a real viewport.
+///
+/// It reports one as soon as it has a height, but a scan that finished
+/// first would otherwise sit there with a single decoded tile.
+const INITIAL_WINDOW: usize = 15;
 
 /// How far the reader may run ahead of the decode pool, as a multiple of
 /// the pool size.
@@ -56,7 +63,11 @@ thread_local! {
 // ── Background worker messages ────────────────────────────────────
 
 enum ScanMsg {
-    Count(usize),
+    /// Every photo the scan found, before a single byte has been read.
+    /// `scan_grouped` knows the whole list up front, so the strip can show
+    /// the true count and every filename immediately — and the preview
+    /// service has the paths it needs to decode on demand.
+    Found(Vec<PhotoRef>),
     Thumb(ScanThumb),
     /// A burst-detection embedding, arriving separately and later than the
     /// photo's tile — see [`spawn_scan_worker`].
@@ -115,9 +126,6 @@ struct ScanThumb {
     index: usize,
     path: PathBuf,
     companions: Vec<PathBuf>,
-    rgb: Vec<u8>,
-    width: u32,
-    height: u32,
     content_hash: [u8; 32],
     imported: bool,
     /// An earlier session moved past this photo without marking it.
@@ -176,8 +184,14 @@ struct Entry {
     /// The row is still here and still copyable; only its picture is
     /// missing.
     readable: Readable,
-    /// Decoded thumbnail (None until the scan worker sends it).
+    /// Decoded thumbnail, present only while this photo is in the retained
+    /// tier. `None` means never decoded, or evicted — `webp` says which.
     thumb: Option<slint::Image>,
+    /// A 256 px WebP of the thumbnail, kept from the first time this photo
+    /// was decoded (~15 KB against the decoded frame's ~196 KB). Evicting
+    /// drops the pixels down to this, so scrolling back re-inflates from
+    /// memory instead of going to the card again.
+    webp: Option<Vec<u8>>,
     /// DINOv2 embedding computed during the scan (`None` if stack detection
     /// is disabled or inference failed for this photo).
     embedding: Option<Vec<f32>>,
@@ -244,6 +258,18 @@ struct ImportCtx {
     /// Whether photos an earlier session already decided on are filtered
     /// out of the strip.
     hide_old: Rc<Cell<bool>>,
+    /// Decodes previews on demand, prioritised by where the user is
+    /// looking. Replaced at the start of every scan.
+    previews: Rc<RefCell<Option<PreviewService>>>,
+    /// Which previews are currently decoded, least-recently-seen first out.
+    retained: Rc<RefCell<Retained>>,
+    /// The model rows the strip last reported as on screen (inclusive), and
+    /// the row it is centred on. Read whenever the visible set changes
+    /// under us — a filter toggle, or the end of a scan.
+    preview_window: Rc<Cell<(usize, usize, usize)>>,
+    /// Drains decoded previews for as long as the browser is open, which is
+    /// longer than the scan itself lasts.
+    preview_timer: Rc<RefCell<Option<Timer>>>,
     /// The medium the entries on screen actually came off.
     ///
     /// Not the same thing as `source`, which is wherever the folder picker
@@ -362,7 +388,15 @@ fn build(db: Arc<Mutex<maple_db::Database>>) -> Result<Import, slint::PlatformEr
         selected: Rc::new(RefCell::new(HashSet::new())),
         current: Rc::new(Cell::new(0)),
         visible: Rc::new(RefCell::new(Visible::default())),
-        hide_old: Rc::new(Cell::new(false)),
+        // Photos an earlier session already decided on are hidden by
+        // default: the point of a re-scan is what is *new* on the card.
+        hide_old: Rc::new(Cell::new(true)),
+        previews: Rc::new(RefCell::new(None)),
+        retained: Rc::new(RefCell::new(Retained::new(
+            maple_state::Settings::load().import.retained_previews(),
+        ))),
+        preview_window: Rc::new(Cell::new((0, 0, 0))),
+        preview_timer: Rc::new(RefCell::new(None)),
         scanned_source: Rc::new(RefCell::new(PathBuf::new())),
         model,
         preview_shown_idx: Rc::new(Cell::new(None)),
@@ -509,8 +543,13 @@ fn wire_scan(window: &ImportWindow, ctx: &ImportCtx) {
                 ),
             });
             *ctx.scanned_source.borrow_mut() = src.clone();
-            ctx.hide_old.set(false);
-            w.set_hide_old(false);
+            // A fresh medium: nothing decoded, nothing remembered, and the
+            // "new only" filter back on.
+            ctx.previews.borrow_mut().take();
+            ctx.retained.borrow_mut().clear();
+            ctx.preview_window.set((0, INITIAL_WINDOW, 0));
+            ctx.hide_old.set(true);
+            w.set_hide_old(true);
             w.set_old_count(0);
             w.set_preview_state(0);
 
@@ -527,7 +566,7 @@ fn wire_scan(window: &ImportWindow, ctx: &ImportCtx) {
 
                     for _ in 0..10 {
                         match rx.try_recv() {
-                            Ok(ScanMsg::Count(n)) => apply_scan_count(&w, &ctx2, n),
+                            Ok(ScanMsg::Found(photos)) => apply_scan_listing(&w, &ctx2, photos),
                             Ok(ScanMsg::Thumb(thumb)) => apply_scan_thumb(&w, &ctx2, thumb),
                             Ok(ScanMsg::Embedding { index, embedding }) => {
                                 // Arrives after the photo's tile and needs
@@ -601,7 +640,16 @@ fn spawn_scan_worker(
             }
         };
         let total = scanned_groups.len();
-        let _ = tx.send(ScanMsg::Count(total));
+        let listing = scanned_groups
+            .iter()
+            .map(|g| PhotoRef {
+                display: g.display.path.clone(),
+                companions: g.companions.iter().map(|c| c.path.clone()).collect(),
+            })
+            .collect();
+        if tx.send(ScanMsg::Found(listing)).is_err() {
+            return;
+        }
 
         let decoders = tuning.decoders();
         let budget = tuning.read_timeout();
@@ -639,7 +687,7 @@ fn spawn_scan_worker(
                             Err(_) => break,
                         };
                         match job {
-                            Ok(job) => decode_one(job, budget, embed_tx.as_ref(), &tx),
+                            Ok(job) => decode_one(job, embed_tx.as_ref(), &tx),
                             Err(_) => break,
                         }
                     }
@@ -719,9 +767,6 @@ fn read_one(
     }
 }
 
-/// Decoded thumbnail pixels: `(rgb, width, height)`.
-type Thumbnail = (Vec<u8>, u32, u32);
-
 /// What one read off the medium produces.
 struct Read {
     /// The file's BLAKE3 content hash — `None` if it could not be read in
@@ -789,6 +834,19 @@ fn read_with_budget(path: &Path, budget: Duration) -> Read {
     }
 }
 
+/// Read the bytes to decode for `path`, giving up after `budget`.
+///
+/// The file itself for an ordinary image, a raw's embedded preview for a
+/// raw. Shared with `import_previews`, which re-reads a photo whose preview
+/// was evicted and whose WebP copy is gone too.
+pub(crate) fn read_preview_bytes(path: &Path, budget: Duration) -> Option<Vec<u8>> {
+    within_budget(budget, {
+        let path = path.to_path_buf();
+        move || maple_import::loadable_image_bytes(&path).ok()
+    })
+    .flatten()
+}
+
 /// Run `work` on its own thread and stop waiting for it after `budget`.
 ///
 /// A thread blocked on a card that has stopped answering cannot be
@@ -806,45 +864,15 @@ fn within_budget<T: Send + 'static>(
     rx.recv_timeout(budget).ok()
 }
 
-/// Last resort for a photo whose display file will not decode: try the
-/// other files in its group.
+/// Turn one read photo into the metadata row the UI lists, and — only when
+/// burst detection is on — into pixels for the embedder.
 ///
-/// A raw + JPEG pair lists the JPEG as the display file, so one corrupt
-/// JPEG loses the preview for a photo whose raw is perfectly intact. The
-/// raw's embedded preview is right there.
-///
-/// This reads from the medium on a decode thread, which the pipeline
-/// otherwise never does. That is deliberate and safe *because it is rare*:
-/// it happens once per unreadable file, not once per photo, so it cannot
-/// put the card back under the many-reader contention the single reader
-/// exists to avoid.
-fn preview_from_companion(
-    companions: &[PathBuf],
-    budget: Duration,
-) -> Option<(Thumbnail, PathBuf)> {
-    for path in companions {
-        // `continue`, not `?`: one companion that cannot be read must not
-        // stop us trying the next one.
-        let Some(bytes) = within_budget(budget, {
-            let path = path.clone();
-            move || maple_import::loadable_image_bytes(&path).ok()
-        })
-        .flatten() else {
-            continue;
-        };
-        if let Ok(rendered) = crate::thumbnail::render_bytes_to_rgb(&bytes, 256) {
-            return Some((rendered, path.clone()));
-        }
-    }
-    None
-}
-
-/// Decode one photo's bytes into a thumbnail and hand it to the UI.
-///
-/// Pure CPU over memory — this is the part that fans out across cores.
+/// It deliberately does **not** produce the tile's picture. Previews are
+/// decoded on demand by `import_previews`, driven by where the user is
+/// actually looking, because a card of a few thousand photos will not fit
+/// in memory as decoded frames and almost none of them are on screen.
 fn decode_one(
     job: DecodeJob,
-    budget: Duration,
     embed_tx: Option<&mpsc::SyncSender<EmbedJob>>,
     tx: &mpsc::Sender<ScanMsg>,
 ) {
@@ -852,73 +880,32 @@ fn decode_one(
         index, path, companions, hash, imported, skipped_before, bytes, readable,
     } = job;
 
-    let mut readable = readable;
-    let mut rendered = bytes
-        .as_deref()
-        .and_then(|b| match crate::thumbnail::render_bytes_to_rgb(b, 256) {
-            Ok(out) => Some(out),
-            Err(err) => {
-                tracing::warn!(
-                    target: "maple::import::unreadable",
-                    "decode failed: {}: {err}",
-                    path.display()
-                );
-                None
-            }
-        });
-
-    // Nothing from the display file — but a raw + JPEG pair has another
-    // copy of the same photo sitting next to it. Not attempted after a
-    // timeout: the card is already not answering, and trying again would
-    // only double the stall.
-    if rendered.is_none() && readable != Readable::TimedOut && !companions.is_empty() {
-        if let Some((out, from)) = preview_from_companion(&companions, budget) {
-            tracing::info!(
-                target: "maple::import::unreadable",
-                "preview recovered from {} because {} would not decode",
-                from.display(),
-                path.display()
-            );
-            rendered = Some(out);
-            readable = Readable::FromCompanion;
+    // Only the embedder needs pixels here, and it needs them for every
+    // photo — burst detection compares the whole card against itself. They
+    // are dropped as soon as it has them.
+    let mut sharpness = None;
+    if let Some(embed_tx) = embed_tx {
+        if let Some((rgb, width, height)) = bytes
+            .as_deref()
+            .and_then(|b| crate::thumbnail::render_bytes_to_rgb(b, 256).ok())
+        {
+            sharpness = Some(maple_import::laplacian_variance(&rgb, width, height));
+            // Blocks once the embedder is `EMBED_QUEUE_DEPTH` photos
+            // behind, which is the throttle keeping the queue bounded.
+            let _ = embed_tx.send(EmbedJob { index, hash, rgb, width, height });
         }
     }
-
-    let (rgb, width, height) = rendered.unwrap_or_default();
-    let has_pixels = !rgb.is_empty() && width > 0 && height > 0;
-    let readable = if has_pixels {
-        readable
-    } else if readable.ok() {
-        Readable::NoPreview
-    } else {
-        readable
-    };
-
-    let sharpness = has_pixels.then(|| maple_import::laplacian_variance(&rgb, width, height));
-
-    // The tile goes out first. The embed queue can block, and when it does
-    // the user should already have the picture in front of them.
-    let embed_pixels = embed_tx.is_some().then(|| rgb.clone());
 
     let _ = tx.send(ScanMsg::Thumb(ScanThumb {
         index,
         path,
         companions,
-        rgb,
-        width,
-        height,
         content_hash: hash,
         imported,
         skipped_before,
         readable,
         sharpness,
     }));
-
-    if let (Some(embed_tx), Some(rgb), true) = (embed_tx, embed_pixels, has_pixels) {
-        // Blocks once the embedder is `EMBED_QUEUE_DEPTH` photos behind,
-        // which is the throttle that keeps the queue's memory bounded.
-        let _ = embed_tx.send(EmbedJob { index, hash, rgb, width, height });
-    }
 }
 
 /// Serial half of the scan: turn rendered photos into DINOv2 embeddings.
@@ -989,47 +976,224 @@ fn save_embed_cache(cache: &maple_import::EmbeddingCache, path: &Path) {
     }
 }
 
-/// The scan's photo count arrived — size the entry list and the model.
-fn apply_scan_count(w: &ImportWindow, ctx: &ImportCtx, n: usize) {
-    let mut ents = ctx.entries.borrow_mut();
-    ents.reserve(n);
-    for _ in 0..n {
-        ents.push(Entry {
-            path: PathBuf::new(),
-            companions: vec![],
-            content_hash: [0; 32],
-            is_imported: false,
-            passed: false,
-            decided_before: false,
-            readable: Readable::Yes,
-            thumb: None,
-            embedding: None,
-            sharpness: None,
-        });
+/// The scan's listing arrived — size the entry list, fill in every path,
+/// and start decoding whatever the strip is showing.
+///
+/// The listing comes before any file has been read, so the count and the
+/// filenames are right from the first frame; hashes and "already seen"
+/// flags land later, per photo, as the reader gets to them.
+fn apply_scan_listing(w: &ImportWindow, ctx: &ImportCtx, photos: Vec<PhotoRef>) {
+    let n = photos.len();
+    {
+        let mut ents = ctx.entries.borrow_mut();
+        ents.clear();
+        ents.reserve(n);
+        for photo in &photos {
+            ents.push(Entry {
+                path: photo.display.clone(),
+                companions: photo.companions.clone(),
+                content_hash: [0; 32],
+                is_imported: false,
+                passed: false,
+                decided_before: false,
+                readable: Readable::Yes,
+                thumb: None,
+                webp: None,
+                embedding: None,
+                sharpness: None,
+            });
+        }
     }
-    drop(ents);
     w.set_total_count(n as i32);
-    // Bulk reset — happens once per scan when the
-    // count first arrives, not on every click.
+
+    let tuning = maple_state::Settings::load().import;
+    let (tx, rx) = mpsc::channel::<PreviewMsg>();
+    *ctx.previews.borrow_mut() = Some(PreviewService::start(
+        Arc::new(photos),
+        tuning.read_timeout(),
+        tuning.decoders(),
+        tx,
+    ));
+    start_preview_drain(ctx, rx);
+
+    // Bulk reset — once per scan, not on every click.
     refilter(w, ctx);
+}
+
+/// Drain decoded previews for as long as the browser is open.
+///
+/// A separate timer from the scan's: the user goes on scrolling long after
+/// the index pass has finished, and every scroll is a new decode request.
+fn start_preview_drain(ctx: &ImportCtx, rx: mpsc::Receiver<PreviewMsg>) {
+    let drain_ctx = ctx.clone();
+    let timer = Timer::default();
+    timer.start(TimerMode::Repeated, Duration::from_millis(30), move || {
+        let Some(w) = drain_ctx.window.upgrade() else { return };
+        // A handful per tick: each one encodes a WebP, and starving the
+        // event loop is exactly what this whole change is avoiding.
+        for _ in 0..6 {
+            match rx.try_recv() {
+                Ok(msg) => apply_preview(&w, &drain_ctx, msg),
+                Err(mpsc::TryRecvError::Empty) => break,
+                Err(mpsc::TryRecvError::Disconnected) => break,
+            }
+        }
+    });
+    *ctx.preview_timer.borrow_mut() = Some(timer);
+}
+
+/// One decoded preview arrived (or failed to).
+fn apply_preview(w: &ImportWindow, ctx: &ImportCtx, msg: PreviewMsg) {
+    let index = match msg {
+        PreviewMsg::Ready { index, rgb, width, height, from_companion } => {
+            let buf =
+                slint::SharedPixelBuffer::<slint::Rgb8Pixel>::clone_from_slice(&rgb, width, height);
+            // Keep a WebP alongside the pixels. It is ~15 KB against the
+            // frame's ~196 KB, and it is what eviction falls back to, so
+            // scrolling back never returns to the card.
+            let webp = crate::thumbnail::encode_webp_rgb(&rgb, width, height, 80);
+            if let Some(e) = ctx.entries.borrow_mut().get_mut(index) {
+                e.thumb = Some(slint::Image::from_rgb8(buf));
+                e.webp = Some(webp);
+                if from_companion {
+                    e.readable = Readable::FromCompanion;
+                }
+            }
+            let dropped = ctx.retained.borrow_mut().insert(index);
+            for index in dropped {
+                evict_preview(ctx, index);
+            }
+            index
+        }
+        PreviewMsg::Failed { index } => {
+            if let Some(e) = ctx.entries.borrow_mut().get_mut(index) {
+                if e.readable.ok() {
+                    e.readable = Readable::NoPreview;
+                }
+            }
+            index
+        }
+    };
+    redraw(ctx, index);
+    if ctx.preview_shown_idx.get() == Some(index) {
+        set_preview_state(w, ctx, index);
+    }
+}
+
+/// Drop a preview's pixels, keeping its WebP so it can come back without
+/// touching the medium.
+fn evict_preview(ctx: &ImportCtx, index: usize) {
+    if let Some(e) = ctx.entries.borrow_mut().get_mut(index) {
+        e.thumb = None;
+    }
+    redraw(ctx, index);
+}
+
+/// Re-inflate an evicted preview from its WebP copy. Cheap enough to do on
+/// the UI thread — it is a 256 px image — and it saves a card read.
+fn restore_preview(ctx: &ImportCtx, index: usize) -> bool {
+    let webp = match ctx.entries.borrow().get(index) {
+        Some(e) if e.thumb.is_none() => e.webp.clone(),
+        _ => None,
+    };
+    let Some(webp) = webp else { return false };
+    let Ok((rgb, width, height)) = crate::thumbnail::decode_webp_rgb(&webp) else {
+        return false;
+    };
+    let buf = slint::SharedPixelBuffer::<slint::Rgb8Pixel>::clone_from_slice(&rgb, width, height);
+    if let Some(e) = ctx.entries.borrow_mut().get_mut(index) {
+        e.thumb = Some(slint::Image::from_rgb8(buf));
+    }
+    let dropped = ctx.retained.borrow_mut().insert(index);
+    for index in dropped {
+        evict_preview(ctx, index);
+    }
+    redraw(ctx, index);
+    true
+}
+
+/// Repaint one entry's tile, if it is on screen at all.
+fn redraw(ctx: &ImportCtx, index: usize) {
+    update_row(
+        &ctx.model,
+        &ctx.entries.borrow(),
+        &ctx.selected.borrow(),
+        &ctx.groups.borrow(),
+        &ctx.visible.borrow(),
+        index,
+    );
+}
+
+/// The strip reported which rows are on screen — decode those, and let go
+/// of what has been out of sight longest.
+///
+/// `first`/`last` are model rows and inclusive; the strip already adds its
+/// own prefetch margin either side of the viewport.
+fn set_preview_window(ctx: &ImportCtx, first: usize, last: usize, focus: usize) {
+    ctx.preview_window.set((first, last, focus));
+    request_previews(ctx);
+}
+
+/// Ask the preview service for everything on screen that is not already
+/// decoded, nearest the viewport first.
+fn request_previews(ctx: &ImportCtx) {
+    let (first, last, focus) = ctx.preview_window.get();
+    let rows: Vec<usize> = {
+        let visible = ctx.visible.borrow();
+        if visible.rows.is_empty() {
+            return;
+        }
+        // Never ask for more than can be held. A window wider than the
+        // retention cap is self-defeating: the tail would evict the head
+        // and the strip would decode the same photos over and over. It
+        // also means a bad geometry reading cannot turn into a request to
+        // decode the entire card.
+        let ceiling = ctx.retained.borrow().capacity();
+        let last = last
+            .min(visible.rows.len().saturating_sub(1))
+            .min(first.saturating_add(ceiling.saturating_sub(1)));
+        if first > last {
+            return;
+        }
+        visible.rows[first..=last].to_vec()
+    };
+    let focus_entry = {
+        let visible = ctx.visible.borrow();
+        visible.rows.get(focus).copied().unwrap_or(0)
+    };
+
+    // Seeing a photo is what keeps its preview alive, so touch every row on
+    // screen before anything is allowed to be evicted.
+    {
+        let mut retained = ctx.retained.borrow_mut();
+        for &index in &rows {
+            retained.touch(index);
+        }
+    }
+
+    let mut wanted = Vec::new();
+    for index in rows {
+        let has_pixels = ctx
+            .entries
+            .borrow()
+            .get(index)
+            .is_some_and(|e| e.thumb.is_some());
+        if has_pixels || restore_preview(ctx, index) {
+            continue;
+        }
+        wanted.push(index);
+    }
+
+    if let Some(service) = ctx.previews.borrow().as_ref() {
+        service.want(wanted, focus_entry);
+    }
 }
 
 /// One scanned photo arrived — fill its entry in and refresh its row.
 fn apply_scan_thumb(w: &ImportWindow, ctx: &ImportCtx, msg: ScanThumb) {
     let ScanThumb {
-        index, path, companions, rgb, width, height, content_hash, imported, skipped_before,
-        readable, sharpness,
+        index, path, companions, content_hash, imported, skipped_before, readable, sharpness,
     } = msg;
-    let thumb = if !rgb.is_empty() && width > 0 && height > 0 {
-        let buf = slint::SharedPixelBuffer::<slint::Rgb8Pixel>::clone_from_slice(
-            &rgb, width, height,
-        );
-        Some(slint::Image::from_rgb8(buf))
-    } else {
-        None
-    };
-    let cur = ctx.current.get();
-    let is_first = index == 0 && cur == 0;
     {
         let mut ents = ctx.entries.borrow_mut();
         if let Some(e) = ents.get_mut(index) {
@@ -1042,7 +1206,6 @@ fn apply_scan_thumb(w: &ImportWindow, ctx: &ImportCtx, msg: ScanThumb) {
             e.passed = skipped_before;
             e.decided_before = imported || skipped_before;
             e.readable = readable;
-            e.thumb = thumb.clone();
             e.sharpness = sharpness;
         }
     }
@@ -1056,17 +1219,16 @@ fn apply_scan_thumb(w: &ImportWindow, ctx: &ImportCtx, msg: ScanThumb) {
     );
     ctx.scanned_count.set(ctx.scanned_count.get() + 1);
     w.set_scanned_count(ctx.scanned_count.get() as i32);
-    // Show preview for the first result.
-    if is_first {
-        let filename = path
-            .file_name()
-            .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or_default();
-        if let Some(img) = thumb {
-            w.set_preview_photo(img);
-            ctx.preview_shown_idx.set(Some(0));
-        }
-        w.set_preview_filename(filename.into());
+    // Name the first photo straight away. Its picture arrives separately,
+    // through the preview service, once the strip says it is on screen.
+    if index == 0 && ctx.current.get() == 0 {
+        w.set_preview_filename(
+            path.file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default()
+                .into(),
+        );
+        show_preview(w, &ctx.entries, 0);
     }
 }
 
@@ -1293,6 +1455,18 @@ fn wire_browse(window: &ImportWindow, ctx: &ImportCtx) {
             set_preview_state(&w, &ctx, new_idx);
         }
     };
+    window.on_preview_window({
+        let ctx = ctx.clone();
+        move |first, last, focus| {
+            set_preview_window(
+                &ctx,
+                first.max(0) as usize,
+                last.max(0) as usize,
+                focus.max(0) as usize,
+            );
+        }
+    });
+
     window.on_nav_prev(make_nav(-1));
     window.on_nav_next(make_nav(1));
 
@@ -1855,7 +2029,9 @@ fn make_item(entries: &[Entry], selected: &HashSet<usize>, groups: &[Vec<usize>]
             .map(|n| SharedString::from(n.to_string_lossy().as_ref()))
             .unwrap_or_default(),
         thumb: e.thumb.clone().unwrap_or_default(),
-        loaded: !e.path.as_os_str().is_empty(),
+        // "Has a picture", not "has been scanned": previews are decoded
+        // around the viewport and dropped again when they fall behind.
+        loaded: e.thumb.is_some(),
         is_selected,
         is_imported: e.is_imported,
         // One verdict per tile, decided here rather than half here and half
@@ -1926,6 +2102,9 @@ fn refilter(w: &ImportWindow, ctx: &ImportCtx) {
         show_preview(w, &ctx.entries, idx);
     }
     set_preview_state(w, ctx, ctx.current.get());
+    // The rows now mean different entries, so what is worth decoding has
+    // changed even though the viewport has not moved.
+    request_previews(ctx);
 }
 
 /// Mirror the current photo's verdict into the preview bar's chip, so the
@@ -2007,6 +2186,7 @@ mod tests {
             decided_before: false,
             readable: Readable::Yes,
             thumb: None,
+            webp: None,
             embedding: None,
             sharpness,
         }
@@ -2182,7 +2362,9 @@ mod tests {
         assert!(item.has_jpg);
         assert!(item.has_raw);
         assert_eq!(item.filename, "DSCF0001.JPG");
-        assert!(item.loaded);
+        // The JPG/RAW badges come from the listing, not from having pixels:
+        // they are known before the file has been touched.
+        assert!(!item.loaded, "no preview has been decoded for it yet");
     }
 
     #[test]
@@ -2392,26 +2574,13 @@ mod tests {
         let path = dir.path().join("truncated.jpg");
         std::fs::write(&path, b"not really a jpeg").unwrap();
 
-        // The read succeeds — it is the *decode* that has nothing to give,
-        // and that is decided later, on a decode thread.
+        // The *read* succeeds — the bytes are there. Whether they decode is
+        // a separate question, asked later and only for photos on screen
+        // (see `import_previews`).
         let out = read_with_budget(&path, Duration::from_secs(30));
-        assert!(out.hash.is_some(), "the bytes are readable even if the image is not");
-
-        let job = DecodeJob {
-            index: 0,
-            path,
-            companions: vec![],
-            hash: out.hash.unwrap(),
-            imported: false,
-            skipped_before: false,
-            bytes: out.bytes,
-            readable: out.readable,
-        };
-        let (tx, rx) = mpsc::channel();
-        decode_one(job, Duration::from_secs(5), None, &tx);
-        let ScanMsg::Thumb(t) = rx.recv().unwrap() else { panic!("expected a thumb") };
-        assert_eq!(t.readable, Readable::NoPreview);
-        assert!(t.rgb.is_empty());
+        assert!(out.hash.is_some());
+        assert!(out.bytes.is_some());
+        assert!(out.readable.ok());
     }
 
     #[cfg(unix)]
@@ -2466,7 +2635,7 @@ mod tests {
                 display: maple_import::ImageFile { path: path.clone(), size: 0 },
                 companions: vec![],
             };
-            decode_one(read_one(index, &group, budget, &prior), budget, None, &tx);
+            decode_one(read_one(index, &group, budget, &prior), None, &tx);
         }
         drop(tx);
 
@@ -2486,7 +2655,7 @@ mod tests {
             .collect();
         assert_eq!(stalled, vec![2], "only the stalled file lacks a preview");
         for t in thumbs.iter().filter(|t| t.readable.ok()) {
-            assert!(t.width > 0 && !t.rgb.is_empty());
+            assert!(t.content_hash != [0u8; 32], "a readable photo must be hashed");
         }
         // Five good photos plus one 150 ms write-off: anything near a
         // multiple of the budget would mean the stall was contagious.
@@ -2498,9 +2667,12 @@ mod tests {
     }
 
     /// Drive the real `spawn_scan_worker` over a real folder and assert the
-    /// message stream the UI depends on: a count, one thumb per photo, then
-    /// `Done`. A deadlock between reader, decoders and embedder shows up
-    /// here as a timeout rather than as an empty grid in the app.
+    /// message stream the UI depends on: the listing, one row per photo,
+    /// then `Done`. A deadlock between reader, decoders and embedder shows
+    /// up here as a timeout rather than as an empty grid in the app.
+    ///
+    /// Pixels are not part of this stream any more — previews are decoded
+    /// on demand by `import_previews`.
     #[test]
     fn a_scan_reports_a_count_then_every_photo_then_done() {
         let dir = tempfile::tempdir().unwrap();
@@ -2526,9 +2698,9 @@ mod tests {
         loop {
             // Finite: a deadlock must fail the test, not hang it.
             match rx.recv_timeout(Duration::from_secs(30)) {
-                Ok(ScanMsg::Count(n)) => count = Some(n),
+                Ok(ScanMsg::Found(photos)) => count = Some(photos.len()),
                 Ok(ScanMsg::Thumb(t)) => {
-                    assert!(t.readable.ok(), "photo {} failed to render", t.index);
+                    assert!(t.readable.ok(), "photo {} failed to read", t.index);
                     assert!(seen.insert(t.index), "photo {} arrived twice", t.index);
                 }
                 Ok(ScanMsg::Embedding { .. }) => {}
@@ -2541,7 +2713,7 @@ mod tests {
             }
         }
 
-        assert_eq!(count, Some(25), "the count must arrive before anything else");
+        assert_eq!(count, Some(25), "the listing must arrive before anything else");
         assert_eq!(seen.len(), 25, "every photo must reach the UI exactly once");
         assert!(done, "the scan must finish");
     }
@@ -2606,135 +2778,17 @@ mod tests {
         assert_eq!(thumbs, N);
     }
 
-    // ── Falling back to the raw when the JPEG is corrupt ─────────
-
-    /// Decode one group and return the thumb the UI would receive.
-    fn decode_group(display: &std::path::Path, companions: Vec<PathBuf>) -> ScanThumb {
-        let prior = PriorDecisions {
-            imported: maple_state::SeenSet::new(),
-            skipped: maple_state::SeenSet::new(),
-        };
-        let group = maple_import::ImageGroup {
-            display: maple_import::ImageFile { path: display.to_path_buf(), size: 0 },
-            companions: companions
-                .into_iter()
-                .map(|path| maple_import::ImageFile { path, size: 0 })
-                .collect(),
-        };
-        let budget = Duration::from_secs(5);
-        let (tx, rx) = mpsc::channel();
-        decode_one(read_one(0, &group, budget, &prior), budget, None, &tx);
-        drop(tx);
-        match rx.recv().unwrap() {
-            ScanMsg::Thumb(t) => t,
-            _ => panic!("expected a thumb"),
-        }
-    }
-
-    /// Bytes that look like a JPEG for long enough to be picked up, and
-    /// then are not one.
-    fn write_corrupt_jpeg(path: &std::path::Path) {
-        std::fs::write(path, b"\xff\xd8\xff\xe0 not actually a jpeg").unwrap();
-    }
-
-    #[test]
-    fn a_corrupt_display_file_is_previewed_from_its_companion() {
-        let dir = tempfile::tempdir().unwrap();
-        // The shape of a RAW+JPEG pair: the JPEG is the display file, and
-        // it is the one that is corrupt.
-        let jpg = dir.path().join("DSCF0042.jpg");
-        write_corrupt_jpeg(&jpg);
-        let companion = dir.path().join("DSCF0042.png");
-        write_png(&companion);
-
-        let thumb = decode_group(&jpg, vec![companion]);
-
-        assert_eq!(thumb.readable, Readable::FromCompanion);
-        assert!(thumb.width > 0 && !thumb.rgb.is_empty(), "the companion should show");
-        // The identity stays the display file's. It is what the library row
-        // and `SeenSet` are keyed on, and the companion is a different file
-        // with a different hash — borrowing its pixels must not borrow its
-        // name.
-        assert_eq!(thumb.content_hash, maple_import::content_hash(&jpg).unwrap());
-    }
-
-    #[test]
-    fn a_corrupt_photo_with_no_usable_companion_has_no_preview() {
-        let dir = tempfile::tempdir().unwrap();
-        let jpg = dir.path().join("DSCF0043.jpg");
-        write_corrupt_jpeg(&jpg);
-        let junk = dir.path().join("DSCF0043.png");
-        std::fs::write(&junk, b"also not an image").unwrap();
-
-        let thumb = decode_group(&jpg, vec![junk]);
-        assert_eq!(thumb.readable, Readable::NoPreview);
-        assert!(thumb.rgb.is_empty());
-    }
-
-    #[test]
-    fn a_lone_corrupt_file_has_nothing_to_fall_back_on() {
-        let dir = tempfile::tempdir().unwrap();
-        let jpg = dir.path().join("DSCF0044.jpg");
-        write_corrupt_jpeg(&jpg);
-
-        let thumb = decode_group(&jpg, vec![]);
-        assert_eq!(thumb.readable, Readable::NoPreview);
-    }
-
-    #[test]
-    fn a_healthy_photo_is_not_reported_as_recovered() {
-        let dir = tempfile::tempdir().unwrap();
-        let png = dir.path().join("DSCF0045.png");
-        write_png(&png);
-        let companion = dir.path().join("DSCF0045-companion.png");
-        write_png(&companion);
-
-        let thumb = decode_group(&png, vec![companion]);
-        assert_eq!(thumb.readable, Readable::Yes, "the companion was not needed");
-    }
-
-    /// A card that has stopped answering must not be asked twice: falling
-    /// back after a timeout would double every stall.
-    #[cfg(unix)]
-    #[test]
-    fn a_timed_out_photo_does_not_also_wait_on_its_companion() {
-        let dir = tempfile::tempdir().unwrap();
-        let stalled = dir.path().join("stalls.jpg");
-        make_stalling_file(&stalled);
-        let companion = dir.path().join("stalls-companion.jpg");
-        make_stalling_file(&companion);
-
-        let prior = PriorDecisions {
-            imported: maple_state::SeenSet::new(),
-            skipped: maple_state::SeenSet::new(),
-        };
-        let group = maple_import::ImageGroup {
-            display: maple_import::ImageFile { path: stalled, size: 0 },
-            companions: vec![maple_import::ImageFile { path: companion, size: 0 }],
-        };
-        let budget = Duration::from_millis(200);
-        let (tx, rx) = mpsc::channel();
-
-        let started = std::time::Instant::now();
-        decode_one(read_one(0, &group, budget, &prior), budget, None, &tx);
-        let waited = started.elapsed();
-        drop(tx);
-
-        let ScanMsg::Thumb(t) = rx.recv().unwrap() else { panic!("expected a thumb") };
-        assert_eq!(t.readable, Readable::TimedOut);
-        assert!(
-            waited < budget * 2,
-            "waited {waited:?} — the companion was tried after a timeout"
-        );
-    }
-
     #[test]
     fn an_unreadable_photo_still_reaches_its_tile() {
         let mut entries = vec![entry("/src/a.jpg", None)];
         entries[0].readable = Readable::TimedOut;
         let item = make_item(&entries, &HashSet::new(), &[], 0);
         assert!(item.is_unreadable);
-        assert!(item.loaded, "it was scanned — it is not still loading");
+        // `loaded` now means "has a decoded preview", so an unreadable
+        // photo is not loaded — but the tile still knows its name, which is
+        // what stops it looking like a row still waiting its turn.
+        assert!(!item.loaded);
+        assert_eq!(item.filename, "a.jpg");
     }
 
     #[test]

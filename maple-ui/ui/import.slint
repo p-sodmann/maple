@@ -23,6 +23,9 @@ export struct ImportItem {
     index: int,
     filename: string,
     thumb: image,
+    // A decoded preview is in hand. Previews are decoded on demand around
+    // the viewport, so this goes false again when one is evicted — it is
+    // not "has been scanned".
     loaded: bool,
     is-selected: bool,   // marked for import — the yellow dot
     is-imported: bool,   // already present in the library
@@ -53,6 +56,10 @@ component ImportGridView {
     in property <int> current-index: -1;    // highlighted (preview target)
     in property <length> cell-size: 120px;
     callback clicked(int);
+    // Rows on screen (inclusive) plus the row the viewport is centred on.
+    // Rust decodes these and lets go of what has been out of sight longest,
+    // so this is what makes a few thousand photos affordable.
+    callback window-changed(int, int, int);
 
     property <length> gap: Theme.gap;
     property <length> pad: Theme.pad;
@@ -63,6 +70,20 @@ component ImportGridView {
     // Single column — one thumbnail per row.
     property <float> columns: 1;
     property <float> row-count: Math.ceil(root.items.length / root.columns);
+
+    // A margin either side of the viewport so a preview is usually already
+    // decoded by the time it scrolls in. Deliberately a function of
+    // geometry alone, like the library grid's prefetch lead.
+    property <length> lead: 1.0 * sv.visible-height;
+    property <int> first-wanted: Math.max(0, Math.floor((-sv.viewport-y - root.lead) / root.pitch-y));
+    property <int> last-wanted: Math.max(0, Math.ceil((-sv.viewport-y + sv.visible-height + root.lead) / root.pitch-y));
+    property <int> focus-row: Math.max(0, Math.floor((-sv.viewport-y + sv.visible-height / 2) / root.pitch-y));
+
+    changed first-wanted => { root.window-changed(root.first-wanted, root.last-wanted, root.focus-row); }
+    changed last-wanted => { root.window-changed(root.first-wanted, root.last-wanted, root.focus-row); }
+    // The list itself changing (a scan filling in, the filter toggling)
+    // changes what those rows *are*, so it has to re-ask too.
+    changed items => { root.window-changed(root.first-wanted, root.last-wanted, root.focus-row); }
 
     sv := ScrollView {
         viewport-width: sv.visible-width;
@@ -226,7 +247,7 @@ component ImportGridView {
                     height: root.label-h;
                     spacing: 6px;
 
-                    if item.loaded: Text {
+                    if item.filename != "": Text {
                         text: "JPG";
                         font-size: 9px;
                         font-weight: 700;
@@ -234,7 +255,7 @@ component ImportGridView {
                         vertical-alignment: center;
                         color: item.has-jpg ? Theme.fg : Theme.dim-fg.with-alpha(0.4);
                     }
-                    if item.loaded: Text {
+                    if item.filename != "": Text {
                         text: "RAW";
                         font-size: 9px;
                         font-weight: 700;
@@ -382,7 +403,7 @@ export component ImportWindow inherits Window {
     // The "Hide old images" toggle only appears once there is something to
     // hide.
     in property <int> old-count: 0;
-    in-out property <bool> hide-old: false;
+    in-out property <bool> hide-old: true;
     // Verdict on the photo in the big preview: 0 undecided, 1 marked for
     // import, 2 moved past, 3 already in the library. Mirrors the badge on
     // its tile, where the user is not necessarily looking.
@@ -405,6 +426,8 @@ export component ImportWindow inherits Window {
     callback open-path-template;
     callback start-scan;
     callback item-clicked(int);
+    // Rows on screen (inclusive) and the row at its centre.
+    callback preview-window(int, int, int);
     callback toggle-hide-old();
     callback copy-selected;
     callback nav-prev;
@@ -715,6 +738,7 @@ export component ImportWindow inherits Window {
                         current-index: root.current-index;
                         cell-size: 236px;
                         clicked(i) => { root.item-clicked(i); }
+                        window-changed(a, b, c) => { root.preview-window(a, b, c); }
                     }
 
                     Rectangle {

@@ -301,6 +301,15 @@ pub struct ImportSettings {
     /// copyable either way, it just has no preview.
     #[serde(default = "ImportSettings::default_read_timeout_secs")]
     pub read_timeout_secs: u64,
+    /// Decoded previews held in memory at once. Default: 128.
+    ///
+    /// A 256 px preview is about 196 KB decoded, so the default is roughly
+    /// 25 MB — many screenfuls of a one-column filmstrip. Past this the
+    /// least-recently-seen preview is dropped down to its WebP copy (~15 KB)
+    /// and re-inflated from there if it scrolls back into view, so eviction
+    /// never sends the app back to the card.
+    #[serde(default = "ImportSettings::default_max_loaded_previews")]
+    pub max_loaded_previews: usize,
 }
 
 impl ImportSettings {
@@ -310,6 +319,18 @@ impl ImportSettings {
 
     fn default_read_timeout_secs() -> u64 {
         30
+    }
+
+    fn default_max_loaded_previews() -> usize {
+        128
+    }
+
+    /// Decoded-preview ceiling, never small enough to thrash.
+    ///
+    /// A cap below a screenful would evict previews the user is still
+    /// looking at and immediately decode them again.
+    pub fn retained_previews(&self) -> usize {
+        self.max_loaded_previews.max(16)
     }
 
     /// Decode pool size, never zero.
@@ -328,6 +349,7 @@ impl Default for ImportSettings {
         Self {
             decode_threads: Self::default_decode_threads(),
             read_timeout_secs: Self::default_read_timeout_secs(),
+            max_loaded_previews: Self::default_max_loaded_previews(),
         }
     }
 }
@@ -996,12 +1018,20 @@ mod tests {
         let s = ImportSettings::default();
         assert_eq!(s.decoders(), 4);
         assert_eq!(s.read_timeout(), std::time::Duration::from_secs(30));
+        assert_eq!(s.retained_previews(), 128);
 
         // Neither knob may come back as zero: no decoders would mean no
         // scan at all, and a zero timeout would abandon every photo.
-        let zeroed = ImportSettings { decode_threads: 0, read_timeout_secs: 0 };
+        let zeroed = ImportSettings {
+            decode_threads: 0,
+            read_timeout_secs: 0,
+            max_loaded_previews: 0,
+        };
         assert_eq!(zeroed.decoders(), 1);
         assert_eq!(zeroed.read_timeout(), std::time::Duration::from_secs(1));
+        // A ceiling below a screenful would evict previews still on screen
+        // and immediately decode them again.
+        assert_eq!(zeroed.retained_previews(), 16);
 
         let parsed: Settings = toml::from_str(
             "[import]\ndecode_threads = 9\nread_timeout_secs = 120\n",
