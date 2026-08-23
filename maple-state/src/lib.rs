@@ -6,7 +6,7 @@
 mod seen;
 pub mod sync;
 
-pub use seen::SeenSet;
+pub use seen::{Record, SeenSet};
 pub use sync::{PeerMode, SyncRole, SyncSettings};
 
 use serde::{Deserialize, Serialize};
@@ -270,6 +270,64 @@ impl Default for AiSettings {
             server_url: Self::default_server_url(),
             model: Self::default_model(),
             prompt: Self::default_prompt(),
+        }
+    }
+}
+
+/// Import scan settings.
+///
+/// Stored under `[import]` in `settings.toml`.
+///
+/// The scan reads the medium on **one** thread and decodes on several: a
+/// camera card is a single bus, and several readers on it are slower than
+/// one, not faster. So the knob here is the size of the *decode* pool.
+/// There is little point pushing it high — a scan exists to be looked at,
+/// and nobody triages photos faster than a handful of cores can produce
+/// them — but a fast internal disk and a lot of cores can take more.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ImportSettings {
+    /// Photos decoded in parallel during an import scan. Default: 4.
+    ///
+    /// Clamped to at least 1. Each worker holds one full-resolution frame
+    /// while it works (a 24 MP photo is ~72 MB), so this is a memory dial
+    /// as much as a speed one.
+    #[serde(default = "ImportSettings::default_decode_threads")]
+    pub decode_threads: usize,
+    /// Seconds one photo gets to be read off the medium before the scan
+    /// gives up on it and moves on. Default: 30.
+    ///
+    /// The backstop for a card that stops answering. Raise it for a slow
+    /// reader and very large raws; the photo is still listed and still
+    /// copyable either way, it just has no preview.
+    #[serde(default = "ImportSettings::default_read_timeout_secs")]
+    pub read_timeout_secs: u64,
+}
+
+impl ImportSettings {
+    fn default_decode_threads() -> usize {
+        4
+    }
+
+    fn default_read_timeout_secs() -> u64 {
+        30
+    }
+
+    /// Decode pool size, never zero.
+    pub fn decoders(&self) -> usize {
+        self.decode_threads.max(1)
+    }
+
+    /// How long one read may take before it is abandoned.
+    pub fn read_timeout(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(self.read_timeout_secs.max(1))
+    }
+}
+
+impl Default for ImportSettings {
+    fn default() -> Self {
+        Self {
+            decode_threads: Self::default_decode_threads(),
+            read_timeout_secs: Self::default_read_timeout_secs(),
         }
     }
 }
@@ -576,7 +634,7 @@ pub struct Settings {
     #[serde(default = "Settings::default_preview_buffer_size")]
     pub preview_buffer_size: usize,
     /// Directory where library data files are stored
-    /// (`seen_imported.bin`, `seen_rejected.bin`, …).
+    /// (`seen_imported.bin`, `seen_skipped.bin`, …).
     /// Defaults to `~/.config/maple/`.
     #[serde(default = "Settings::default_library_dir")]
     pub library_dir: PathBuf,
@@ -587,6 +645,9 @@ pub struct Settings {
     /// Destination folder/filename templates for imported files.
     #[serde(default)]
     pub path_template: PathTemplateSettings,
+    /// Import scan tuning.
+    #[serde(default)]
+    pub import: ImportSettings,
     /// AI image description settings.
     #[serde(default)]
     pub ai: AiSettings,
@@ -691,6 +752,7 @@ impl Default for Settings {
             library_dir: Self::default_library_dir(),
             database_path: Self::default_database_path(),
             path_template: PathTemplateSettings::default(),
+            import: ImportSettings::default(),
             ai: AiSettings::default(),
             face: FaceSettings::default(),
             collections: CollectionSettings::default(),
@@ -927,6 +989,32 @@ mod tests {
         let loaded = Settings::load_from(&path);
         assert_eq!(loaded.sync.listen_addr, "192.168.1.20:9000");
         assert_eq!(loaded.sync.interval_secs, 45);
+    }
+
+    #[test]
+    fn an_import_section_round_trips_and_defaults_sanely() {
+        let s = ImportSettings::default();
+        assert_eq!(s.decoders(), 4);
+        assert_eq!(s.read_timeout(), std::time::Duration::from_secs(30));
+
+        // Neither knob may come back as zero: no decoders would mean no
+        // scan at all, and a zero timeout would abandon every photo.
+        let zeroed = ImportSettings { decode_threads: 0, read_timeout_secs: 0 };
+        assert_eq!(zeroed.decoders(), 1);
+        assert_eq!(zeroed.read_timeout(), std::time::Duration::from_secs(1));
+
+        let parsed: Settings = toml::from_str(
+            "[import]\ndecode_threads = 9\nread_timeout_secs = 120\n",
+        )
+        .unwrap();
+        assert_eq!(parsed.import.decoders(), 9);
+        assert_eq!(parsed.import.read_timeout().as_secs(), 120);
+    }
+
+    #[test]
+    fn settings_with_no_import_section_still_scan() {
+        let parsed: Settings = toml::from_str("debug = false\n").unwrap();
+        assert_eq!(parsed.import.decoders(), 4);
     }
 
     #[test]

@@ -20,6 +20,11 @@ export global Theme {
     out property <color> accent-tint: root.dark ? #3A2B25 : #F2E2DA;
     out property <color> field:       root.dark ? #241F1B : #F4F0EA;
     out property <color> success:     root.dark ? #5FAE7A : #3F8F5D;
+    // Import triage markers. Deliberately off the accent ramp — the accent
+    // is a terracotta, and a "skip" mark drawn in it would read as an
+    // ordinary selection rather than a decision against the photo.
+    out property <color> marked:      root.dark ? #E7B23F : #D79A1B;
+    out property <color> rejected:    root.dark ? #DE5F4E : #C4402F;
 
     // ── Layout ─────────────────────────────────────────────────────
     out property <length> sidebar-width:   228px;

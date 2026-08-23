@@ -36,6 +36,29 @@ folder = "{YYYY}/{MM}"
 # Filename stem. "{original}" keeps the source filename unchanged.
 filename = "{original}"
 
+# ── Import scan ─────────────────────────────────────────────────
+# The scan reads the medium on one thread and decodes on several. That is
+# deliberate: a camera card is a single bus, and several readers on it are
+# slower than one, not faster — twelve threads each get a twelfth of the
+# bandwidth and the grid stays empty until they all finish at once.
+
+[import]
+# Photos decoded in parallel. Minimum 1.
+# Each worker holds one full-resolution frame while it works (a 24 MP photo
+# is about 72 MB), so this is a memory dial as much as a speed one. The
+# default is low on purpose: a scan exists to be looked through, and nobody
+# triages photos faster than four cores can produce them. Raise it for a
+# fast internal disk and a lot of cores.
+decode_threads = 4
+
+# Seconds one photo gets to be read off the medium before the scan gives up
+# on it and moves on to the next.
+# The backstop for a card that has stopped answering — without it, one file
+# that never returns stalls the whole scan. A photo that times out is still
+# listed and still copyable, it just has no preview, and its full path is
+# logged under the `maple::import::unreadable` target.
+read_timeout_secs = 30
+
 # ── AI image description ────────────────────────────────────────
 
 [ai]

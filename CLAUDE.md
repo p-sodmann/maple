@@ -159,6 +159,43 @@ single binary; the backend is fixed at compile time.
   all do. `ServerDeps::on_change` is the master's equivalent of the servant worker's:
   a master polls nothing, so without it a photo a servant sent sits unseen until the app
   restarts. (The 60-second scanner still refreshes nothing — that gap predates sync.)
+- **Import scan pipeline** (`maple-ui/src/import.rs`): three stages split along where
+  the work blocks. **Reading is serial**, on one thread — a camera card is a single bus,
+  and twelve readers on it each get a twelfth of the bandwidth and all finish late
+  *together*, so the grid sits empty for minutes and then fills in a burst (measured: it
+  made time-to-first-tile worse, not better). One reader also opens each file **once**;
+  hashing and decoding used to open it separately, doubling traffic over the slowest link
+  in the pipeline. `read_with_budget` hashes the *file* bytes — never a raw's preview, so
+  the digest stays the identifier `SeenSet` and the library use. **Decoding fans out**
+  across `[import] decode_threads` workers pulling from one bounded queue: pure CPU over
+  bytes already in memory, so it cannot stall on the card. **Embedding is serial again**,
+  behind everything, because it owns the single `&mut` ONNX session and the embedding
+  cache; its results arrive later as `ScanMsg::Embedding`, after the tile is already on
+  screen. Three rules: the tile is sent *before* the embed job (that queue blocks, and
+  the user should already have the picture); every queue is bounded (`sync_channel`),
+  since an unbounded one would pull a whole card into RAM; and each stage's original
+  sender is dropped inside the `thread::scope` body, or the stages wait on each other
+  forever. A file the card never returns from is **outlived, not cancelled** — the read
+  runs on its own thread and `recv_timeout` walks away after `read_timeout_secs`, the
+  same trade `image_loader.rs` makes. Its path is logged under the
+  `maple::import::unreadable` target and the photo stays listed, selectable and copyable
+  with no preview.
+- **The import record lives on the medium** (`maple-state/src/seen.rs`, P9): the scan's
+  "already imported" badge reads `<source>/.maple_seen.bin`, written to the card itself
+  so it carries its own history to the next machine — beside `.maple_embed_cache.bin`,
+  which established the idiom. `library_dir/seen_imported.bin` stays as a
+  *non-authoritative* replica, read only when the source has no readable record of its
+  own (read-only card, network share, a folder that moved); a **corrupt** medium record
+  falls back the same way as a missing one, since reading it as an empty set would send
+  the user re-importing a whole card. `SeenSet` is **grow-only**, so saving is a
+  read-merge-write union (`merge_save_to_source`) with no locking and no conflict
+  resolution — that is what makes two importers running at once combine instead of
+  clobber, and it is the same code path that folds a card's history into a library that
+  has never seen it. Two invariants worth keeping: the all-zero `UNHASHED` sentinel the
+  scan stores on a hash failure is refused by `insert` *and* dropped on load (it would
+  otherwise badge every unreadable photo as imported), and `save_to` stages into a
+  dot-prefixed scratch file and renames, so an ejected card mid-write leaves the previous
+  record rather than a truncated one.
 - **Raw file support**: Only Fujifilm RAF currently. Always use `maple_import::loadable_image_bytes(path)` for loading images (handles raw preview extraction transparently). Check format with `maple_import::is_raw_format(path)`.
 
 ### Database

@@ -10,7 +10,7 @@
 
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::{mpsc, Arc, Mutex};
 use std::time::Duration;
@@ -31,6 +31,24 @@ const EMBED_CACHE_FILE: &str = ".maple_embed_cache.bin";
 /// flushed to disk (mirrors `maple-db::hasher`'s `BATCH_SIZE` convention).
 const EMBED_CACHE_FLUSH_EVERY: usize = 20;
 
+/// How far the reader may run ahead of the decode pool, as a multiple of
+/// the pool size.
+///
+/// Each queued job holds one file's bytes, so this bounds what the reader
+/// can pull into RAM. Deep enough to keep every decoder fed through an
+/// uneven patch, shallow enough that a big card cannot be read faster than
+/// it is consumed.
+const READ_AHEAD_PER_DECODER: usize = 3;
+
+/// How many rendered photos may queue up in front of the embedder.
+///
+/// The bound is what keeps the two stages from turning into a memory leak:
+/// each job carries a 256×256 RGB buffer, so an unbounded queue on a
+/// 5 000-photo card would be about a gigabyte of thumbnails waiting for
+/// ONNX. At this depth the render workers block instead, by which point the
+/// user already has 64 tiles on screen.
+const EMBED_QUEUE_DEPTH: usize = 64;
+
 thread_local! {
     static IMPORT: RefCell<Option<Import>> = const { RefCell::new(None) };
 }
@@ -40,8 +58,49 @@ thread_local! {
 enum ScanMsg {
     Count(usize),
     Thumb(ScanThumb),
+    /// A burst-detection embedding, arriving separately and later than the
+    /// photo's tile — see [`spawn_scan_worker`].
+    Embedding { index: usize, embedding: Vec<f32> },
     Done,
     Error(String),
+}
+
+/// Why a photo has no preview — kept apart because the two mean very
+/// different things when you go looking for the file afterwards.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+enum Readable {
+    #[default]
+    Yes,
+    /// The bytes came back but decoded to nothing: corrupt, truncated, or a
+    /// format the decoder does not actually handle.
+    NoPreview,
+    /// The read never returned inside [`PHOTO_BUDGET`] and the scan walked
+    /// away. Usually the card or the cable, not the file.
+    TimedOut,
+}
+
+impl Readable {
+    fn ok(self) -> bool {
+        self == Self::Yes
+    }
+
+    /// Short reason for the log summary at the end of a scan.
+    fn reason(self) -> &'static str {
+        match self {
+            Self::Yes => "ok",
+            Self::NoPreview => "could not be decoded",
+            Self::TimedOut => "timed out",
+        }
+    }
+}
+
+/// What earlier sessions already decided about the photos on a medium.
+///
+/// Read-only for the whole scan, so it travels as a bare `Arc` — nothing
+/// mutates it and there is nothing for a lock to protect.
+struct PriorDecisions {
+    imported: maple_state::SeenSet,
+    skipped: maple_state::SeenSet,
 }
 
 /// One scanned photo, handed from the scan worker to the UI thread.
@@ -54,9 +113,12 @@ struct ScanThumb {
     height: u32,
     content_hash: [u8; 32],
     imported: bool,
-    /// DINOv2 embedding, if stack detection is enabled and inference
-    /// (or an SD-card cache hit) succeeded.
-    embedding: Option<Vec<f32>>,
+    /// An earlier session moved past this photo without marking it.
+    skipped_before: bool,
+    /// Whether a preview came back at all, and if not, why. The row still
+    /// exists either way and can still be selected and copied; it just has
+    /// no picture to show.
+    readable: Readable,
     /// Variance-of-Laplacian sharpness score, computed whenever an
     /// embedding is (used to auto-pick the "best" shot in a burst).
     sharpness: Option<f32>,
@@ -94,6 +156,19 @@ struct Entry {
     companions: Vec<PathBuf>,
     content_hash: [u8; 32],
     is_imported: bool,
+    /// The user has moved off this photo without marking it for import —
+    /// a decision, not an absence, and what paints the red ✗. Set on every
+    /// departure, marked or not, so that un-marking a photo later turns it
+    /// into a skip rather than back into "never looked at". Pre-set for
+    /// photos an earlier session already skipped.
+    passed: bool,
+    /// An earlier session already decided about this photo: imported it, or
+    /// passed over it. The predicate behind "Hide old images".
+    decided_before: bool,
+    /// Whether the scan got a preview out of this file, and if not, why.
+    /// The row is still here and still copyable; only its picture is
+    /// missing.
+    readable: Readable,
     /// Decoded thumbnail (None until the scan worker sends it).
     thumb: Option<slint::Image>,
     /// DINOv2 embedding computed during the scan (`None` if stack detection
@@ -102,6 +177,44 @@ struct Entry {
     /// Variance-of-Laplacian sharpness score, used to auto-pick the "best"
     /// shot within a detected burst group.
     sharpness: Option<f32>,
+}
+
+/// Which entries the filmstrip is currently showing, and where.
+///
+/// "Hide old images" filters the model but not the entry list: the scan
+/// index stays every photo's identity — selection, groups, navigation and
+/// the preview all address entries by it — and this is the only place that
+/// knows a model row is a different number.
+#[derive(Default)]
+struct Visible {
+    /// Model row → entry index.
+    rows: Vec<usize>,
+    /// Entry index → model row; `None` while the entry is filtered out.
+    row_of: Vec<Option<usize>>,
+}
+
+impl Visible {
+    fn rebuild(&mut self, entries: &[Entry], hide_old: bool) {
+        self.rows.clear();
+        self.row_of.clear();
+        self.row_of.resize(entries.len(), None);
+        for (i, e) in entries.iter().enumerate() {
+            if hide_old && e.decided_before {
+                continue;
+            }
+            self.row_of[i] = Some(self.rows.len());
+            self.rows.push(i);
+        }
+    }
+
+    /// The model row showing entry `i`, if it is on screen at all.
+    fn row(&self, i: usize) -> Option<usize> {
+        self.row_of.get(i).copied().flatten()
+    }
+
+    fn shows(&self, i: usize) -> bool {
+        self.row(i).is_some()
+    }
 }
 
 // ── Controller struct ─────────────────────────────────────────────
@@ -118,6 +231,19 @@ struct ImportCtx {
     entries: Rc<RefCell<Vec<Entry>>>,
     selected: Rc<RefCell<HashSet<usize>>>,
     current: Rc<Cell<usize>>,
+    /// Row ↔ entry mapping for the filmstrip; identity when nothing is
+    /// hidden.
+    visible: Rc<RefCell<Visible>>,
+    /// Whether photos an earlier session already decided on are filtered
+    /// out of the strip.
+    hide_old: Rc<Cell<bool>>,
+    /// The medium the entries on screen actually came off.
+    ///
+    /// Not the same thing as `source`, which is wherever the folder picker
+    /// currently points: picking a new source and closing the window
+    /// without re-scanning would otherwise write the *previous* card's
+    /// verdicts into the new one's record.
+    scanned_source: Rc<RefCell<PathBuf>>,
     /// Persistent model, mutated in place via `set_row_data` for single-row
     /// changes (selection toggle, thumb arriving, rotate, …) instead of being
     /// replaced wholesale. Swapping in a brand-new `VecModel` on every click
@@ -228,6 +354,9 @@ fn build(db: Arc<Mutex<maple_db::Database>>) -> Result<Import, slint::PlatformEr
         entries: Rc::new(RefCell::new(Vec::new())),
         selected: Rc::new(RefCell::new(HashSet::new())),
         current: Rc::new(Cell::new(0)),
+        visible: Rc::new(RefCell::new(Visible::default())),
+        hide_old: Rc::new(Cell::new(false)),
+        scanned_source: Rc::new(RefCell::new(PathBuf::new())),
         model,
         preview_shown_idx: Rc::new(Cell::new(None)),
         scanned_count: Rc::new(Cell::new(0)),
@@ -256,11 +385,23 @@ fn build(db: Arc<Mutex<maple_db::Database>>) -> Result<Import, slint::PlatformEr
 fn wire_chrome(window: &ImportWindow, ctx: &ImportCtx) {
     // ── Close ─────────────────────────────────────────────────────
     window.on_close_requested({
-        let w = ctx.window.clone();
+        let ctx = ctx.clone();
         move || {
-            if let Some(w) = w.upgrade() {
+            commit_skips(&ctx);
+            if let Some(w) = ctx.window.upgrade() {
                 let _ = w.hide();
             }
+        }
+    });
+
+    // The platform's own close button does not route through the callback
+    // above, and losing a session's triage to it would be the easiest way
+    // to lose it.
+    window.window().on_close_requested({
+        let ctx = ctx.clone();
+        move || {
+            commit_skips(&ctx);
+            slint::CloseRequestResponse::HideWindow
         }
     });
 
@@ -347,11 +488,26 @@ fn wire_scan(window: &ImportWindow, ctx: &ImportCtx) {
             let library_dir = settings.library_dir.clone();
             let stack_settings = settings.stacks.clone();
 
-            let imported_set = Arc::new(Mutex::new(
-                maple_state::SeenSet::load_imported(&library_dir),
-            ));
+            // Both records live on the medium being scanned, so a card
+            // plugged into a second machine still knows what it has already
+            // given up and what was already turned down. The library copies
+            // are only the fallback for a source that carries none (see
+            // `SeenSet::load_for_source`).
+            let prior = Arc::new(PriorDecisions {
+                imported: maple_state::SeenSet::load_for_source(
+                    &src, &library_dir, maple_state::Record::Imported,
+                ),
+                skipped: maple_state::SeenSet::load_for_source(
+                    &src, &library_dir, maple_state::Record::Skipped,
+                ),
+            });
+            *ctx.scanned_source.borrow_mut() = src.clone();
+            ctx.hide_old.set(false);
+            w.set_hide_old(false);
+            w.set_old_count(0);
+            w.set_preview_state(0);
 
-            spawn_scan_worker(src, stack_settings, imported_set.clone(), tx.clone());
+            spawn_scan_worker(src, stack_settings, settings.import.clone(), prior, tx.clone());
 
             // Timer to drain scan results.
             let ctx2 = ctx.clone();
@@ -366,6 +522,14 @@ fn wire_scan(window: &ImportWindow, ctx: &ImportCtx) {
                         match rx.try_recv() {
                             Ok(ScanMsg::Count(n)) => apply_scan_count(&w, &ctx2, n),
                             Ok(ScanMsg::Thumb(thumb)) => apply_scan_thumb(&w, &ctx2, thumb),
+                            Ok(ScanMsg::Embedding { index, embedding }) => {
+                                // Arrives after the photo's tile and needs
+                                // no repaint — only `finish_scan`'s
+                                // clustering reads it.
+                                if let Some(e) = ctx2.entries.borrow_mut().get_mut(index) {
+                                    e.embedding = Some(embedding);
+                                }
+                            }
                             Ok(ScanMsg::Done) => {
                                 finish_scan(&w, &ctx2);
                                 return;
@@ -386,17 +550,39 @@ fn wire_scan(window: &ImportWindow, ctx: &ImportCtx) {
     });
 }
 
-/// Scan `src` on a background thread, streaming one [`ScanThumb`] per photo.
+/// Scan `src`, streaming one [`ScanThumb`] per photo.
 ///
-/// Burst detection during the scan reuses the [stacks] settings — same
-/// toggle/threshold/model as post-import library stacking. If the embedder
-/// fails to load (e.g. no network for a first-time model fetch), log once and
-/// continue the scan without embeddings/sharpness — this is enrichment, never
-/// a hard requirement to finish scanning.
+/// Three stages, split along where the work actually blocks.
+///
+/// **Reading is serial, on this thread.** A camera card is one bus: twelve
+/// threads pulling twelve files off it at once each get a twelfth of the
+/// bandwidth and all finish late *together*, so the grid sits empty for
+/// minutes and then fills in a burst. One reader at full bandwidth hands
+/// over the first photo almost immediately and the rest at a steady rate.
+/// It also reads each file **once** — hashing and decoding used to open it
+/// separately, doubling the traffic over the slowest link in the whole
+/// pipeline.
+///
+/// **Decoding fans out.** It is pure CPU over bytes already in memory, so
+/// it parallelises cleanly and cannot stall on the card.
+///
+/// **Embedding is serial again**, behind everything else: it needs the one
+/// `&mut` ONNX session and the one embedding cache, and its results arrive
+/// later as [`ScanMsg::Embedding`], long after the tile is on screen.
+///
+/// A file the card never returns from costs one read timeout and is then
+/// abandoned — before, it stalled the scan forever. Both the pool size and
+/// that timeout come from `[import]` in settings.toml.
+///
+/// If the embedder fails to load (e.g. no network for a first-time model
+/// fetch), log once and let the scan finish without embeddings or
+/// sharpness — this is enrichment, never a hard requirement to finish
+/// scanning.
 fn spawn_scan_worker(
     src: PathBuf,
     stack_settings: maple_state::StackSettings,
-    imported_set: Arc<Mutex<maple_state::SeenSet>>,
+    tuning: maple_state::ImportSettings,
+    prior: Arc<PriorDecisions>,
     tx: mpsc::Sender<ScanMsg>,
 ) {
     std::thread::spawn(move || {
@@ -410,107 +596,315 @@ fn spawn_scan_worker(
         let total = scanned_groups.len();
         let _ = tx.send(ScanMsg::Count(total));
 
-        let algorithm_key = stack_settings.algorithm_key();
-        let cache_path = src.join(EMBED_CACHE_FILE);
-        let mut embedder = if stack_settings.enabled {
-            match maple_db::load_onnx_embedder(&stack_settings) {
-                Ok(e) => Some(e),
-                Err(err) => {
-                    tracing::warn!(
-                        "Import scan: failed to load image embedder, skipping burst detection: {err}"
-                    );
-                    None
-                }
+        let decoders = tuning.decoders();
+        let budget = tuning.read_timeout();
+        // One line naming the settings actually in force, so a slow scan
+        // can be reasoned about from the log alone.
+        tracing::info!(
+            "Import scan: {total} photos from {}, 1 reader + {decoders} decoders, {:?} read timeout",
+            src.display(),
+            budget
+        );
+        let (jobs_tx, jobs_rx) =
+            mpsc::sync_channel::<DecodeJob>(decoders * READ_AHEAD_PER_DECODER);
+        let jobs_rx = Arc::new(Mutex::new(jobs_rx));
+        let (embed_tx, embed_rx) = mpsc::sync_channel::<EmbedJob>(EMBED_QUEUE_DEPTH);
+
+        std::thread::scope(|scope| {
+            if stack_settings.enabled {
+                let tx = tx.clone();
+                let src = src.clone();
+                let settings = stack_settings.clone();
+                scope.spawn(move || embed_stage(&src, &settings, embed_rx, &tx));
             }
-        } else {
-            None
-        };
-        let mut embed_cache = stack_settings
-            .enabled
-            .then(|| maple_import::EmbeddingCache::load_from(&cache_path, &algorithm_key));
-        let mut unflushed = 0usize;
 
-        for (idx, group) in scanned_groups.into_iter().enumerate() {
-            let display_path = group.display.path.clone();
-            let companions: Vec<PathBuf> =
-                group.companions.iter().map(|c| c.path.clone()).collect();
-
-            let (hash, imported) = match maple_import::content_hash(&display_path) {
-                Ok(h) => {
-                    let imp = imported_set.lock().map(|s| s.contains(&h)).unwrap_or(false);
-                    (h, imp)
-                }
-                Err(_) => ([0u8; 32], false),
-            };
-
-            let (rgb, width, height) =
-                thumbnail::render_to_rgb(&display_path, 256).unwrap_or_default();
-
-            let (sharpness, embedding) = if stack_settings.enabled
-                && !rgb.is_empty()
-                && width > 0
-                && height > 0
-            {
-                let sharp = maple_import::laplacian_variance(&rgb, width, height);
-                let cached = embed_cache.as_ref().and_then(|c| c.get(&hash)).map(|s| s.to_vec());
-                let embedding = match cached {
-                    Some(e) => Some(e),
-                    None => embedder.as_mut().and_then(|embedder| {
-                        let img = RgbImage::from_raw(width, height, rgb.clone())?;
-                        match embedder.embed(&DynamicImage::ImageRgb8(img)) {
-                            Ok(v) => {
-                                if let Some(cache) = embed_cache.as_mut() {
-                                    cache.insert(hash, v.clone());
-                                    unflushed += 1;
-                                }
-                                Some(v)
-                            }
-                            Err(err) => {
-                                tracing::warn!(
-                                    "Import scan: embedding failed for {}: {err}",
-                                    display_path.display()
-                                );
-                                None
-                            }
+            for _ in 0..decoders {
+                let tx = tx.clone();
+                let jobs_rx = jobs_rx.clone();
+                let embed_tx = stack_settings.enabled.then(|| embed_tx.clone());
+                scope.spawn(move || {
+                    loop {
+                        // Take the job and release the lock before decoding:
+                        // holding it across the decode would serialise the
+                        // pool back down to one worker.
+                        let job = match jobs_rx.lock() {
+                            Ok(rx) => rx.recv(),
+                            Err(_) => break,
+                        };
+                        match job {
+                            Ok(job) => decode_one(job, embed_tx.as_ref(), &tx),
+                            Err(_) => break,
                         }
-                    }),
-                };
-                (Some(sharp), embedding)
-            } else {
-                (None, None)
-            };
-
-            if unflushed >= EMBED_CACHE_FLUSH_EVERY {
-                if let Some(cache) = embed_cache.as_ref() {
-                    if let Err(err) = cache.save_to(&cache_path) {
-                        tracing::warn!("Import scan: failed to write embedding cache: {err}");
                     }
+                });
+            }
+
+            // The reader itself. Sequential, in scan order, on this thread.
+            for (index, group) in scanned_groups.iter().enumerate() {
+                if jobs_tx.send(read_one(index, group, budget, &prior)).is_err() {
+                    break;
                 }
-                unflushed = 0;
             }
 
-            let _ = tx.send(ScanMsg::Thumb(ScanThumb {
-                index: idx,
-                path: display_path,
-                companions,
-                rgb,
-                width,
-                height,
-                content_hash: hash,
-                imported,
-                embedding,
-                sharpness,
-            }));
-        }
-
-        if let Some(cache) = embed_cache.as_ref() {
-            if let Err(err) = cache.save_to(&cache_path) {
-                tracing::warn!("Import scan: failed to write embedding cache: {err}");
-            }
-        }
+            // Both stages end when every sender is gone, so these two
+            // originals have to go before the scope joins — otherwise the
+            // pipeline waits on itself forever.
+            drop(jobs_tx);
+            drop(embed_tx);
+        });
 
         let _ = tx.send(ScanMsg::Done);
     });
+}
+
+/// One photo's bytes, read off the medium and waiting for a free core.
+struct DecodeJob {
+    index: usize,
+    path: PathBuf,
+    companions: Vec<PathBuf>,
+    hash: [u8; 32],
+    imported: bool,
+    skipped_before: bool,
+    /// What to decode: the file itself, or a raw's embedded preview.
+    /// `None` when the read failed or ran out of time.
+    bytes: Option<Vec<u8>>,
+    readable: Readable,
+}
+
+/// One photo's worth of work for the embedder, queued behind the decoders.
+struct EmbedJob {
+    index: usize,
+    hash: [u8; 32],
+    rgb: Vec<u8>,
+    width: u32,
+    height: u32,
+}
+
+/// Read one photo off the medium and look up what earlier sessions decided
+/// about it. Runs on the single reader thread.
+fn read_one(
+    index: usize,
+    group: &maple_import::ImageGroup,
+    budget: Duration,
+    prior: &PriorDecisions,
+) -> DecodeJob {
+    let path = group.display.path.clone();
+    let companions: Vec<PathBuf> = group.companions.iter().map(|c| c.path.clone()).collect();
+
+    let Read { hash, bytes, readable } = read_with_budget(&path, budget);
+
+    // A photo we could not hash has no history to look up, and `SeenSet`
+    // refuses to store the all-zero placeholder either way.
+    let (imported, skipped_before) = match hash {
+        Some(h) => (prior.imported.contains(&h), prior.skipped.contains(&h)),
+        None => (false, false),
+    };
+
+    DecodeJob {
+        index,
+        path,
+        companions,
+        hash: hash.unwrap_or([0u8; 32]),
+        imported,
+        skipped_before,
+        bytes,
+        readable,
+    }
+}
+
+/// What one read off the medium produces.
+struct Read {
+    /// The file's BLAKE3 content hash — `None` if it could not be read in
+    /// time. Always over the *file*, never over a raw's preview, so it
+    /// stays the same identifier the library and `SeenSet` use.
+    hash: Option<[u8; 32]>,
+    /// Bytes for the decoder, or `None` if there is nothing to decode.
+    bytes: Option<Vec<u8>>,
+    readable: Readable,
+}
+
+/// Read `path`, giving up after `budget`.
+///
+/// The read runs on its own thread so that abandoning it is possible at
+/// all: a thread blocked on a card that has stopped answering cannot be
+/// cancelled, only outlived. A timed-out thread is left to finish on its
+/// own and its result discarded.
+///
+/// The budget is a parameter rather than read from settings here so a test
+/// can prove the walk-away actually happens without waiting the configured
+/// timeout to do it.
+fn read_with_budget(path: &Path, budget: Duration) -> Read {
+    let (tx, rx) = mpsc::channel();
+    {
+        let path = path.to_path_buf();
+        std::thread::spawn(move || {
+            // For an ordinary image these are the file's own bytes, so the
+            // same read serves both the hash and the decode. Only a raw
+            // needs the file opened twice — its preview is not the file.
+            let bytes = maple_import::loadable_image_bytes(&path).ok();
+            let hash = if maple_import::is_raw_format(&path) {
+                maple_import::content_hash(&path).ok()
+            } else {
+                bytes.as_deref().map(maple_import::hash_bytes)
+            };
+            let _ = tx.send((hash, bytes));
+        });
+    }
+
+    let started = std::time::Instant::now();
+    match rx.recv_timeout(budget) {
+        Ok((hash, Some(bytes))) => Read { hash, bytes: Some(bytes), readable: Readable::Yes },
+        Ok((hash, None)) => {
+            tracing::warn!(
+                target: "maple::import::unreadable",
+                "unreadable after {:?}: {}",
+                started.elapsed(),
+                path.display()
+            );
+            Read { hash, bytes: None, readable: Readable::NoPreview }
+        }
+        Err(_) => {
+            // The one the user goes hunting for: full path, not just the
+            // filename, because two cards can hold the same DSCF0042.RAF.
+            tracing::warn!(
+                target: "maple::import::unreadable",
+                "TIMEOUT after {:?} (budget {:?}), moving on without it: {}",
+                started.elapsed(),
+                budget,
+                path.display()
+            );
+            Read { hash: None, bytes: None, readable: Readable::TimedOut }
+        }
+    }
+}
+
+/// Decode one photo's bytes into a thumbnail and hand it to the UI.
+///
+/// Pure CPU over memory — this is the part that fans out across cores.
+fn decode_one(
+    job: DecodeJob,
+    embed_tx: Option<&mpsc::SyncSender<EmbedJob>>,
+    tx: &mpsc::Sender<ScanMsg>,
+) {
+    let DecodeJob {
+        index, path, companions, hash, imported, skipped_before, bytes, readable,
+    } = job;
+
+    let rendered = bytes
+        .as_deref()
+        .and_then(|b| match crate::thumbnail::render_bytes_to_rgb(b, 256) {
+            Ok(out) => Some(out),
+            Err(err) => {
+                tracing::warn!(
+                    target: "maple::import::unreadable",
+                    "decode failed: {}: {err}",
+                    path.display()
+                );
+                None
+            }
+        });
+
+    let (rgb, width, height) = rendered.unwrap_or_default();
+    let has_pixels = !rgb.is_empty() && width > 0 && height > 0;
+    let readable = if has_pixels { readable } else if readable.ok() {
+        Readable::NoPreview
+    } else {
+        readable
+    };
+
+    let sharpness = has_pixels.then(|| maple_import::laplacian_variance(&rgb, width, height));
+
+    // The tile goes out first. The embed queue can block, and when it does
+    // the user should already have the picture in front of them.
+    let embed_pixels = embed_tx.is_some().then(|| rgb.clone());
+
+    let _ = tx.send(ScanMsg::Thumb(ScanThumb {
+        index,
+        path,
+        companions,
+        rgb,
+        width,
+        height,
+        content_hash: hash,
+        imported,
+        skipped_before,
+        readable,
+        sharpness,
+    }));
+
+    if let (Some(embed_tx), Some(rgb), true) = (embed_tx, embed_pixels, has_pixels) {
+        // Blocks once the embedder is `EMBED_QUEUE_DEPTH` photos behind,
+        // which is the throttle that keeps the queue's memory bounded.
+        let _ = embed_tx.send(EmbedJob { index, hash, rgb, width, height });
+    }
+}
+
+/// Serial half of the scan: turn rendered photos into DINOv2 embeddings.
+///
+/// Owns the single ONNX session and the SD-card embedding cache, which is
+/// why it cannot be one of the parallel workers. Ends when every render
+/// worker has dropped its sender.
+fn embed_stage(
+    src: &Path,
+    stack_settings: &maple_state::StackSettings,
+    jobs: mpsc::Receiver<EmbedJob>,
+    tx: &mpsc::Sender<ScanMsg>,
+) {
+    let algorithm_key = stack_settings.algorithm_key();
+    let cache_path = src.join(EMBED_CACHE_FILE);
+    let mut cache = maple_import::EmbeddingCache::load_from(&cache_path, &algorithm_key);
+    let mut embedder = match maple_db::load_onnx_embedder(stack_settings) {
+        Ok(e) => Some(e),
+        Err(err) => {
+            tracing::warn!(
+                "Import scan: failed to load image embedder, skipping burst detection: {err}"
+            );
+            None
+        }
+    };
+    let mut unflushed = 0usize;
+
+    // Keep draining even with no embedder: cache hits are still real
+    // embeddings, and leaving the channel unread would block every render
+    // worker as soon as the queue filled.
+    for job in jobs {
+        let embedding = match cache.get(&job.hash) {
+            Some(cached) => Some(cached.to_vec()),
+            None => embedder.as_mut().and_then(|embedder| {
+                let img = RgbImage::from_raw(job.width, job.height, job.rgb)?;
+                match embedder.embed(&DynamicImage::ImageRgb8(img)) {
+                    Ok(v) => {
+                        cache.insert(job.hash, v.clone());
+                        unflushed += 1;
+                        Some(v)
+                    }
+                    Err(err) => {
+                        tracing::warn!("Import scan: embedding failed for photo {}: {err}", job.index);
+                        None
+                    }
+                }
+            }),
+        };
+
+        if let Some(embedding) = embedding {
+            let _ = tx.send(ScanMsg::Embedding { index: job.index, embedding });
+        }
+
+        if unflushed >= EMBED_CACHE_FLUSH_EVERY {
+            save_embed_cache(&cache, &cache_path);
+            unflushed = 0;
+        }
+    }
+
+    if unflushed > 0 {
+        save_embed_cache(&cache, &cache_path);
+    }
+}
+
+fn save_embed_cache(cache: &maple_import::EmbeddingCache, path: &Path) {
+    if let Err(err) = cache.save_to(path) {
+        tracing::warn!("Import scan: failed to write embedding cache: {err}");
+    }
 }
 
 /// The scan's photo count arrived — size the entry list and the model.
@@ -523,6 +917,9 @@ fn apply_scan_count(w: &ImportWindow, ctx: &ImportCtx, n: usize) {
             companions: vec![],
             content_hash: [0; 32],
             is_imported: false,
+            passed: false,
+            decided_before: false,
+            readable: Readable::Yes,
             thumb: None,
             embedding: None,
             sharpness: None,
@@ -532,17 +929,14 @@ fn apply_scan_count(w: &ImportWindow, ctx: &ImportCtx, n: usize) {
     w.set_total_count(n as i32);
     // Bulk reset — happens once per scan when the
     // count first arrives, not on every click.
-    ctx.model.set_vec(build_items(
-        &ctx.entries.borrow(),
-        &ctx.selected.borrow(),
-        &ctx.groups.borrow(),
-    ));
+    refilter(w, ctx);
 }
 
 /// One scanned photo arrived — fill its entry in and refresh its row.
 fn apply_scan_thumb(w: &ImportWindow, ctx: &ImportCtx, msg: ScanThumb) {
     let ScanThumb {
-        index, path, companions, rgb, width, height, content_hash, imported, embedding, sharpness,
+        index, path, companions, rgb, width, height, content_hash, imported, skipped_before,
+        readable, sharpness,
     } = msg;
     let thumb = if !rgb.is_empty() && width > 0 && height > 0 {
         let buf = slint::SharedPixelBuffer::<slint::Rgb8Pixel>::clone_from_slice(
@@ -561,8 +955,12 @@ fn apply_scan_thumb(w: &ImportWindow, ctx: &ImportCtx, msg: ScanThumb) {
             e.companions = companions;
             e.content_hash = content_hash;
             e.is_imported = imported;
+            // A photo an earlier session passed over shows its red ✗ right
+            // away — that verdict is exactly what `passed` means.
+            e.passed = skipped_before;
+            e.decided_before = imported || skipped_before;
+            e.readable = readable;
             e.thumb = thumb.clone();
-            e.embedding = embedding;
             e.sharpness = sharpness;
         }
     }
@@ -571,6 +969,7 @@ fn apply_scan_thumb(w: &ImportWindow, ctx: &ImportCtx, msg: ScanThumb) {
         &ctx.entries.borrow(),
         &ctx.selected.borrow(),
         &ctx.groups.borrow(),
+        &ctx.visible.borrow(),
         index,
     );
     ctx.scanned_count.set(ctx.scanned_count.get() + 1);
@@ -625,14 +1024,13 @@ fn finish_scan(w: &ImportWindow, ctx: &ImportCtx) {
     *ctx.groups.borrow_mut() = resolved_groups;
 
     w.set_scanning(false);
-    w.set_status_text(scan_status_text(n).into());
-    // Bulk reset — happens once when the scan
-    // finishes, not on every click.
-    ctx.model.set_vec(build_items(
-        &ctx.entries.borrow(),
-        &ctx.selected.borrow(),
-        &ctx.groups.borrow(),
-    ));
+    let unreadable = report_unreadable(&ctx.entries.borrow());
+    w.set_status_text(scan_status_text(n, unreadable).into());
+    // Bulk reset — happens once when the scan finishes, not on every
+    // click. This is also the point at which every entry's `decided_before`
+    // is finally known, so it is where "Hide old images" can first take
+    // effect (and where its count stops moving).
+    refilter(w, ctx);
 }
 
 /// Translate clusters over the embedded-only subset back into flat `entries`
@@ -664,8 +1062,40 @@ fn sharpest_in_group(group: &[usize], entries: &[Entry]) -> usize {
     best
 }
 
-fn scan_status_text(n: usize) -> String {
-    format!("{n} photo{} found", if n == 1 { "" } else { "s" })
+fn scan_status_text(n: usize, unreadable: usize) -> String {
+    let found = format!("{n} photo{} found", if n == 1 { "" } else { "s" });
+    if unreadable == 0 {
+        found
+    } else {
+        // Say it on screen too. The per-file warnings go to stderr, which
+        // is nowhere at all when the app was launched from a bundle.
+        format!("{found} · {unreadable} without a preview (see the log for paths)")
+    }
+}
+
+/// Log every photo the scan could not render, with its full path, and
+/// return how many there were.
+///
+/// One block at the end rather than only the per-file warnings, because the
+/// per-file ones are scattered through a scan's worth of output and the
+/// path is exactly what you need to go look at the file.
+fn report_unreadable(entries: &[Entry]) -> usize {
+    let failures: Vec<&Entry> = entries.iter().filter(|e| !e.readable.ok()).collect();
+    if failures.is_empty() {
+        return 0;
+    }
+    let list = failures
+        .iter()
+        .map(|e| format!("  {}: {}", e.readable.reason(), e.path.display()))
+        .collect::<Vec<_>>()
+        .join("\n");
+    tracing::warn!(
+        target: "maple::import::unreadable",
+        "{} of {} photos produced no preview:\n{list}",
+        failures.len(),
+        entries.len()
+    );
+    failures.len()
 }
 
 // ── Browsing (click + navigation) ─────────────────────────────────
@@ -676,7 +1106,13 @@ fn wire_browse(window: &ImportWindow, ctx: &ImportCtx) {
         let ctx = ctx.clone();
         move |idx| {
             let Some(w) = ctx.window.upgrade() else { return };
+            // `idx` is the entry's scan index, not its row: the strip emits
+            // `item.index` so that hiding old photos cannot make a click
+            // land on the wrong photo.
             let idx = idx as usize;
+            if idx >= ctx.entries.borrow().len() {
+                return;
+            }
             // Only skip the reload if this exact photo is *already* the one
             // on screen — `current` alone isn't enough, since it defaults to
             // 0 before anything has ever been previewed.
@@ -693,18 +1129,26 @@ fn wire_browse(window: &ImportWindow, ctx: &ImportCtx) {
             w.set_selected_count(ctx.selected.borrow().len() as i32);
             // A click only ever changes this one row's selection state —
             // update it in place rather than rebuilding the whole model.
-            update_row(&ctx.model, &ctx.entries.borrow(), &ctx.selected.borrow(), &ctx.groups.borrow(), idx);
+            update_row(&ctx.model, &ctx.entries.borrow(), &ctx.selected.borrow(),
+                       &ctx.groups.borrow(), &ctx.visible.borrow(), idx);
 
             // Clicking the already-open photo just toggles its selection —
             // don't re-decode and re-render the big preview for no reason.
             if already_shown {
+                set_preview_state(&w, &ctx, idx);
                 return;
+            }
+            // Clicking a different tile leaves the open photo behind, which
+            // is the same decision as stepping past it with the arrows.
+            if let Some(prev) = ctx.preview_shown_idx.get() {
+                leave(&ctx, prev);
             }
             ctx.current.set(idx);
             w.set_current_index(idx as i32);
             ctx.preview_shown_idx.set(Some(idx));
 
             show_preview(&w, &ctx.entries, idx);
+            set_preview_state(&w, &ctx, idx);
         }
     });
 
@@ -719,20 +1163,74 @@ fn wire_browse(window: &ImportWindow, ctx: &ImportCtx) {
             }
             let cur = ctx.current.get();
 
-            let new_idx = nav_target(&ctx.groups.borrow(), cur, len, delta);
+            let new_idx = nav_visible_target(
+                &ctx.groups.borrow(),
+                &ctx.visible.borrow(),
+                cur,
+                len,
+                delta,
+            );
 
             if new_idx == cur {
                 return;
             }
+            leave(&ctx, cur);
             ctx.current.set(new_idx);
             w.set_current_index(new_idx as i32);
             ctx.preview_shown_idx.set(Some(new_idx));
 
             show_preview(&w, &ctx.entries, new_idx);
+            set_preview_state(&w, &ctx, new_idx);
         }
     };
     window.on_nav_prev(make_nav(-1));
     window.on_nav_next(make_nav(1));
+
+    // ── Hide / show photos an earlier session already decided on ──
+    window.on_toggle_hide_old({
+        let ctx = ctx.clone();
+        move || {
+            let Some(w) = ctx.window.upgrade() else { return };
+            let hide = !ctx.hide_old.get();
+            ctx.hide_old.set(hide);
+            w.set_hide_old(hide);
+            // A view filter only: nothing is deselected, so a burst member
+            // auto-picked out of an old group is still copied. Hiding
+            // changes what you look at, never what happens.
+            refilter(&w, &ctx);
+        }
+    });
+}
+
+/// Step from `cur`, then keep stepping until the landing spot is a photo
+/// the strip is actually showing.
+///
+/// [`nav_target`] knows about burst groups; this only skips over what "Hide
+/// old images" has filtered out. Returns `cur` when there is nothing
+/// visible left in that direction, which is what makes the arrow keys stop
+/// at the ends instead of jumping to a hidden photo.
+fn nav_visible_target(
+    groups: &[Vec<usize>],
+    visible: &Visible,
+    cur: usize,
+    len: usize,
+    delta: i32,
+) -> usize {
+    let mut at = nav_target(groups, cur, len, delta);
+    // Bounded by the entry count: `nav_target` clamps at both ends, so the
+    // walk always terminates, but a group layout should never be able to
+    // turn a mis-step into a spin either.
+    for _ in 0..len {
+        if at == cur || visible.shows(at) {
+            return at;
+        }
+        let next = nav_target(groups, at, len, delta);
+        if next == at {
+            return cur;
+        }
+        at = next;
+    }
+    cur
 }
 
 /// Where a left/right step from `cur` lands.
@@ -803,6 +1301,9 @@ fn show_preview(w: &ImportWindow, entries: &Rc<RefCell<Vec<Entry>>>, idx: usize)
 struct CopyRun {
     /// The selected entries, ascending — the rows to mark imported.
     sel_indices: Vec<usize>,
+    /// Root of the medium these photos came off — where the imported
+    /// record is written back.
+    source: PathBuf,
     library_dir: PathBuf,
     algorithm_key: String,
 }
@@ -821,6 +1322,7 @@ fn wire_copy(window: &ImportWindow, ctx: &ImportCtx) {
                 w.set_status_text("No destination folder set.".into());
                 return;
             }
+            let src = ctx.scanned_source.borrow().clone();
 
             w.set_copying(true);
             w.set_copy_done(false);
@@ -838,6 +1340,7 @@ fn wire_copy(window: &ImportWindow, ctx: &ImportCtx) {
 
             let run = CopyRun {
                 sel_indices,
+                source: src,
                 library_dir: settings.library_dir.clone(),
                 algorithm_key: settings.stacks.algorithm_key(),
             };
@@ -920,6 +1423,61 @@ fn copy_mode_from_index(mode: i32) -> maple_import::CopyMode {
     }
 }
 
+/// Write the photos this session turned down to the medium's skipped
+/// record.
+///
+/// Called when a copy finishes and when the import window closes — the two
+/// ends of a session. A card triaged across several sittings must not
+/// present the same rejects again in the next one, and triage that ends
+/// without a copy is still triage.
+///
+/// Photos already in the library are left out: they are in the *imported*
+/// record, which already answers "decided before" for them, and listing one
+/// in both would only blur what each record means.
+fn commit_skips(ctx: &ImportCtx) {
+    let source = ctx.scanned_source.borrow().clone();
+    if source.as_os_str().is_empty() {
+        return;
+    }
+    let mut skipped = maple_state::SeenSet::new();
+    {
+        let entries = ctx.entries.borrow();
+        let selected = ctx.selected.borrow();
+        for (i, e) in entries.iter().enumerate() {
+            if e.passed && !e.is_imported && !selected.contains(&i) {
+                skipped.insert(&e.content_hash);
+            }
+        }
+    }
+    if skipped.is_empty() {
+        return;
+    }
+    let library_dir = maple_state::Settings::load().library_dir;
+    record_on_medium(&skipped, &source, &library_dir, maple_state::Record::Skipped);
+}
+
+/// Fold `set` into one of the medium's records, logging what happened.
+///
+/// A source that cannot be written to is not a failure — a read-only card
+/// is ordinary, and the library replica still carries the decision — so it
+/// is reported at `info`. Losing the record entirely is the `warn`.
+fn record_on_medium(
+    set: &maple_state::SeenSet,
+    source: &std::path::Path,
+    library_dir: &std::path::Path,
+    record: maple_state::Record,
+) {
+    match set.merge_save_to_source(source, library_dir, record) {
+        Ok(true) => {}
+        Ok(false) => tracing::info!(
+            "Import: {} is not writable; {} was recorded in the library only",
+            source.display(),
+            record.on_medium()
+        ),
+        Err(err) => tracing::warn!("Import: failed to write {}: {err}", record.on_medium()),
+    }
+}
+
 /// Flatten the selected entries into the file list to hand `copy_images`.
 fn copy_sources(
     entries: &[Entry],
@@ -961,18 +1519,31 @@ fn finish_copy(
     failed: usize,
     dest_by_source: &HashMap<PathBuf, PathBuf>,
 ) {
-    // Mark as imported in the SeenSet.
+    // Record the import on the medium it came off.
+    //
+    // Only the hashes copied *this run* go into `fresh`; the union with
+    // what is already on disk happens inside `merge_save_to_source`. That
+    // is what makes two importers running at once combine rather than
+    // clobber — the old load-modify-write here silently lost one of them.
     {
-        let mut imp = maple_state::SeenSet::load_imported(&run.library_dir);
+        let mut fresh = maple_state::SeenSet::new();
         let mut ents = ctx.entries.borrow_mut();
         for &i in &run.sel_indices {
             if let Some(e) = ents.get_mut(i) {
                 e.is_imported = true;
-                imp.insert(&e.content_hash);
+                fresh.insert(&e.content_hash);
             }
         }
-        let _ = imp.save_imported(&run.library_dir);
+        drop(ents);
+        record_on_medium(
+            &fresh,
+            &run.source,
+            &run.library_dir,
+            maple_state::Record::Imported,
+        );
     }
+    // A copy ends a session's worth of triage, so the skips go down with it.
+    commit_skips(ctx);
     // Insert display files into library DB, under the path they were copied
     // to. `Entry::path` is the *source* path — an SD-card path that stops
     // existing the moment the card is ejected.
@@ -1023,8 +1594,9 @@ fn finish_copy(
         let ents = ctx.entries.borrow();
         let sel = ctx.selected.borrow();
         let grp = ctx.groups.borrow();
+        let vis = ctx.visible.borrow();
         for &i in &run.sel_indices {
-            update_row(&ctx.model, &ents, &sel, &grp, i);
+            update_row(&ctx.model, &ents, &sel, &grp, &vis, i);
         }
     }
 
@@ -1149,7 +1721,8 @@ fn apply_rotation(
         &rgb, pw, ph,
     );
     w.set_preview_photo(slint::Image::from_rgb8(buf));
-    update_row(&ctx.model, &ctx.entries.borrow(), &ctx.selected.borrow(), &ctx.groups.borrow(), idx);
+    update_row(&ctx.model, &ctx.entries.borrow(), &ctx.selected.borrow(),
+               &ctx.groups.borrow(), &ctx.visible.borrow(), idx);
     w.set_rotating(false);
 }
 
@@ -1163,6 +1736,7 @@ fn make_item(entries: &[Entry], selected: &HashSet<usize>, groups: &[Vec<usize>]
         !display_is_raw || e.companions.iter().any(|c| !maple_import::is_raw_format(c));
     let has_raw =
         display_is_raw || e.companions.iter().any(|c| maple_import::is_raw_format(c));
+    let is_selected = selected.contains(&i);
     ImportItem {
         index: i as i32,
         filename: e
@@ -1172,8 +1746,15 @@ fn make_item(entries: &[Entry], selected: &HashSet<usize>, groups: &[Vec<usize>]
             .unwrap_or_default(),
         thumb: e.thumb.clone().unwrap_or_default(),
         loaded: !e.path.as_os_str().is_empty(),
-        is_selected: selected.contains(&i),
+        is_selected,
         is_imported: e.is_imported,
+        // One verdict per tile, decided here rather than half here and half
+        // in the markup. Marking a photo outranks having walked past it,
+        // and a photo already in the library is never a "skip" — it is
+        // wearing the ✓ scrim, which says more.
+        is_skipped: e.passed && !is_selected && !e.is_imported,
+        is_unreadable: !e.readable.ok(),
+        is_old: e.decided_before,
         stack_size: find_group(groups, i).map(|g| g.len() as i32).unwrap_or(0),
         has_jpg,
         has_raw,
@@ -1185,22 +1766,117 @@ fn make_item(entries: &[Entry], selected: &HashSet<usize>, groups: &[Vec<usize>]
 /// use [`update_row`] for those so a full model swap doesn't tear down and
 /// recreate every tile's `TouchArea` (which can drop a click landing
 /// mid-rebuild).
-fn build_items(entries: &[Entry], selected: &HashSet<usize>, groups: &[Vec<usize>]) -> Vec<ImportItem> {
-    (0..entries.len())
-        .map(|i| make_item(entries, selected, groups, i))
+fn build_items(
+    entries: &[Entry],
+    selected: &HashSet<usize>,
+    groups: &[Vec<usize>],
+    visible: &Visible,
+) -> Vec<ImportItem> {
+    visible
+        .rows
+        .iter()
+        .map(|&i| make_item(entries, selected, groups, i))
         .collect()
 }
 
-/// Update a single row of the persistent model in place.
+/// Recompute which entries the strip shows and rebuild the model.
+///
+/// A full `set_vec`, which tears down and rebuilds every tile, so it is
+/// only called when the visible set can actually have changed: the toggle,
+/// and the two bulk points of a scan. Rows arriving one at a time go
+/// through [`update_row`] instead.
+fn refilter(w: &ImportWindow, ctx: &ImportCtx) {
+    let items = {
+        let entries = ctx.entries.borrow();
+        let mut visible = ctx.visible.borrow_mut();
+        visible.rebuild(&entries, ctx.hide_old.get());
+        w.set_old_count(entries.iter().filter(|e| e.decided_before).count() as i32);
+        build_items(&entries, &ctx.selected.borrow(), &ctx.groups.borrow(), &visible)
+    };
+    ctx.model.set_vec(items);
+
+    // Turning the filter on can hide the photo the user is looking at.
+    // Land them on the first one still showing rather than leaving the
+    // preview on something the strip no longer contains.
+    let landing = {
+        let visible = ctx.visible.borrow();
+        if visible.shows(ctx.current.get()) {
+            None
+        } else {
+            visible.rows.first().copied()
+        }
+    };
+    if let Some(idx) = landing {
+        ctx.current.set(idx);
+        w.set_current_index(idx as i32);
+        ctx.preview_shown_idx.set(Some(idx));
+        show_preview(w, &ctx.entries, idx);
+    }
+    set_preview_state(w, ctx, ctx.current.get());
+}
+
+/// Mirror the current photo's verdict into the preview bar's chip, so the
+/// state is legible where the user is actually looking.
+///
+/// 0 undecided, 1 marked for import, 2 moved past, 3 already in the
+/// library — the same precedence the tile badge uses.
+fn set_preview_state(w: &ImportWindow, ctx: &ImportCtx, idx: usize) {
+    let entries = ctx.entries.borrow();
+    // Marked first: in a triage pass the chip's job is to say what *this*
+    // session decided, and "already in the library" is a fact the tile's ✓
+    // is already carrying.
+    let state = match entries.get(idx) {
+        None => 0,
+        Some(_) if ctx.selected.borrow().contains(&idx) => 1,
+        Some(e) if e.is_imported => 3,
+        Some(e) if e.passed => 2,
+        Some(_) => 0,
+    };
+    w.set_preview_state(state);
+}
+
+/// Moving off a photo is a decision: whatever is left unmarked earns the
+/// red ✗ from that moment on.
+///
+/// Marked photos are flagged too even though nothing shows for them, so
+/// that un-marking one later reads as a skip rather than reverting to
+/// "never looked at" — the user did look at it.
+fn leave(ctx: &ImportCtx, idx: usize) {
+    let newly_passed = match ctx.entries.borrow_mut().get_mut(idx) {
+        Some(e) if !e.passed => {
+            e.passed = true;
+            true
+        }
+        _ => false,
+    };
+    if newly_passed {
+        update_row(
+            &ctx.model,
+            &ctx.entries.borrow(),
+            &ctx.selected.borrow(),
+            &ctx.groups.borrow(),
+            &ctx.visible.borrow(),
+            idx,
+        );
+    }
+}
+
+/// Update the row showing entry `i` in place. A no-op when that entry is
+/// currently filtered out of the strip — it will be rebuilt with the right
+/// state whenever the filter next changes.
 fn update_row(
     model: &VecModel<ImportItem>,
     entries: &[Entry],
     selected: &HashSet<usize>,
     groups: &[Vec<usize>],
+    visible: &Visible,
     i: usize,
 ) {
-    if i < entries.len() {
-        model.set_row_data(i, make_item(entries, selected, groups, i));
+    if i >= entries.len() {
+        return;
+    }
+    if let Some(row) = visible.row(i) {
+        model.set_row_data(row, make_item(entries, selected, groups, i));
     }
 }
 
@@ -1214,10 +1890,20 @@ mod tests {
             companions: vec![],
             content_hash: [0; 32],
             is_imported: false,
+            passed: false,
+            decided_before: false,
+            readable: Readable::Yes,
             thumb: None,
             embedding: None,
             sharpness,
         }
+    }
+
+    /// The mapping the strip has when nothing is filtered out.
+    fn all_visible(entries: &[Entry]) -> Visible {
+        let mut v = Visible::default();
+        v.rebuild(entries, false);
+        v
     }
 
     // ── find_group / nav_target ───────────────────────────────────
@@ -1288,9 +1974,9 @@ mod tests {
 
     #[test]
     fn scan_status_text_pluralises() {
-        assert_eq!(scan_status_text(1), "1 photo found");
-        assert_eq!(scan_status_text(0), "0 photos found");
-        assert_eq!(scan_status_text(7), "7 photos found");
+        assert_eq!(scan_status_text(1, 0), "1 photo found");
+        assert_eq!(scan_status_text(0, 0), "0 photos found");
+        assert_eq!(scan_status_text(7, 0), "7 photos found");
     }
 
     #[test]
@@ -1375,10 +2061,409 @@ mod tests {
         assert!(second.is_selected);
     }
 
+    // ── Triage verdicts ──────────────────────────────────────────
+
+    /// An entry in a given triage state, for the badge tests.
+    fn triaged(path: &str, passed: bool, imported: bool) -> Entry {
+        let mut e = entry(path, None);
+        e.passed = passed;
+        e.is_imported = imported;
+        e.decided_before = imported;
+        e
+    }
+
+    #[test]
+    fn a_photo_not_yet_reached_carries_no_verdict() {
+        let entries = vec![triaged("/src/a.jpg", false, false)];
+        let item = make_item(&entries, &HashSet::new(), &[], 0);
+        assert!(!item.is_selected);
+        assert!(!item.is_skipped, "a photo nobody has looked at is not a reject");
+        assert!(!item.is_imported);
+    }
+
+    #[test]
+    fn moving_past_a_photo_is_what_paints_the_red_cross() {
+        let entries = vec![triaged("/src/a.jpg", true, false)];
+        let item = make_item(&entries, &HashSet::new(), &[], 0);
+        assert!(item.is_skipped);
+    }
+
+    #[test]
+    fn marking_a_photo_outranks_having_walked_past_it() {
+        // The user stepped past it, came back and marked it: one verdict,
+        // and it is the mark.
+        let entries = vec![triaged("/src/a.jpg", true, false)];
+        let item = make_item(&entries, &HashSet::from([0]), &[], 0);
+        assert!(item.is_selected);
+        assert!(!item.is_skipped);
+    }
+
+    #[test]
+    fn a_photo_already_in_the_library_is_never_a_reject() {
+        let entries = vec![triaged("/src/a.jpg", true, true)];
+        let item = make_item(&entries, &HashSet::new(), &[], 0);
+        assert!(item.is_imported);
+        assert!(!item.is_skipped, "the ✓ scrim already says more than a ✗ would");
+        assert!(item.is_old, "an imported photo was decided in an earlier session");
+    }
+
+    // ── Hiding what an earlier session decided ───────────────────
+
+    #[test]
+    fn hiding_old_photos_leaves_entry_indices_as_the_identity() {
+        let entries = vec![
+            triaged("/src/a.jpg", false, true),   // old
+            triaged("/src/b.jpg", false, false),  // new
+            triaged("/src/c.jpg", false, true),   // old
+            triaged("/src/d.jpg", false, false),  // new
+        ];
+        let mut visible = Visible::default();
+        visible.rebuild(&entries, true);
+
+        assert_eq!(visible.rows, vec![1, 3]);
+        assert_eq!(visible.row(0), None);
+        assert_eq!(visible.row(1), Some(0));
+        assert_eq!(visible.row(3), Some(1));
+
+        // The rows shrank to two, but each item still names its own scan
+        // index — a click on the second row must reach entry 3, not entry 1.
+        let items = build_items(&entries, &HashSet::new(), &[], &visible);
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0].index, 1);
+        assert_eq!(items[1].index, 3);
+    }
+
+    #[test]
+    fn with_the_filter_off_every_row_is_its_own_entry() {
+        let entries = vec![
+            triaged("/src/a.jpg", false, true),
+            triaged("/src/b.jpg", false, false),
+        ];
+        let visible = all_visible(&entries);
+        assert_eq!(visible.rows, vec![0, 1]);
+        assert_eq!(visible.row(0), Some(0));
+        assert_eq!(visible.row(1), Some(1));
+    }
+
+    #[test]
+    fn navigation_steps_over_hidden_photos() {
+        // b and c were decided earlier; from a, "next" must land on d.
+        let entries = vec![
+            triaged("/src/a.jpg", false, false),
+            triaged("/src/b.jpg", false, true),
+            triaged("/src/c.jpg", false, true),
+            triaged("/src/d.jpg", false, false),
+        ];
+        let mut visible = Visible::default();
+        visible.rebuild(&entries, true);
+
+        assert_eq!(nav_visible_target(&[], &visible, 0, 4, 1), 3);
+        assert_eq!(nav_visible_target(&[], &visible, 3, 4, -1), 0);
+    }
+
+    #[test]
+    fn navigation_stays_put_when_nothing_visible_lies_ahead() {
+        let entries = vec![
+            triaged("/src/a.jpg", false, false),
+            triaged("/src/b.jpg", false, true),
+            triaged("/src/c.jpg", false, true),
+        ];
+        let mut visible = Visible::default();
+        visible.rebuild(&entries, true);
+
+        // Everything past `a` is hidden — the arrow key must not jump onto
+        // a photo the strip is not showing.
+        assert_eq!(nav_visible_target(&[], &visible, 0, 3, 1), 0);
+    }
+
+    #[test]
+    fn navigation_is_unchanged_when_nothing_is_hidden() {
+        let entries: Vec<Entry> =
+            (0..4).map(|i| triaged(&format!("/src/{i}.jpg"), false, false)).collect();
+        let visible = all_visible(&entries);
+        for cur in 0..4usize {
+            assert_eq!(
+                nav_visible_target(&[], &visible, cur, 4, 1),
+                nav_target(&[], cur, 4, 1)
+            );
+            assert_eq!(
+                nav_visible_target(&[], &visible, cur, 4, -1),
+                nav_target(&[], cur, 4, -1)
+            );
+        }
+    }
+
+    // ── Surviving a photo that will not decode ───────────────────
+
+    /// A real, decodable 8×8 PNG.
+    fn write_png(path: &std::path::Path) {
+        let img = image::RgbImage::from_pixel(8, 8, image::Rgb([120, 30, 200]));
+        image::DynamicImage::ImageRgb8(img).save(path).unwrap();
+    }
+
+    /// A named pipe with no writer. Opening it for reading blocks forever,
+    /// which is the cheapest faithful stand-in for the card that started
+    /// all this — a file the OS never returns from.
+    #[cfg(unix)]
+    fn make_stalling_file(path: &std::path::Path) {
+        let ok = std::process::Command::new("mkfifo")
+            .arg(path)
+            .status()
+            .expect("mkfifo");
+        assert!(ok.success());
+    }
+
+    #[test]
+    fn a_readable_photo_comes_back_with_bytes_and_a_hash() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("a.png");
+        write_png(&path);
+
+        let out = read_with_budget(&path, Duration::from_secs(30));
+        assert!(out.readable.ok());
+        assert!(out.bytes.is_some());
+        // One read serves both: the hash of the bytes handed to the decoder
+        // is the same identifier the library and `SeenSet` use.
+        assert_eq!(
+            out.hash.unwrap(),
+            maple_import::content_hash(&path).unwrap(),
+            "the scan's hash must match the file's content hash"
+        );
+    }
+
+    #[test]
+    fn a_file_that_cannot_be_decoded_still_yields_its_hash() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("truncated.jpg");
+        std::fs::write(&path, b"not really a jpeg").unwrap();
+
+        // The read succeeds — it is the *decode* that has nothing to give,
+        // and that is decided later, on a decode thread.
+        let out = read_with_budget(&path, Duration::from_secs(30));
+        assert!(out.hash.is_some(), "the bytes are readable even if the image is not");
+
+        let job = DecodeJob {
+            index: 0,
+            path,
+            companions: vec![],
+            hash: out.hash.unwrap(),
+            imported: false,
+            skipped_before: false,
+            bytes: out.bytes,
+            readable: out.readable,
+        };
+        let (tx, rx) = mpsc::channel();
+        decode_one(job, None, &tx);
+        let ScanMsg::Thumb(t) = rx.recv().unwrap() else { panic!("expected a thumb") };
+        assert_eq!(t.readable, Readable::NoPreview);
+        assert!(t.rgb.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_file_that_never_returns_is_abandoned_rather_than_waited_on() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("stalls.jpg");
+        make_stalling_file(&path);
+
+        let started = std::time::Instant::now();
+        let out = read_with_budget(&path, Duration::from_millis(150));
+        let waited = started.elapsed();
+
+        assert_eq!(out.readable, Readable::TimedOut);
+        assert!(out.hash.is_none() && out.bytes.is_none());
+        assert!(
+            waited < Duration::from_secs(5),
+            "waited {waited:?} on a file that never comes back"
+        );
+        // The reader thread is still blocked in `open` and always will be.
+        // Outliving it is the whole mechanism; there is nothing to join.
+    }
+
+    /// The bug this whole rewrite exists for: one file the card never
+    /// returns from must cost its budget once and then be left behind,
+    /// rather than stopping the scan.
+    #[cfg(unix)]
+    #[test]
+    fn one_stalled_photo_does_not_stop_the_scan() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut paths = Vec::new();
+        for i in 0..5 {
+            let p = dir.path().join(format!("good{i}.png"));
+            write_png(&p);
+            paths.push(p);
+        }
+        let stalled = dir.path().join("stalls.jpg");
+        make_stalling_file(&stalled);
+        // In the middle: before the fix, nothing after it ever arrived.
+        paths.insert(2, stalled);
+
+        let prior = PriorDecisions {
+            imported: maple_state::SeenSet::new(),
+            skipped: maple_state::SeenSet::new(),
+        };
+        let (tx, rx) = mpsc::channel();
+        let budget = Duration::from_millis(150);
+
+        let started = std::time::Instant::now();
+        for (index, path) in paths.iter().enumerate() {
+            let group = maple_import::ImageGroup {
+                display: maple_import::ImageFile { path: path.clone(), size: 0 },
+                companions: vec![],
+            };
+            decode_one(read_one(index, &group, budget, &prior), None, &tx);
+        }
+        drop(tx);
+
+        let thumbs: Vec<ScanThumb> = rx
+            .into_iter()
+            .filter_map(|m| match m {
+                ScanMsg::Thumb(t) => Some(t),
+                _ => None,
+            })
+            .collect();
+
+        assert_eq!(thumbs.len(), 6, "every photo must be reported, stalled or not");
+        let stalled: Vec<usize> = thumbs
+            .iter()
+            .filter(|t| t.readable == Readable::TimedOut)
+            .map(|t| t.index)
+            .collect();
+        assert_eq!(stalled, vec![2], "only the stalled file lacks a preview");
+        for t in thumbs.iter().filter(|t| t.readable.ok()) {
+            assert!(t.width > 0 && !t.rgb.is_empty());
+        }
+        // Five good photos plus one 150 ms write-off: anything near a
+        // multiple of the budget would mean the stall was contagious.
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "the scan took {:?} — a stalled photo is still blocking",
+            started.elapsed()
+        );
+    }
+
+    /// Drive the real `spawn_scan_worker` over a real folder and assert the
+    /// message stream the UI depends on: a count, one thumb per photo, then
+    /// `Done`. A deadlock between reader, decoders and embedder shows up
+    /// here as a timeout rather than as an empty grid in the app.
+    #[test]
+    fn a_scan_reports_a_count_then_every_photo_then_done() {
+        let dir = tempfile::tempdir().unwrap();
+        for i in 0..25 {
+            write_png(&dir.path().join(format!("p{i:03}.png")));
+        }
+
+        let (tx, rx) = mpsc::channel();
+        spawn_scan_worker(
+            dir.path().to_path_buf(),
+            maple_state::StackSettings { enabled: false, ..Default::default() },
+            maple_state::ImportSettings::default(),
+            Arc::new(PriorDecisions {
+                imported: maple_state::SeenSet::new(),
+                skipped: maple_state::SeenSet::new(),
+            }),
+            tx,
+        );
+
+        let mut count = None;
+        let mut seen = std::collections::HashSet::new();
+        let done;
+        loop {
+            // Finite: a deadlock must fail the test, not hang it.
+            match rx.recv_timeout(Duration::from_secs(30)) {
+                Ok(ScanMsg::Count(n)) => count = Some(n),
+                Ok(ScanMsg::Thumb(t)) => {
+                    assert!(t.readable.ok(), "photo {} failed to render", t.index);
+                    assert!(seen.insert(t.index), "photo {} arrived twice", t.index);
+                }
+                Ok(ScanMsg::Embedding { .. }) => {}
+                Ok(ScanMsg::Done) => {
+                    done = true;
+                    break;
+                }
+                Ok(ScanMsg::Error(e)) => panic!("scan error: {e}"),
+                Err(e) => panic!("scan stalled after {} thumbs: {e}", seen.len()),
+            }
+        }
+
+        assert_eq!(count, Some(25), "the count must arrive before anything else");
+        assert_eq!(seen.len(), 25, "every photo must reach the UI exactly once");
+        assert!(done, "the scan must finish");
+    }
+
+    /// Timing probe against camera-sized files, run by hand:
+    /// `cargo test -p maple-ui scan_throughput -- --ignored --nocapture`.
+    ///
+    /// The synthetic scan test above uses 8×8 pixels and proves only that
+    /// the pipeline is wired up. This one asks the question that actually
+    /// went wrong on a real card: **how long until the first tile appears**.
+    /// Reading twelve files at once made that number worse, not better.
+    #[test]
+    #[ignore = "writes ~50 full-size JPEGs; run by hand"]
+    fn scan_throughput_on_camera_sized_files() {
+        const N: usize = 48;
+        let dir = tempfile::tempdir().unwrap();
+        eprintln!("writing {N} 6000×4000 JPEGs…");
+        for i in 0..N {
+            let img = image::RgbImage::from_fn(6000, 4000, |x, y| {
+                image::Rgb([(x % 251) as u8, (y % 241) as u8, ((x ^ y) % 239) as u8])
+            });
+            image::DynamicImage::ImageRgb8(img)
+                .save(dir.path().join(format!("DSCF{i:04}.jpg")))
+                .unwrap();
+        }
+
+        let (tx, rx) = mpsc::channel();
+        let started = std::time::Instant::now();
+        spawn_scan_worker(
+            dir.path().to_path_buf(),
+            maple_state::StackSettings { enabled: false, ..Default::default() },
+            maple_state::ImportSettings::default(),
+            Arc::new(PriorDecisions {
+                imported: maple_state::SeenSet::new(),
+                skipped: maple_state::SeenSet::new(),
+            }),
+            tx,
+        );
+
+        let mut first: Option<Duration> = None;
+        let mut thumbs = 0usize;
+        loop {
+            match rx.recv_timeout(Duration::from_secs(120)) {
+                Ok(ScanMsg::Thumb(_)) => {
+                    thumbs += 1;
+                    if first.is_none() {
+                        first = Some(started.elapsed());
+                        eprintln!("first tile after {:?}", first.unwrap());
+                    }
+                }
+                Ok(ScanMsg::Done) => break,
+                Ok(_) => {}
+                Err(e) => panic!("stalled after {thumbs} thumbs: {e}"),
+            }
+        }
+        eprintln!(
+            "{thumbs} photos in {:?} (first tile {:?}, {:.1}/s)",
+            started.elapsed(),
+            first.unwrap(),
+            thumbs as f64 / started.elapsed().as_secs_f64()
+        );
+        assert_eq!(thumbs, N);
+    }
+
+    #[test]
+    fn an_unreadable_photo_still_reaches_its_tile() {
+        let mut entries = vec![entry("/src/a.jpg", None)];
+        entries[0].readable = Readable::TimedOut;
+        let item = make_item(&entries, &HashSet::new(), &[], 0);
+        assert!(item.is_unreadable);
+        assert!(item.loaded, "it was scanned — it is not still loading");
+    }
+
     #[test]
     fn build_items_covers_every_entry() {
         let entries = vec![entry("/src/a.jpg", None), entry("/src/b.jpg", None)];
-        let items = build_items(&entries, &HashSet::new(), &[]);
+        let items = build_items(&entries, &HashSet::new(), &[], &all_visible(&entries));
         assert_eq!(items.len(), 2);
         assert_eq!(items[1].index, 1);
         // Solo entries carry no stack badge.

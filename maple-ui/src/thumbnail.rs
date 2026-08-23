@@ -25,7 +25,21 @@ use fast_image_resize as fir;
 /// EXIF orientation is applied before resizing.
 /// Lanczos3 filter is used for the final downsample step.
 pub fn render_to_rgb(path: &Path, max_size: u32) -> anyhow::Result<(Vec<u8>, u32, u32)> {
-    let rgb_img = maple_import::decode_image(path)?.into_rgb8();
+    render_decoded(maple_import::decode_image(path)?, max_size)
+}
+
+/// Decode and resize bytes already in memory.
+///
+/// The import scan reads each file once on a single thread — a card is one
+/// serial bus, and twelve readers on it are slower than one — then hands the
+/// bytes here to be decoded on whichever core is free. `bytes` is the file
+/// itself for an ordinary image, or a raw's embedded preview.
+pub fn render_bytes_to_rgb(bytes: &[u8], max_size: u32) -> anyhow::Result<(Vec<u8>, u32, u32)> {
+    render_decoded(maple_import::decode_image_bytes(bytes)?, max_size)
+}
+
+fn render_decoded(img: image::DynamicImage, max_size: u32) -> anyhow::Result<(Vec<u8>, u32, u32)> {
+    let rgb_img = img.into_rgb8();
     let (src_w, src_h) = rgb_img.dimensions();
     let (dst_w, dst_h) = fit_dims(src_w, src_h, max_size);
 

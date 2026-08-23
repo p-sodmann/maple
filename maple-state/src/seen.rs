@@ -1,12 +1,31 @@
 //! Persistent sets for tracking previously imported and rejected images.
 //!
-//! Two separate files are maintained:
+//! Two [`Record`]s are kept, [`Record::Imported`] and [`Record::Skipped`] —
+//! what was copied into a library, and what the user deliberately passed over
+//! in the import browser. Together they are "what an earlier session already
+//! decided about this photo", which is what the browser's *Hide old images*
+//! filter asks.
 //!
-//! * `seen_imported.bin` — images copied to the destination.
-//! * `seen_rejected.bin` — images explicitly skipped by the user.
+//! Each record lives in two places:
+//!
+//! * `<source>/.maple_seen.bin` and `<source>/.maple_skipped.bin` — the
+//!   **authoritative** copies, written to the medium itself so the card
+//!   carries its own history to whichever machine it is plugged into next.
+//!   Same idiom as `maple_import::EmbeddingCache`'s `.maple_embed_cache.bin`,
+//!   which sits beside them.
+//! * `seen_imported.bin` and `seen_skipped.bin` — non-authoritative replicas
+//!   in the library directory, read only when a source carries no record of
+//!   its own: read-only cards, network shares, and plain folders that later
+//!   move would otherwise have no memory at all.
 //!
 //! Each stores the full 32-byte BLAKE3 content hashes of its members, both in
 //! memory and on disk.
+//!
+//! The set is **grow-only**, which is what lets [`SeenSet::merge_save_to_source`]
+//! be a read-merge-write with no locking and no conflict resolution: a union
+//! is the same operation whether it is combining two concurrent importers or
+//! folding one card's history into another's. Nothing ever removes a hash, so
+//! there is no delete for a merge to lose.
 //!
 //! Membership queries are **exact** in both directions: [`SeenSet::contains`]
 //! answers from the hash set itself, so the only way two distinct images can
@@ -19,7 +38,8 @@
 //! correctness mechanism — the hash set alone is already O(1).
 
 use std::collections::HashSet;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Number of hash functions for the bloom filter.
 const K: u32 = 7;
@@ -29,6 +49,55 @@ const MIN_BITS: usize = 8192;
 
 /// File format version.
 const VERSION: u32 = 1;
+
+/// Placeholder the import scan stores when hashing a file fails
+/// (`maple-ui/src/import.rs`). It is not a content hash, and letting it into
+/// the set would badge *every* unreadable photo on the next scan as already
+/// imported. [`SeenSet::insert`] refuses it on the way in, and the loader
+/// drops it on the way out of a file that already caught it.
+const UNHASHED: [u8; 32] = [0u8; 32];
+
+/// Makes scratch filenames unique within one process; the pid separates
+/// processes. Two importers saving at the same moment must not end up
+/// writing the same temp file out from under each other.
+static TEMP_SEQ: AtomicU64 = AtomicU64::new(0);
+
+/// Which of the two per-medium records a load or save is talking about.
+///
+/// The pair is deliberately not one set with a flag per hash: both are
+/// grow-only, and keeping them apart is what lets a union be the only
+/// combining operation either one ever needs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Record {
+    /// Photos copied into a library.
+    Imported,
+    /// Photos the user moved past without marking — the import browser's
+    /// red ✗. Kept so a card triaged in one sitting does not present the
+    /// same rejects again in the next.
+    Skipped,
+}
+
+impl Record {
+    /// Filename at the root of an import medium.
+    ///
+    /// Dotfile-prefixed so the import scanner's existing hidden-file
+    /// filtering already skips it, exactly like `.maple_embed_cache.bin`
+    /// next to it.
+    pub fn on_medium(self) -> &'static str {
+        match self {
+            Self::Imported => ".maple_seen.bin",
+            Self::Skipped => ".maple_skipped.bin",
+        }
+    }
+
+    /// Filename of the library-side replica.
+    pub fn replica(self) -> &'static str {
+        match self {
+            Self::Imported => "seen_imported.bin",
+            Self::Skipped => "seen_skipped.bin",
+        }
+    }
+}
 
 /// Persistent set keyed by full 32-byte BLAKE3 content hashes.
 pub struct SeenSet {
@@ -60,43 +129,108 @@ impl SeenSet {
 
     // ── Named constructors ───────────────────────────────────────
 
-    /// Load the imported-images set from `dir/seen_imported.bin`.
-    pub fn load_imported(dir: &Path) -> Self {
-        Self::load_from(&dir.join("seen_imported.bin"))
+    /// Load a record's library-side replica out of `dir`.
+    pub fn load_replica(dir: &Path, record: Record) -> Self {
+        Self::load_from(&dir.join(record.replica()))
     }
 
-    /// Load the rejected-images set from `dir/seen_rejected.bin`.
-    pub fn load_rejected(dir: &Path) -> Self {
-        Self::load_from(&dir.join("seen_rejected.bin"))
+    /// Load `record` for an import medium rooted at `root`.
+    ///
+    /// The medium's own copy is authoritative. The library replica is
+    /// consulted **only** when the medium carries no readable record of its
+    /// own — a card that was never written to because it is read-only, a
+    /// network share, a folder that has since moved. A medium record that
+    /// exists but is corrupt falls back the same way: an empty set there
+    /// would silently forget every decision ever made about it.
+    pub fn load_for_source(root: &Path, library_dir: &Path, record: Record) -> Self {
+        Self::read_file(&root.join(record.on_medium()))
+            .unwrap_or_else(|| Self::load_replica(library_dir, record))
     }
 
     // ── Load / Save ─────────────────────────────────────────────
 
     /// Load from a specific file (`Self::new()` on any error).
     pub fn load_from(path: &Path) -> Self {
-        match std::fs::read(path) {
-            Ok(data) => Self::from_bytes(&data),
-            Err(_) => Self::new(),
-        }
+        Self::read_file(path).unwrap_or_default()
     }
 
-    /// Save the imported-images set to `dir/seen_imported.bin`.
-    pub fn save_imported(&self, dir: &Path) -> anyhow::Result<()> {
-        self.save_to(&dir.join("seen_imported.bin"))
+    /// Load from a specific file, distinguishing "nothing readable there"
+    /// from "an empty set". Only [`Self::load_for_source`] needs the
+    /// difference, and for it the difference is the whole point.
+    fn read_file(path: &Path) -> Option<Self> {
+        Self::parse(&std::fs::read(path).ok()?)
     }
 
-    /// Save the rejected-images set to `dir/seen_rejected.bin`.
-    pub fn save_rejected(&self, dir: &Path) -> anyhow::Result<()> {
-        self.save_to(&dir.join("seen_rejected.bin"))
+    /// Save a record's library-side replica into `dir`.
+    pub fn save_replica(&self, dir: &Path, record: Record) -> anyhow::Result<()> {
+        self.save_to(&dir.join(record.replica()))
     }
 
-    /// Save to a specific file.
+    /// Save to a specific file, replacing it atomically.
+    ///
+    /// The bytes land in a scratch file beside the target and are renamed
+    /// over it, so a reader never sees a half-written set and a crash or an
+    /// ejected card mid-write leaves the previous record intact rather than
+    /// a truncated one.
     pub fn save_to(&self, path: &Path) -> anyhow::Result<()> {
         if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
+            if !parent.as_os_str().is_empty() {
+                std::fs::create_dir_all(parent)?;
+            }
         }
-        std::fs::write(path, self.to_bytes())?;
+        let tmp = scratch_path(path);
+        std::fs::write(&tmp, self.to_bytes())?;
+        if let Err(err) = std::fs::rename(&tmp, path) {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(err.into());
+        }
         Ok(())
+    }
+
+    /// Fold this set into the record on the import medium at `root`, and
+    /// into the library replica.
+    ///
+    /// Read-merge-write, both times: whatever is on disk is loaded, unioned
+    /// with `self`, and written back. Two importers running at once
+    /// therefore combine instead of clobbering each other — the old
+    /// load-modify-write in `maple-ui/src/import.rs` dropped one of the two
+    /// runs entirely — and the same code path merges a card's history into
+    /// a library that has never seen it.
+    ///
+    /// Returns `Ok(true)` when the medium itself took the write, `Ok(false)`
+    /// when only the replica did (a read-only card — expected, not a
+    /// failure), and `Err` when neither did and the record was lost.
+    pub fn merge_save_to_source(
+        &self,
+        root: &Path,
+        library_dir: &Path,
+        record: Record,
+    ) -> anyhow::Result<bool> {
+        // An empty root joins to a bare relative name, i.e. the process's
+        // working directory — nobody's import medium. Treat it as unwritable
+        // rather than littering wherever the app happens to have been
+        // launched from.
+        let on_medium = if root.as_os_str().is_empty() {
+            Err(anyhow::anyhow!("no source root to write the record to"))
+        } else {
+            self.merge_save_into(&root.join(record.on_medium()))
+        };
+        let replica = self.merge_save_into(&library_dir.join(record.replica()));
+        match (on_medium, replica) {
+            (Ok(()), _) => Ok(true),
+            (Err(_), Ok(())) => Ok(false),
+            (Err(medium), Err(replica)) => Err(medium.context(format!(
+                "neither the medium nor the library replica could be written ({replica})"
+            ))),
+        }
+    }
+
+    /// One half of [`Self::merge_save_to_source`]: reload `path`, union
+    /// `self` into it, write it back.
+    fn merge_save_into(&self, path: &Path) -> anyhow::Result<()> {
+        let mut merged = Self::load_from(path);
+        merged.merge(self);
+        merged.save_to(path)
     }
 
     // ── Core API ────────────────────────────────────────────────
@@ -104,9 +238,10 @@ impl SeenSet {
     /// Insert a full 32-byte BLAKE3 content hash.
     ///
     /// Inserting the same hash twice is a no-op: the set stores each hash
-    /// once, so [`Self::len`] counts distinct images.
+    /// once, so [`Self::len`] counts distinct images. The all-zero
+    /// [`UNHASHED`] placeholder is refused outright — see its comment.
     pub fn insert(&mut self, hash: &[u8; 32]) {
-        if !self.hashes.insert(*hash) {
+        if *hash == UNHASHED || !self.hashes.insert(*hash) {
             return;
         }
         // Resize the bloom filter if the load factor is getting too high.
@@ -125,6 +260,17 @@ impl SeenSet {
     /// hashes, so a `true` result means this exact 32-byte hash was inserted.
     pub fn contains(&self, hash: &[u8; 32]) -> bool {
         self.bloom_maybe_contains(hash) && self.hashes.contains(hash)
+    }
+
+    /// Union `other` into this set.
+    ///
+    /// The only combining operation the format needs: the set is grow-only,
+    /// so a union can never lose information and never has to choose a
+    /// winner.
+    pub fn merge(&mut self, other: &Self) {
+        for hash in &other.hashes {
+            self.insert(hash);
+        }
     }
 
     /// Number of hashes stored.
@@ -197,23 +343,30 @@ impl SeenSet {
         buf
     }
 
-    fn from_bytes(data: &[u8]) -> Self {
+    /// Parse the binary format, or `None` when these bytes are not a set
+    /// this version can read.
+    fn parse(data: &[u8]) -> Option<Self> {
         if data.len() < 8 {
-            return Self::new();
+            return None;
         }
         let version = u32::from_le_bytes(data[0..4].try_into().unwrap());
         if version != VERSION {
-            return Self::new();
+            return None;
         }
         let count = u32::from_le_bytes(data[4..8].try_into().unwrap()) as usize;
         if data.len() < 8 + count * 32 {
-            return Self::new();
+            return None;
         }
         let mut hashes = HashSet::with_capacity(count);
         for i in 0..count {
             let off = 8 + i * 32;
             let h: [u8; 32] = data[off..off + 32].try_into().unwrap();
-            hashes.insert(h);
+            // Drop the sentinel on read as well as on write: a file written
+            // before `insert` started refusing it is already poisoned, and
+            // this is what un-poisons it on the next save.
+            if h != UNHASHED {
+                hashes.insert(h);
+            }
         }
         let mut set = Self {
             bits: Vec::new(),
@@ -221,7 +374,7 @@ impl SeenSet {
             hashes,
         };
         set.rebuild_bloom();
-        set
+        Some(set)
     }
 }
 
@@ -229,6 +382,17 @@ impl Default for SeenSet {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// Scratch filename to stage an atomic replacement of `path` in.
+///
+/// Beside the target, so the rename stays within one filesystem, and unique
+/// per process *and* per call: concurrent importers must not stage into the
+/// same file, or one would rename the other's half-written bytes into place.
+fn scratch_path(path: &Path) -> PathBuf {
+    let name = path.file_name().unwrap_or_default().to_string_lossy();
+    let seq = TEMP_SEQ.fetch_add(1, Ordering::Relaxed);
+    path.with_file_name(format!(".{name}.{}.{seq}.tmp", std::process::id()))
 }
 
 // ── Bloom filter math ────────────────────────────────────────────
@@ -338,7 +502,7 @@ mod tests {
 
         // `from_bytes` rebuilds the bloom from scratch; it must rebuild the
         // exact index too.
-        let mut loaded = SeenSet::from_bytes(&set.to_bytes());
+        let mut loaded = SeenSet::parse(&set.to_bytes()).unwrap();
         assert_eq!(loaded.len(), 500);
         saturate_bloom(&mut loaded);
 
@@ -375,7 +539,7 @@ mod tests {
         assert!(set.contains(&h));
 
         // And the duplicates do not survive a save/load cycle either.
-        let loaded = SeenSet::from_bytes(&set.to_bytes());
+        let loaded = SeenSet::parse(&set.to_bytes()).unwrap();
         assert_eq!(loaded.len(), 1);
         assert!(loaded.contains(&h));
     }
@@ -391,7 +555,7 @@ mod tests {
         set.insert(&h3);
 
         let bytes = set.to_bytes();
-        let loaded = SeenSet::from_bytes(&bytes);
+        let loaded = SeenSet::parse(&bytes).unwrap();
 
         assert_eq!(loaded.len(), 3);
         assert!(loaded.contains(&h1));
@@ -422,10 +586,217 @@ mod tests {
     }
 
     #[test]
-    fn bad_data_returns_empty() {
-        assert!(SeenSet::from_bytes(&[]).is_empty());
-        assert!(SeenSet::from_bytes(&[0; 4]).is_empty());
-        assert!(SeenSet::from_bytes(&[99, 0, 0, 0, 0, 0, 0, 0]).is_empty());
+    fn bad_data_is_rejected_rather_than_read_as_empty() {
+        // `None`, not an empty set: `load_for_source` tells the two apart,
+        // and reading a corrupt medium record as "nothing imported yet"
+        // would send the user re-importing a whole card.
+        assert!(SeenSet::parse(&[]).is_none());
+        assert!(SeenSet::parse(&[0; 4]).is_none());
+        assert!(SeenSet::parse(&[99, 0, 0, 0, 0, 0, 0, 0]).is_none(), "wrong version");
+        // A count the payload cannot cover — a truncated write.
+        assert!(SeenSet::parse(&[1, 0, 0, 0, 9, 0, 0, 0]).is_none());
+    }
+
+    // ── The record on the import medium ──────────────────────────
+
+    #[test]
+    fn the_medium_carries_the_record_to_a_library_that_never_saw_it() {
+        let card = tempfile::tempdir().unwrap();
+        let first_library = tempfile::tempdir().unwrap();
+        let other_library = tempfile::tempdir().unwrap();
+
+        let mut set = SeenSet::new();
+        set.insert(&fake_hash(1));
+        set.merge_save_to_source(card.path(), first_library.path(), Record::Imported).unwrap();
+
+        // Plugged into a different machine: the card still knows.
+        let loaded = SeenSet::load_for_source(card.path(), other_library.path(), Record::Imported);
+        assert!(loaded.contains(&fake_hash(1)));
+    }
+
+    #[test]
+    fn a_source_with_no_record_falls_back_to_the_library_replica() {
+        let card = tempfile::tempdir().unwrap();
+        let library = tempfile::tempdir().unwrap();
+
+        let mut set = SeenSet::new();
+        set.insert(&fake_hash(2));
+        set.save_replica(library.path(), Record::Imported).unwrap();
+
+        // Nothing was ever written to the card — a read-only one, say.
+        assert!(!card.path().join(Record::Imported.on_medium()).exists());
+        assert!(SeenSet::load_for_source(card.path(), library.path(), Record::Imported).contains(&fake_hash(2)));
+    }
+
+    #[test]
+    fn a_corrupt_medium_record_falls_back_rather_than_forgetting() {
+        let card = tempfile::tempdir().unwrap();
+        let library = tempfile::tempdir().unwrap();
+
+        let mut set = SeenSet::new();
+        set.insert(&fake_hash(3));
+        set.save_replica(library.path(), Record::Imported).unwrap();
+        std::fs::write(card.path().join(Record::Imported.on_medium()), b"not a seen set").unwrap();
+
+        // Reading the garbage as an empty set would send the user
+        // re-importing the whole card.
+        assert!(SeenSet::load_for_source(card.path(), library.path(), Record::Imported).contains(&fake_hash(3)));
+    }
+
+    #[test]
+    fn two_importers_saving_at_once_both_survive() {
+        let card = tempfile::tempdir().unwrap();
+        let library = tempfile::tempdir().unwrap();
+
+        // Both loaded the same (empty) record, then each copied its own
+        // photos. Under the old load-modify-write the second save would
+        // overwrite the first and lose `first`.
+        let mut a = SeenSet::new();
+        a.insert(&fake_hash(10));
+        let mut b = SeenSet::new();
+        b.insert(&fake_hash(20));
+
+        a.merge_save_to_source(card.path(), library.path(), Record::Imported).unwrap();
+        b.merge_save_to_source(card.path(), library.path(), Record::Imported).unwrap();
+
+        let merged = SeenSet::load_for_source(card.path(), library.path(), Record::Imported);
+        assert!(merged.contains(&fake_hash(10)), "the first importer's photos were lost");
+        assert!(merged.contains(&fake_hash(20)));
+        assert_eq!(merged.len(), 2);
+
+        // And the replica saw the union too, not just the last writer.
+        let replica = SeenSet::load_replica(library.path(), Record::Imported);
+        assert!(replica.contains(&fake_hash(10)) && replica.contains(&fake_hash(20)));
+    }
+
+    #[test]
+    fn merging_two_cards_unions_them() {
+        let mut a = SeenSet::new();
+        a.insert(&fake_hash(1));
+        a.insert(&fake_hash(2));
+        let mut b = SeenSet::new();
+        b.insert(&fake_hash(2));
+        b.insert(&fake_hash(3));
+
+        a.merge(&b);
+        assert_eq!(a.len(), 3, "the shared hash was counted twice");
+        for i in 1..=3u64 {
+            assert!(a.contains(&fake_hash(i)));
+        }
+    }
+
+    #[test]
+    fn the_unhashed_sentinel_never_enters_the_set() {
+        let mut set = SeenSet::new();
+        set.insert(&UNHASHED);
+        assert!(set.is_empty());
+        assert!(!set.contains(&UNHASHED), "one unreadable file would badge them all");
+    }
+
+    #[test]
+    fn a_file_already_holding_the_sentinel_is_healed_on_load() {
+        // version 1, two hashes: the sentinel plus a real one.
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&1u32.to_le_bytes());
+        bytes.extend_from_slice(&2u32.to_le_bytes());
+        bytes.extend_from_slice(&UNHASHED);
+        bytes.extend_from_slice(&fake_hash(5));
+
+        let set = SeenSet::parse(&bytes).unwrap();
+        assert_eq!(set.len(), 1);
+        assert!(!set.contains(&UNHASHED));
+        assert!(set.contains(&fake_hash(5)));
+    }
+
+    #[test]
+    fn a_save_leaves_no_scratch_file_behind() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut set = SeenSet::new();
+        set.insert(&fake_hash(1));
+        set.save_to(&dir.path().join("seen.bin")).unwrap();
+
+        let names: Vec<String> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names, vec!["seen.bin".to_string()]);
+    }
+
+    #[test]
+    fn the_two_records_do_not_bleed_into_each_other() {
+        let card = tempfile::tempdir().unwrap();
+        let library = tempfile::tempdir().unwrap();
+
+        let mut imported = SeenSet::new();
+        imported.insert(&fake_hash(1));
+        imported
+            .merge_save_to_source(card.path(), library.path(), Record::Imported)
+            .unwrap();
+
+        let mut skipped = SeenSet::new();
+        skipped.insert(&fake_hash(2));
+        skipped
+            .merge_save_to_source(card.path(), library.path(), Record::Skipped)
+            .unwrap();
+
+        let imported = SeenSet::load_for_source(card.path(), library.path(), Record::Imported);
+        let skipped = SeenSet::load_for_source(card.path(), library.path(), Record::Skipped);
+
+        assert!(imported.contains(&fake_hash(1)) && !imported.contains(&fake_hash(2)));
+        assert!(skipped.contains(&fake_hash(2)) && !skipped.contains(&fake_hash(1)));
+
+        // Two files on the card, not one shared one.
+        assert_ne!(Record::Imported.on_medium(), Record::Skipped.on_medium());
+        assert!(card.path().join(Record::Imported.on_medium()).exists());
+        assert!(card.path().join(Record::Skipped.on_medium()).exists());
+    }
+
+    #[test]
+    fn a_skipped_record_survives_to_another_machine_like_an_imported_one() {
+        let card = tempfile::tempdir().unwrap();
+        let first = tempfile::tempdir().unwrap();
+        let second = tempfile::tempdir().unwrap();
+
+        let mut skipped = SeenSet::new();
+        skipped.insert(&fake_hash(3));
+        skipped
+            .merge_save_to_source(card.path(), first.path(), Record::Skipped)
+            .unwrap();
+
+        assert!(SeenSet::load_for_source(card.path(), second.path(), Record::Skipped)
+            .contains(&fake_hash(3)));
+    }
+
+    #[test]
+    fn an_empty_source_root_writes_nothing_to_the_working_directory() {
+        let library = tempfile::tempdir().unwrap();
+        let mut set = SeenSet::new();
+        set.insert(&fake_hash(9));
+
+        assert!(!set.merge_save_to_source(Path::new(""), library.path(), Record::Imported).unwrap());
+        assert!(!Path::new(Record::Imported.on_medium()).exists(), "littered the cwd");
+        assert!(SeenSet::load_replica(library.path(), Record::Imported).contains(&fake_hash(9)));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_read_only_medium_still_records_in_the_library() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let card = tempfile::tempdir().unwrap();
+        let library = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(card.path(), std::fs::Permissions::from_mode(0o555)).unwrap();
+
+        let mut set = SeenSet::new();
+        set.insert(&fake_hash(7));
+        let on_medium = set.merge_save_to_source(card.path(), library.path(), Record::Imported).unwrap();
+
+        assert!(!on_medium, "a read-only card cannot have taken the write");
+        assert!(SeenSet::load_replica(library.path(), Record::Imported).contains(&fake_hash(7)));
+        // …and the card falls back to that replica next time.
+        assert!(SeenSet::load_for_source(card.path(), library.path(), Record::Imported).contains(&fake_hash(7)));
+
+        std::fs::set_permissions(card.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
     }
 
     #[test]

@@ -24,8 +24,19 @@ export struct ImportItem {
     filename: string,
     thumb: image,
     loaded: bool,
-    is-selected: bool,
+    is-selected: bool,   // marked for import — the yellow dot
     is-imported: bool,   // already present in the library
+    // Moved past without being marked: a decision, not an absence. Set when
+    // the user navigates away from a photo, and pre-set for photos an
+    // earlier session already skipped.
+    is-skipped: bool,
+    // The scan produced no preview for this photo — it failed to decode, or
+    // it ran past its time budget and the scan moved on without it. Still
+    // listed, still selectable, still copied.
+    is-unreadable: bool,
+    // Decided in an *earlier* session (imported then, or skipped then).
+    // What "Hide old images" filters on.
+    is-old: bool,
     stack-size: int,     // >=2 when this photo belongs to a detected burst group
     has-jpg: bool,        // group has a non-raw (JPG/PNG) file
     has-raw: bool,        // group has a raw companion (or the display itself is raw)
@@ -53,6 +64,10 @@ component ImportGridView {
         viewport-width: sv.visible-width;
         viewport-height: root.row-count * root.pitch-y + root.pad;
 
+        // `idx` is the *row*, and it shifts as soon as "Hide old images"
+        // filters the strip; `item.index` is the photo's stable scan index
+        // and is what Rust addresses everything by. Position comes from the
+        // row, identity from the item.
         for item[idx] in root.items: Rectangle {
             property <float> grid-col: Math.mod(idx, root.columns);
             property <float> grid-row: Math.floor(idx / root.columns);
@@ -69,7 +84,7 @@ component ImportGridView {
                     border-radius: Theme.thumb-radius;
                     clip: true;
                     background: Theme.placeholder-bg;
-                    border-width: idx == root.current-index ? 2px : 0;
+                    border-width: item.index == root.current-index ? 2px : 0;
                     border-color: Theme.accent;
 
                     if item.loaded: Image {
@@ -85,6 +100,27 @@ component ImportGridView {
                         font-size: 18px;
                         horizontal-alignment: center;
                         vertical-alignment: center;
+                    }
+
+                    // Scanned, but nothing came back. Say so rather than
+                    // leaving an empty frame that looks like a tile still
+                    // loading — the photo is copyable and the user needs to
+                    // know it is there to decide about it.
+                    if item.loaded && item.is-unreadable: VerticalLayout {
+                        alignment: center;
+                        spacing: 2px;
+                        Text {
+                            text: "⚠";
+                            color: Theme.rejected;
+                            font-size: 16px;
+                            horizontal-alignment: center;
+                        }
+                        Text {
+                            text: "no preview";
+                            color: Theme.dim-fg;
+                            font-size: 9px;
+                            horizontal-alignment: center;
+                        }
                     }
 
                     if item.is-selected: Rectangle {
@@ -104,17 +140,35 @@ component ImportGridView {
                         }
                     }
 
+                    // One corner, one verdict — a yellow dot for "import
+                    // it", a red ✗ for "moved past it", nothing at all for
+                    // one not looked at yet. Which of the three applies is
+                    // settled in `make_item`, not here.
                     if item.is-selected: Rectangle {
+                        x: parent.width - 20px;
+                        y: 6px;
+                        width: 12px;
+                        height: 12px;
+                        border-radius: 6px;
+                        background: Theme.marked;
+                        border-width: 1px;
+                        border-color: #00000044;
+                    }
+
+                    if item.is-skipped: Rectangle {
                         x: parent.width - 22px;
                         y: 4px;
                         width: 18px;
                         height: 18px;
                         border-radius: 9px;
-                        background: Theme.accent;
+                        // A bare glyph vanishes into a busy photo; the
+                        // scrim is what makes the verdict readable while
+                        // scrubbing the strip.
+                        background: #000000.with-alpha(0.55);
                         Text {
-                            text: "✓";
-                            color: white;
-                            font-size: 11px;
+                            text: "✗";
+                            color: Theme.rejected;
+                            font-size: 12px;
                             font-weight: 700;
                             horizontal-alignment: center;
                             vertical-alignment: center;
@@ -178,7 +232,7 @@ component ImportGridView {
             }
 
             ta := TouchArea {
-                clicked => { root.clicked(idx); }
+                clicked => { root.clicked(item.index); }
             }
         }
     }
@@ -301,6 +355,15 @@ export component ImportWindow inherits Window {
     in property <string> preview-filename: "";
     in property <int> selected-count: 0;
     in property <int> total-count: 0;
+    // How many of the scanned photos an earlier session already decided on.
+    // The "Hide old images" toggle only appears once there is something to
+    // hide.
+    in property <int> old-count: 0;
+    in-out property <bool> hide-old: false;
+    // Verdict on the photo in the big preview: 0 undecided, 1 marked for
+    // import, 2 moved past, 3 already in the library. Mirrors the badge on
+    // its tile, where the user is not necessarily looking.
+    in property <int> preview-state: 0;
     in property <string> status-text: "Pick a source folder to begin.";
     // Live scan progress — while true the status bar shows a progress bar
     // (scanned-count / total-count) instead of status-text.
@@ -319,6 +382,7 @@ export component ImportWindow inherits Window {
     callback open-path-template;
     callback start-scan;
     callback item-clicked(int);
+    callback toggle-hide-old();
     callback copy-selected;
     callback nav-prev;
     callback nav-next;
@@ -379,6 +443,34 @@ export component ImportWindow inherits Window {
                         font-weight: 600;
                         vertical-alignment: center;
                         horizontal-stretch: 1;
+                    }
+
+                    if root.in-browser && root.old-count > 0: Rectangle {
+                        border-radius: Theme.radius-btn;
+                        background: root.hide-old
+                            ? Theme.accent-tint
+                            : (old-ta.has-hover ? Theme.card-bg : transparent);
+                        border-width: 1px;
+                        border-color: root.hide-old ? Theme.accent : transparent;
+                        animate background { duration: 120ms; }
+
+                        HorizontalLayout {
+                            padding-left: 10px;
+                            padding-right: 10px;
+                            Text {
+                                text: root.hide-old
+                                    ? "\{root.old-count} old hidden"
+                                    : "Hide old images";
+                                color: root.hide-old ? Theme.accent-text : Theme.dim-fg;
+                                font-size: 12px;
+                                font-weight: root.hide-old ? 700 : 500;
+                                vertical-alignment: center;
+                            }
+                        }
+
+                        old-ta := TouchArea {
+                            clicked => { root.toggle-hide-old(); }
+                        }
                     }
 
                     if root.in-browser: Text {
@@ -531,6 +623,33 @@ export component ImportWindow inherits Window {
                             FlatButton {
                                 text: "‹";
                                 clicked => { root.nav-prev(); }
+                            }
+                            if root.preview-state > 0: Rectangle {
+                                border-radius: 10px;
+                                background: root.preview-state == 1
+                                    ? Theme.marked.with-alpha(0.18)
+                                    : (root.preview-state == 2
+                                        ? Theme.rejected.with-alpha(0.18)
+                                        : Theme.success.with-alpha(0.18));
+                                HorizontalLayout {
+                                    padding-left: 9px;
+                                    padding-right: 9px;
+                                    Text {
+                                        text: root.preview-state == 1
+                                            ? "● marked for import"
+                                            : (root.preview-state == 2
+                                                ? "✗ not imported"
+                                                : "✓ already in library");
+                                        color: root.preview-state == 1
+                                            ? Theme.marked
+                                            : (root.preview-state == 2
+                                                ? Theme.rejected
+                                                : Theme.success);
+                                        font-size: 11px;
+                                        font-weight: 700;
+                                        vertical-alignment: center;
+                                    }
+                                }
                             }
                             Text {
                                 text: root.preview-filename;
