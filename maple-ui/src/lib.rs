@@ -101,13 +101,25 @@ pub fn run() -> anyhow::Result<()> {
         maple_db::ThumbnailCache::open(&fallback).expect("could not open fallback thumbnail cache")
     }));
 
+    // Both background workers below change what the library contains without
+    // anybody asking, so both have to say so: the grid is loaded once at
+    // startup and would otherwise keep showing that reading until the user
+    // navigated. `request_reload` is an in-place refresh, so a scan landing
+    // while the user is deep in their library costs them nothing.
+    let refresh: maple_db::LibraryChanged = Arc::new(|| {
+        // Fires on a worker thread; Slint models may only be touched on the
+        // event loop.
+        let _ = slint::invoke_from_event_loop(grid::request_reload);
+    });
+
     maple_db::LibraryScanner::new(db.clone(), settings.library_dir.clone(), Some(cache.clone()))
+        .on_change(refresh.clone())
         .spawn();
 
     // Backfill EXIF metadata (curated fields + comprehensive tags) for any
     // records inserted since the last run. Safe to call repeatedly — it only
     // touches records where `exif_extracted = 0`.
-    maple_db::spawn_metadata_filler(db.clone());
+    maple_db::spawn_metadata_filler(db.clone(), Some(refresh));
 
     if settings.stacks.enabled {
         maple_db::spawn_hasher(db.clone(), settings.stacks.clone(), Some(cache.clone()));

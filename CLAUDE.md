@@ -75,6 +75,17 @@ single binary; the backend is fixed at compile time.
 
 ### Key patterns
 - **Generation counter**: `LibraryGrid` increments a counter on each `load()`; stale `slint::Timer` pollers self-terminate on mismatch.
+- **`load` vs `refresh`**: `load(query)` is *navigation* — new context, model cleared, back to
+  page 0 and the top of the list. `refresh()` is an *event* — same query, re-reads only the
+  rows already on screen and patches them in place, keeping the scroll offset, the decoded
+  thumbnails and the selection. Everything that changes the library out of band goes through
+  `grid::request_reload` (which calls `refresh`): the 60-second scanner, the metadata filler,
+  an import, a sync pass, a rotation. Two rules make it safe: the model is replaced in a
+  *single* `set_vec` (an empty model for even one frame collapses `viewport-height` in
+  `library.slint` and Slint clamps the scroll to zero), and a tile is only reused when the
+  row's `(id, hash)` still match, since a rotation mints a new hash for the same id. A
+  refresh whose rows are unchanged does nothing at all — the scanner fires one every minute
+  forever.
 - **Clone-shared structs**: Types like `LibraryGrid` wrap `Rc` internals and are cheaply cloned for closure captures.
 - **Singleton windows**: Each secondary window (`DetailWindow`, `ImportWindow`, `SettingsWindow`, `CollectionsWindow`) is held as `thread_local! { static X: RefCell<Option<T>> }`. Strong handle lives only there; all callbacks capture `slint::Weak`.
 - **Context struct + `wire_*` functions**: each window builds one context holding its shared handles (`AppCtx` in `lib.rs`, `ImportCtx` in `import.rs`, `NavState` in `detail.rs`) and passes it to one `wire_*` function per feature block instead of wiring every callback in one scope. The context holds the window as a `slint::Weak` only — callbacks clone fields out of it, never a strong handle. Startup call order is load-bearing (paging wired before the first `grid.load`, `grid::register` before any window that calls `request_reload`).

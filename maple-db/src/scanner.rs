@@ -10,6 +10,17 @@
 //! The scan uses [`scan_grouped_excluding`] so that application-internal
 //! subdirectories (`aligned_faces`, `.thumbcache`, any hidden dir) are never
 //! accidentally ingested as user photos.
+//!
+//! # Telling somebody
+//!
+//! A scan that changes the library and says nothing leaves whatever is on
+//! screen wrong until the app is restarted — drop photos into `library_dir`
+//! with the window open and the grid keeps showing what it read at startup.
+//! [`LibraryScanner::on_change`] is the hook that closes that; `maple-ui`
+//! points it at the grid. It fires **only when a scan actually changed
+//! something**, because it runs every 60 seconds forever and a UI that
+//! re-read the library that often for no reason would be worse than a stale
+//! one.
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
@@ -22,6 +33,12 @@ use maple_import::{content_hash, scan_grouped_excluding};
 use maple_import::ImageGroup;
 
 use crate::{Database, ImageStatus, ThumbnailCache};
+
+/// Called after a scan that changed the library.
+///
+/// Runs on the scanner thread, so a UI caller must marshal
+/// (`slint::Weak::upgrade_in_event_loop`).
+pub type LibraryChanged = Arc<dyn Fn() + Send + Sync>;
 
 const SCAN_INTERVAL: Duration = Duration::from_secs(60);
 
@@ -49,6 +66,7 @@ pub struct LibraryScanner {
     db: Arc<Mutex<Database>>,
     library_dir: PathBuf,
     cache: Option<Arc<ThumbnailCache>>,
+    on_change: Option<LibraryChanged>,
 }
 
 impl LibraryScanner {
@@ -57,7 +75,18 @@ impl LibraryScanner {
         library_dir: PathBuf,
         cache: Option<Arc<ThumbnailCache>>,
     ) -> Self {
-        Self { db, library_dir, cache }
+        Self { db, library_dir, cache, on_change: None }
+    }
+
+    /// Run `hook` after any scan that inserted a row or changed one's status.
+    ///
+    /// Also handed to the metadata filler this scanner spawns: the filler is
+    /// what fills in `taken_at`, and a photo that appears undated and then
+    /// silently re-sorts an hour later is not better than one that appears
+    /// late.
+    pub fn on_change(mut self, hook: LibraryChanged) -> Self {
+        self.on_change = Some(hook);
+        self
     }
 
     pub fn spawn(self) {
@@ -110,6 +139,7 @@ impl LibraryScanner {
             groups.into_iter().map(group_map_entry).collect();
 
         // ── 3. Reconcile DB records against disk ─────────────────
+        let mut restatused = 0usize;
         for (path, status, hash) in &db_records {
             let on_disk = found_map.contains_key(path);
             match (on_disk, status) {
@@ -123,20 +153,22 @@ impl LibraryScanner {
                             );
                         }
                     }
-                    if let Err(e) = crate::lock_db(&self.db).mark_missing(path) {
-                        tracing::warn!(
+                    match crate::lock_db(&self.db).mark_missing(path) {
+                        Ok(()) => restatused += 1,
+                        Err(e) => tracing::warn!(
                             "Library scan: failed to mark missing {}: {e}",
                             path.display()
-                        );
+                        ),
                     }
                 }
                 (true, ImageStatus::Missing) => {
                     tracing::info!("Library scan: marking present {}", path.display());
-                    if let Err(e) = crate::lock_db(&self.db).mark_present(path) {
-                        tracing::warn!(
+                    match crate::lock_db(&self.db).mark_present(path) {
+                        Ok(()) => restatused += 1,
+                        Err(e) => tracing::warn!(
                             "Library scan: failed to mark present {}: {e}",
                             path.display()
-                        );
+                        ),
                     }
                 }
                 _ => {}
@@ -183,7 +215,17 @@ impl LibraryScanner {
         );
 
         if inserted > 0 {
-            crate::metadata::spawn_metadata_filler(self.db.clone());
+            crate::metadata::spawn_metadata_filler(self.db.clone(), self.on_change.clone());
+        }
+
+        // Last, and only if the library really moved: this runs every minute
+        // for the life of the process, and the whole point of counting rather
+        // than notifying unconditionally is that an idle library costs the UI
+        // nothing at all.
+        if inserted > 0 || restatused > 0 {
+            if let Some(hook) = &self.on_change {
+                hook();
+            }
         }
     }
 }
@@ -300,6 +342,71 @@ mod tests {
             )
             .expect("row");
         assert_eq!(status, "missing");
+    }
+
+    /// A scanner whose change hook counts its calls.
+    fn counting(
+        db: Arc<Mutex<Database>>,
+        library: PathBuf,
+    ) -> (LibraryScanner, Arc<std::sync::atomic::AtomicUsize>) {
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let hook = {
+            let calls = calls.clone();
+            Arc::new(move || {
+                calls.fetch_add(1, Ordering::SeqCst);
+            })
+        };
+        (LibraryScanner::new(db, library, None).on_change(hook), calls)
+    }
+
+    #[test]
+    fn a_scan_that_found_nothing_new_says_nothing() {
+        // This runs every 60 seconds for the life of the process. A hook that
+        // fired unconditionally would have the grid re-read the library once
+        // a minute forever, for a library that had not moved.
+        let (dir, db, _) = library_with_a_remote_row();
+        let (scanner, calls) = counting(db, dir.path().join("library"));
+
+        scanner.run_scan();
+        assert_eq!(calls.load(Ordering::SeqCst), 0, "nothing changed");
+    }
+
+    #[test]
+    fn a_scan_that_inserted_a_photo_says_so() {
+        // The gap this exists for: drop photos into `library_dir` with the
+        // window open, and until now the grid kept showing what it read at
+        // startup.
+        let (dir, db, _) = library_with_a_remote_row();
+        let library = dir.path().join("library");
+        let (scanner, calls) = counting(db, library.clone());
+
+        std::fs::write(library.join("new.jpg"), b"\xff\xd8\xffnew").expect("write");
+        scanner.run_scan();
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+        // ...and once it has settled, it goes quiet again.
+        scanner.run_scan();
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn a_photo_that_vanished_or_came_back_says_so() {
+        let (dir, db, _) = library_with_a_remote_row();
+        let library = dir.path().join("library");
+        let (scanner, calls) = counting(db, library.clone());
+
+        let photo = library.join("mine.jpg");
+        let bytes = std::fs::read(&photo).expect("read");
+        std::fs::remove_file(&photo).expect("delete");
+        scanner.run_scan();
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "marked missing");
+
+        std::fs::write(&photo, &bytes).expect("restore");
+        scanner.run_scan();
+        assert_eq!(calls.load(Ordering::SeqCst), 2, "marked present again");
+
+        scanner.run_scan();
+        assert_eq!(calls.load(Ordering::SeqCst), 2, "and then quiet");
     }
 
     fn img(path: &str) -> ImageFile {

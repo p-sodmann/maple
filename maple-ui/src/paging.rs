@@ -48,6 +48,23 @@ impl PageCursor {
         *self = Self::default();
     }
 
+    /// Re-establish the cursor after an in-place refresh: `rows` are loaded
+    /// and nothing is in flight.
+    ///
+    /// Unlike [`reset`](Self::reset) this keeps `want`, because the view has
+    /// not moved — the user is still looking at wherever they had scrolled
+    /// to, and forgetting how much they asked for would stop the grid filling
+    /// in below them.
+    ///
+    /// `asked_for` is the limit the refresh query ran with. A short read is
+    /// the end of the listing, exactly as it is for a page; a full one says
+    /// nothing either way, so the next fetch is left to find out.
+    pub fn refreshed(&mut self, rows: usize, asked_for: usize) {
+        self.requested = rows;
+        self.fetching = false;
+        self.exhausted = rows < asked_for;
+    }
+
     /// Raise the number of rows the view wants loaded. Monotonic: scrolling
     /// back up doesn't unload anything, so a lower request is not a reason
     /// to stop filling in what a deeper scroll already asked for.
@@ -196,5 +213,52 @@ mod tests {
         assert_eq!(c.take_next_offset(), None);
         c.want(100 * PAGE_SIZE);
         assert_eq!(c.take_next_offset(), None);
+    }
+
+    fn scrolled_deep() -> PageCursor {
+        let mut c = PageCursor::default();
+        // Three pages loaded, the view asking for a fourth.
+        for _ in 0..3 {
+            c.want(PAGE_SIZE * 4);
+            let offset = c.take_next_offset().expect("a page is due");
+            assert_eq!(offset % PAGE_SIZE, 0);
+            c.page_arrived(PAGE_SIZE);
+        }
+        c
+    }
+
+    #[test]
+    fn a_refresh_keeps_what_the_view_asked_for() {
+        // The difference between this and `reset`: the user has not moved, so
+        // forgetting how far down they are would stop the grid filling in
+        // below them until they scrolled again.
+        let mut c = scrolled_deep();
+        c.refreshed(PAGE_SIZE * 3, PAGE_SIZE * 3);
+
+        assert_eq!(
+            c.take_next_offset(),
+            Some(PAGE_SIZE * 3),
+            "the next page still continues where the loaded rows end"
+        );
+    }
+
+    #[test]
+    fn a_short_refresh_is_the_end_of_the_listing() {
+        // Photos were deleted off the end while the grid was open.
+        let mut c = scrolled_deep();
+        c.refreshed(PAGE_SIZE * 3 - 10, PAGE_SIZE * 3);
+        assert_eq!(c.take_next_offset(), None, "nothing left to fetch");
+    }
+
+    #[test]
+    fn a_refresh_clears_an_in_flight_fetch() {
+        // `refresh` orphans the page worker by taking a new generation, so a
+        // cursor that still believed one was in flight would never fetch
+        // again.
+        let mut c = PageCursor::default();
+        c.want(PAGE_SIZE * 2);
+        c.take_next_offset().expect("first page");
+        c.refreshed(PAGE_SIZE, PAGE_SIZE);
+        assert_eq!(c.take_next_offset(), Some(PAGE_SIZE));
     }
 }

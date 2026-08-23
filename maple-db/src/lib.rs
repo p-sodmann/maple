@@ -38,7 +38,7 @@ pub use face_detector::{spawn_face_tagger, DetectedFace, FaceDetector, FaceTagge
 pub use faces::{best_person_match, best_person_matches, cosine_similarity, FaceDetection, Person, PersonWithRep};
 pub use metadata::{extract_all_exif_tags, extract_metadata, spawn_metadata_filler, ImageMetadata};
 pub use query::{SearchOrder, SearchQuery};
-pub use scanner::{set_scanner_paused, LibraryScanner};
+pub use scanner::{set_scanner_paused, LibraryChanged, LibraryScanner};
 pub use schema::SYNCED_TABLES;
 pub use sync::{ApplyReport, MissingOriginal, SyncBatch, SyncRow, Tombstone};
 pub use sync_identity::SyncIdentity;

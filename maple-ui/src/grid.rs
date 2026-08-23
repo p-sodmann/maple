@@ -15,6 +15,14 @@
 //! `activated(idx)` handler in `lib.rs` all rely on. Nothing is ever
 //! recycled or windowed out from under them.
 //!
+//! A `refresh()` is the same query again, and deliberately *not* a `load()`:
+//! it re-reads exactly the rows already on screen and patches them in place,
+//! keeping the scroll position, the selection, and every thumbnail that has
+//! already been decoded. Everything that changes the library out of band
+//! goes through it — the 60-second scanner, a sync pass, a rotation — and
+//! any of those reloading from page 0 would throw the user back to the top
+//! of their library, in the scanner's case once a minute.
+//!
 //! Each `load()` increments a generation counter and resets paging to page 0;
 //! the `slint::Timer` poller discards messages from superseded loads, so
 //! rapid search changes never produce stale or interleaved grid content. An
@@ -24,7 +32,7 @@
 //! the UI-thread delivery changes.
 
 use std::cell::{Cell, RefCell};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 use std::sync::{mpsc, Arc, Mutex};
 use std::time::Duration;
@@ -66,6 +74,16 @@ enum GridMsg {
     },
     /// Format recognised but preview extraction not yet implemented.
     Unsupported { index: usize },
+    /// The rows already on screen, read again. Replaces them in place rather
+    /// than appending — see [`LibraryGrid::refresh`].
+    ///
+    /// `asked_for` is the limit the query ran with: fewer rows than that
+    /// means the listing ended, which is the only way a refresh can learn
+    /// that photos were deleted off the end.
+    Refresh {
+        records: Vec<LibraryImage>,
+        asked_for: usize,
+    },
     /// Every thumbnail of one page has been generated.
     PageDone,
 }
@@ -146,20 +164,37 @@ pub fn register(grid: LibraryGrid, current_query: Rc<RefCell<SearchQuery>>, on_r
     REFRESH_HANDLE.with(|cell| *cell.borrow_mut() = Some((grid, current_query, on_reloaded)));
 }
 
-/// Reload the library grid with whatever query it was last showing, then
-/// re-apply any active select-mode membership sync (see `REFRESH_HANDLE`).
+/// Re-read the library grid without disturbing it, then re-apply any active
+/// select-mode membership sync (see `REFRESH_HANDLE`).
 ///
 /// Call this after a change made from outside the grid's own callbacks
-/// leaves its cached records/thumbnails stale — e.g. a library restructure
-/// moving files, or an in-place image rotation changing a thumbnail's hash.
+/// leaves its cached records or thumbnails stale — a library restructure
+/// moving files, an in-place rotation changing a thumbnail's hash, a sync
+/// pass merging a peer's photos, the 60-second scanner finding new ones.
 /// A no-op before `register` has run.
+///
+/// This is [`LibraryGrid::refresh`], not `load`: callers here are *events*,
+/// not navigation, and none of them is a reason to send the user back to
+/// the top of their library. The scanner alone would do it every minute.
 pub fn request_reload() {
     REFRESH_HANDLE.with(|cell| {
-        if let Some((grid, current_query, on_reloaded)) = cell.borrow().as_ref() {
-            grid.load(current_query.borrow().clone());
-            on_reloaded();
+        if let Some((grid, ..)) = cell.borrow().as_ref() {
+            grid.refresh();
         }
     });
+}
+
+/// Run the select-mode resync hook, once a refresh has actually landed.
+///
+/// Separate from [`request_reload`] because a refresh is asynchronous: the
+/// rows arrive from a worker thread, and re-applying membership before they
+/// do would apply it to the tiles that are about to be replaced.
+fn notify_reloaded() {
+    let hook = REFRESH_HANDLE
+        .with(|cell| cell.borrow().as_ref().map(|(_, _, on_reloaded)| on_reloaded.clone()));
+    if let Some(hook) = hook {
+        hook();
+    }
 }
 
 impl LibraryGrid {
@@ -267,6 +302,172 @@ impl LibraryGrid {
         self.fetch_next_page();
     }
 
+    /// Re-read the rows already on screen and patch them in place.
+    ///
+    /// The same query as the last `load`, limited to what is currently
+    /// loaded, with the result reconciled against what is displayed instead
+    /// of replacing it. Three things survive that a `load` would destroy:
+    /// the scroll position, every already-decoded thumbnail, and the
+    /// selection.
+    ///
+    /// The scroll survives because the model is replaced in one `set_vec`
+    /// and never passes through empty: `viewport-height` is a function of
+    /// `items.length` (`library.slint`), so a model that empties for even an
+    /// instant collapses the viewport and Slint clamps `viewport-y` to zero.
+    /// Measured, not assumed — a swap of equal length leaves the offset
+    /// untouched, and a shorter list clamps to its new end, which is the only
+    /// thing it could do.
+    ///
+    /// An empty grid has none of that to protect and takes the simple path —
+    /// which is also the case that matters most, since a library that came
+    /// up empty is exactly the one an import is about to fill.
+    pub fn refresh(&self) {
+        let loaded = self.records.borrow().len();
+        if loaded == 0 {
+            let query = self.query.borrow().clone();
+            self.load(query);
+            notify_reloaded();
+            return;
+        }
+
+        // A new generation, for the same reason `load` takes one: any page
+        // still in flight assumed a row count this is about to change, and
+        // `append_page` would refuse it and stop paging. Orphaning it costs
+        // one re-fetch — `want` is untouched, so `fetch_next_page` at the end
+        // of `apply_refresh` asks for it again.
+        let gen = self.generation.get() + 1;
+        self.generation.set(gen);
+        *self.timer.borrow_mut() = None;
+        self.polling.set(false);
+        self.active_pages.set(0);
+
+        let (tx, rx) = mpsc::channel::<GridMsg>();
+        *self.tx.borrow_mut() = Some(tx.clone());
+        *self.rx.borrow_mut() = Some(rx);
+
+        let query = self.query.borrow().clone().with_limit(loaded).with_offset(0);
+        let db = self.db.clone();
+        self.active_pages.set(1);
+        tracing::debug!("library refresh: re-reading {loaded} rows");
+
+        std::thread::spawn(move || {
+            let records = search_library(&db, &query);
+            let _ = tx.send(GridMsg::Total(count_library(&db, &query)));
+            let _ = tx.send(GridMsg::Refresh { records, asked_for: loaded });
+            let _ = tx.send(GridMsg::PageDone);
+        });
+
+        self.start_poller(gen);
+    }
+
+    /// Reconcile freshly-read rows against what is on screen.
+    fn apply_refresh(&self, fresh: Vec<LibraryImage>, asked_for: usize) {
+        if !self.rows_differ(&fresh) {
+            // The overwhelmingly common case — a scan that changed something
+            // elsewhere in the library, or a sync pass that merged metadata
+            // for rows below the fold. Touch nothing: no model reset, no
+            // re-decode, no repaint.
+            self.cursor.borrow_mut().refreshed(fresh.len(), asked_for);
+            self.fetch_next_page();
+            return;
+        }
+
+        // Index every tile that is already decoded by the row it belongs to,
+        // so a photo that has not changed keeps its pixels. Keyed on the
+        // content hash as well as the id: a rotation keeps the id and mints a
+        // new hash, and reusing the tile there would show the old orientation
+        // until the next navigation.
+        let mut decoded: HashMap<(i64, Option<[u8; 32]>), ThumbItem> = HashMap::new();
+        for (index, old) in self.records.borrow().iter().enumerate() {
+            if let Some(item) = self.model.row_data(index) {
+                decoded.insert((old.id, old.hash), item);
+            }
+        }
+
+        let pending = self.pending_membership.borrow().clone();
+        let mut items = Vec::with_capacity(fresh.len());
+        let mut undecoded: Vec<(usize, LibraryImage)> = Vec::new();
+        for (index, rec) in fresh.iter().enumerate() {
+            let selected = pending
+                .as_ref()
+                .map(|set| set.contains(&rec.id))
+                .unwrap_or_else(|| {
+                    decoded.get(&(rec.id, rec.hash)).is_some_and(|item| item.selected)
+                });
+            match decoded.remove(&(rec.id, rec.hash)) {
+                // The caption, stack size and search score come from the row
+                // and may well have changed; only the pixels are carried.
+                Some(old) if old.loaded => {
+                    let mut item = placeholder_item(rec, selected);
+                    item.image = old.image;
+                    item.loaded = true;
+                    items.push(item);
+                }
+                Some(old) => {
+                    let mut item = placeholder_item(rec, selected);
+                    item.unsupported = old.unsupported;
+                    if !item.unsupported {
+                        undecoded.push((index, rec.clone()));
+                    }
+                    items.push(item);
+                }
+                None => {
+                    items.push(placeholder_item(rec, selected));
+                    undecoded.push((index, rec.clone()));
+                }
+            }
+        }
+        drop(pending);
+
+        let mut groups: Vec<DateGroup> = Vec::new();
+        append_date_groups(&mut groups, &fresh, 0);
+
+        let len = fresh.len();
+        *self.records.borrow_mut() = fresh;
+        // One `set_vec`, never a clear followed by a fill: an intermediate
+        // empty model collapses the view's viewport and loses the scroll.
+        self.model.set_vec(items);
+        sync_date_groups(&self.date_groups, &groups);
+        self.cursor.borrow_mut().refreshed(len, asked_for);
+
+        self.spawn_thumbs(undecoded);
+        self.fetch_next_page();
+        notify_reloaded();
+    }
+
+    /// Whether the freshly-read rows differ from what is displayed in any way
+    /// the grid renders.
+    ///
+    /// Compared field by field rather than by row count alone: a photo
+    /// deleted and another imported between two scans leaves the count
+    /// identical and every tile wrong.
+    fn rows_differ(&self, fresh: &[LibraryImage]) -> bool {
+        let records = self.records.borrow();
+        records.len() != fresh.len()
+            || records.iter().zip(fresh).any(|(old, new)| !same_tile(old, new))
+    }
+
+    /// Decode thumbnails for rows that have none, at their new indices.
+    fn spawn_thumbs(&self, work: Vec<(usize, LibraryImage)>) {
+        if work.is_empty() {
+            return;
+        }
+        let Some(tx) = self.tx.borrow().clone() else {
+            return;
+        };
+        let gen = self.generation.get();
+        let cache = self.cache.clone();
+        let quality = self.quality;
+        let thumb_px = self.thumb_px.get();
+
+        self.active_pages.set(self.active_pages.get() + 1);
+        std::thread::spawn(move || {
+            decode_thumbs(&tx, &work, thumb_px, quality, &cache);
+            let _ = tx.send(GridMsg::PageDone);
+        });
+        self.start_poller(gen);
+    }
+
     /// Ask the grid to have at least `rows` items loaded.
     ///
     /// Called from the view as it scrolls, with the item index the viewport
@@ -310,55 +511,17 @@ impl LibraryGrid {
             if with_total {
                 let _ = tx.send(GridMsg::Total(count_library(&db, &query)));
             }
-            let page_len = records.len();
             let _ = tx.send(GridMsg::Page { offset, records: records.clone() });
 
-            if page_len > 0 {
-                let parallelism =
-                    std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
-                let chunk_size = (page_len / parallelism).max(1);
-
-                let blobs = crate::remote::blobs();
-                std::thread::scope(|scope| {
-                    for (chunk_index, chunk) in records.chunks(chunk_size).enumerate() {
-                        let tx = tx.clone();
-                        let cache = cache.clone();
-                        let blobs = blobs.clone();
-                        scope.spawn(move || {
-                            for (i, rec) in chunk.iter().enumerate() {
-                                // Absolute row index: this page starts at
-                                // `offset` in the accumulated grid.
-                                let index = offset + chunk_index * chunk_size + i;
-                                match load_thumbnail(rec, thumb_px, quality, &cache, &blobs) {
-                                    Ok((rgb, width, height)) => {
-                                        let _ =
-                                            tx.send(GridMsg::Thumb { index, rgb, width, height });
-                                    }
-                                    Err(e) => {
-                                        tracing::warn!(
-                                            "Thumbnail failed for {}: {e}",
-                                            rec.path.display()
-                                        );
-                                        // A remote miss is transient — the
-                                        // master may be asleep, or the hash
-                                        // may have moved under a rotation —
-                                        // so the tile keeps its placeholder
-                                        // and the next load tries again.
-                                        // "Unsupported" is permanent, and
-                                        // claiming it here would be a lie the
-                                        // user cannot clear.
-                                        if !rec.locality.is_remote()
-                                            && !raw_preview_supported(&rec.path)
-                                        {
-                                            let _ = tx.send(GridMsg::Unsupported { index });
-                                        }
-                                    }
-                                }
-                            }
-                        });
-                    }
-                });
-            }
+            // A page is contiguous, so its absolute row indices are just the
+            // offset plus the position. A refresh's are not, which is why
+            // `decode_thumbs` takes them explicitly.
+            let work: Vec<(usize, LibraryImage)> = records
+                .into_iter()
+                .enumerate()
+                .map(|(i, rec)| (offset + i, rec))
+                .collect();
+            decode_thumbs(&tx, &work, thumb_px, quality, &cache);
 
             let _ = tx.send(GridMsg::PageDone);
         });
@@ -394,6 +557,9 @@ impl LibraryGrid {
                 };
                 match msg {
                     GridMsg::Page { offset, records } => grid.append_page(offset, records),
+                    GridMsg::Refresh { records, asked_for } => {
+                        grid.apply_refresh(records, asked_for)
+                    }
                     GridMsg::Total(total) => grid.report_total(total),
                     GridMsg::Thumb { index, rgb, width, height } => {
                         if let Some(mut item) = grid.model.row_data(index) {
@@ -672,6 +838,73 @@ fn sync_date_groups(model: &VecModel<DateGroup>, new: &[DateGroup]) {
 }
 
 /// Build the initial placeholder tile for a record (image filled in later).
+/// Decode thumbnails for `work` — `(absolute row index, record)` — in
+/// parallel, streaming each one back as it finishes.
+///
+/// Shared by page loading and in-place refresh. They differ only in whether
+/// the indices are contiguous, so the indices are carried rather than
+/// derived; letting each caller compute them separately is how a refresh
+/// would end up painting a photo onto the wrong tile.
+fn decode_thumbs(
+    tx: &mpsc::Sender<GridMsg>,
+    work: &[(usize, LibraryImage)],
+    thumb_px: u32,
+    quality: u8,
+    cache: &Arc<ThumbnailCache>,
+) {
+    if work.is_empty() {
+        return;
+    }
+    let parallelism = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
+    let chunk_size = (work.len() / parallelism).max(1);
+
+    let blobs = crate::remote::blobs();
+    std::thread::scope(|scope| {
+        for chunk in work.chunks(chunk_size) {
+            let tx = tx.clone();
+            let cache = cache.clone();
+            let blobs = blobs.clone();
+            scope.spawn(move || {
+                for (index, rec) in chunk {
+                    let index = *index;
+                    match load_thumbnail(rec, thumb_px, quality, &cache, &blobs) {
+                        Ok((rgb, width, height)) => {
+                            let _ = tx.send(GridMsg::Thumb { index, rgb, width, height });
+                        }
+                        Err(e) => {
+                            tracing::warn!("Thumbnail failed for {}: {e}", rec.path.display());
+                            // A remote miss is transient — the master may be
+                            // asleep, or the hash may have moved under a
+                            // rotation — so the tile keeps its placeholder and
+                            // the next load tries again. "Unsupported" is
+                            // permanent, and claiming it here would be a lie
+                            // the user cannot clear.
+                            if !rec.locality.is_remote() && !raw_preview_supported(&rec.path) {
+                                let _ = tx.send(GridMsg::Unsupported { index });
+                            }
+                        }
+                    }
+                }
+            });
+        }
+    });
+}
+
+/// Whether two readings of the same row would draw the same tile.
+///
+/// Everything the tile shows, and nothing else: a `taken_at` that changed
+/// without moving the row, or a peer's `rev` bump, is not a repaint. The
+/// hash is in because it keys the thumbnail — a rotation changes it and the
+/// old pixels are then wrong.
+fn same_tile(old: &LibraryImage, new: &LibraryImage) -> bool {
+    old.id == new.id
+        && old.hash == new.hash
+        && old.status == new.status
+        && old.locality == new.locality
+        && old.meta.filename == new.meta.filename
+        && old.stack_size == new.stack_size
+}
+
 fn placeholder_item(rec: &LibraryImage, selected: bool) -> ThumbItem {
     ThumbItem {
         id: rec.id as i32,
@@ -748,4 +981,89 @@ fn load_thumbnail(
     }
 
     Ok((rgb, w, h))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use maple_db::{ImageStatus, Locality};
+
+    fn row(id: i64, name: &str) -> LibraryImage {
+        LibraryImage {
+            id,
+            path: format!("/photos/{name}").into(),
+            raw_path: None,
+            added_at: 0,
+            status: ImageStatus::Present,
+            meta: maple_db::ImageMetadata {
+                filename: Some(name.to_owned()),
+                ..Default::default()
+            },
+            hash: Some([1u8; 32]),
+            stack_id: None,
+            stack_size: None,
+            search_hit: None,
+            locality: Locality::Local,
+            origin_device: None,
+        }
+    }
+
+    #[test]
+    fn a_row_that_did_not_change_keeps_its_tile() {
+        // The common case by far: the scanner runs every minute and finds
+        // nothing. Repainting the grid on that schedule would be worse than
+        // never refreshing it at all.
+        let before = row(1, "a.jpg");
+        let mut after = row(1, "a.jpg");
+        // Things the tile does not show may move freely.
+        after.added_at = 99;
+        after.meta.taken_at = Some(1_700_000_000);
+        assert!(same_tile(&before, &after));
+    }
+
+    #[test]
+    fn a_rotation_invalidates_the_thumbnail_it_had() {
+        // Same row, new content hash — the decoded pixels show the old
+        // orientation and must not be carried across.
+        let before = row(1, "a.jpg");
+        let mut after = row(1, "a.jpg");
+        after.hash = Some([2u8; 32]);
+        assert!(!same_tile(&before, &after));
+    }
+
+    #[test]
+    fn a_photo_that_went_missing_or_remote_redraws() {
+        let before = row(1, "a.jpg");
+
+        let mut gone = row(1, "a.jpg");
+        gone.status = ImageStatus::Missing;
+        assert!(!same_tile(&before, &gone));
+
+        let mut relayed = row(1, "a.jpg");
+        relayed.locality = Locality::Remote;
+        assert!(
+            !same_tile(&before, &relayed),
+            "its pixels come from somewhere else now"
+        );
+    }
+
+    #[test]
+    fn a_renamed_photo_redraws_its_caption() {
+        let before = row(1, "a.jpg");
+        let after = row(1, "20240315_a.jpg");
+        assert!(!same_tile(&before, &after));
+    }
+
+    #[test]
+    fn a_swap_that_keeps_the_count_is_still_a_change() {
+        // One photo deleted and another imported between two scans leaves the
+        // row count identical and every tile below it wrong, which is why the
+        // comparison is row by row rather than a length check.
+        let before = [row(1, "a.jpg"), row(2, "b.jpg")];
+        let after = [row(1, "a.jpg"), row(3, "c.jpg")];
+        assert!(before
+            .iter()
+            .zip(after.iter())
+            .any(|(old, new)| !same_tile(old, new)));
+    }
 }

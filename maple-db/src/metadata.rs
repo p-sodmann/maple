@@ -260,7 +260,12 @@ fn gps_decimal_degrees(exif: &exif::Exif, val_tag: Tag, ref_tag: Tag) -> Option<
 /// library records where `filename IS NULL` (not yet processed).
 ///
 /// Safe to call multiple times — only unprocessed records are touched.
-pub fn spawn_metadata_filler(db: Arc<Mutex<Database>>) {
+///
+/// `on_change` runs once at the end, and only if there was anything to fill.
+/// `taken_at` is what the date view groups and sorts by, so a batch that
+/// finishes without saying so leaves freshly imported photos sitting under
+/// the wrong day until something else reloads the grid.
+pub fn spawn_metadata_filler(db: Arc<Mutex<Database>>, on_change: Option<crate::LibraryChanged>) {
     std::thread::Builder::new()
         .name("maple-metadata-filler".into())
         .spawn(move || {
@@ -288,6 +293,9 @@ pub fn spawn_metadata_filler(db: Arc<Mutex<Database>>) {
             }
 
             tracing::info!("Metadata filler: done");
+            if let Some(hook) = on_change {
+                hook();
+            }
         })
         .ok();
 }

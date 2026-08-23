@@ -1004,8 +1004,15 @@ fn finish_copy(
             .collect()
     };
     insert_imported_images(&ctx.db, &to_insert, &run.algorithm_key);
-    // Backfill EXIF for the records just inserted.
-    maple_db::spawn_metadata_filler(ctx.db.clone());
+    // Backfill EXIF for the records just inserted, and refresh the library
+    // grid once it has: an import is the one moment the user is *expecting*
+    // new photos to appear, and until now they only did on the next scan.
+    maple_db::spawn_metadata_filler(
+        ctx.db.clone(),
+        Some(Arc::new(|| {
+            let _ = slint::invoke_from_event_loop(crate::grid::request_reload);
+        })),
+    );
     ctx.selected.borrow_mut().clear();
     w.set_selected_count(0);
     w.set_copying(false);
