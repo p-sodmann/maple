@@ -120,6 +120,12 @@ pub struct SyncClient {
 }
 
 impl SyncClient {
+    /// The URL this client dials, for a message that has to name it. Not the
+    /// `host:port` it was built from — that is the caller's to remember.
+    pub fn address(&self) -> &str {
+        &self.base
+    }
+
     /// `address` is `host:port`; the scheme is added here because there is
     /// only one — the transport is plain HTTP by design (§2.2), and letting a
     /// caller pass `https://` would promise a confidentiality this protocol

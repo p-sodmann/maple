@@ -20,6 +20,16 @@
 //! through an `mpsc` channel that [`PairingController::tick`] drains — the
 //! same shape as every other background job in this crate.
 //!
+//! # The pick-list is a shortcut, not a decision
+//!
+//! Since P8 a servant is shown the masters mDNS found (§2.4). Choosing one
+//! fills in the address field and nothing else: the handshake that follows
+//! is byte-for-byte the one a typed address gets, with the same two codes
+//! and the same proof. A record is unauthenticated hearsay — see
+//! [`maple_sync::discovery`] — so the list can only save typing, never
+//! establish trust. The field stays editable underneath it, because plenty
+//! of networks block multicast.
+//!
 //! # What "abort" has to mean
 //!
 //! When the three minutes run out or five wrong codes arrive, both codes are
@@ -32,6 +42,7 @@ use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use maple_sync::discovery::DeviceSource;
 use maple_sync::pairing::{PairError, PairOutcome, MAX_ATTEMPTS};
 use maple_sync::{
     Clock, Initiator, PairCode, PairingSlot, RandomSource, SharedRandom, SyncClient,
@@ -82,6 +93,17 @@ impl PairingEnd {
     }
 }
 
+/// One row of the discovered-devices pick-list.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeviceChoice {
+    /// `Studio · 192.168.1.20:7645`, or with a `needs updating` tail.
+    pub label: String,
+    /// What choosing it writes into the address field.
+    pub address: String,
+    /// Whether the address field currently holds exactly this.
+    pub chosen: bool,
+}
+
 /// Everything the modal renders, recomputed on each tick.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct PairingView {
@@ -97,6 +119,10 @@ pub struct PairingView {
     pub can_submit: bool,
     /// Whether the address field is shown and required.
     pub needs_address: bool,
+    /// Masters mDNS has found, best-named first. Always empty on the master
+    /// side, which dials nobody, and empty on a network with no discovery —
+    /// in both cases the modal simply shows no list.
+    pub devices: Vec<DeviceChoice>,
     /// Whether the modal should be on screen at all.
     pub open: bool,
 }
@@ -126,6 +152,9 @@ pub struct PairingDeps {
     pub side: PairingSide,
     pub clock: Clock,
     pub rng: SharedRandom,
+    /// Where the pick-list comes from. `None` is a working modal with a
+    /// typed address, which is what every pairing did before P8.
+    pub discovery: Option<Arc<dyn DeviceSource>>,
 }
 
 /// Drives one pairing modal.
@@ -140,6 +169,9 @@ pub struct PairingController {
     /// Set once the peer's code has been committed.
     submitted: bool,
     side: PairingSide,
+    /// Taken from the deps at `open`, because the modal outlives the call
+    /// that built them and the list is re-read on every tick.
+    discovery: Option<Arc<dyn DeviceSource>>,
     driver: Option<ClaimDriver>,
     ended: Option<PairingEnd>,
     /// A completed pairing waiting for the caller to persist. Servant side
@@ -157,6 +189,7 @@ impl PairingController {
             address: String::new(),
             submitted: false,
             side: PairingSide::Master,
+            discovery: None,
             driver: None,
             ended: None,
             outcome: None,
@@ -177,6 +210,7 @@ impl PairingController {
         self.entered.clear();
         self.submitted = false;
         self.side = deps.side;
+        self.discovery = deps.discovery.clone();
         self.driver = None;
         self.ended = None;
         self.outcome = None;
@@ -208,6 +242,38 @@ impl PairingController {
         if !self.submitted {
             self.address = address.trim().to_owned();
         }
+    }
+
+    /// Take one of the discovered devices as the address to dial.
+    ///
+    /// Deliberately the same path as typing: it fills the field the user can
+    /// still edit, rather than remembering a chosen device separately. One
+    /// address, one place it lives, and the modal keeps working identically
+    /// on a network where nothing is ever discovered.
+    pub fn choose_device(&mut self, address: &str) {
+        self.set_address(address);
+    }
+
+    /// The pick-list, and which row matches the current address.
+    fn device_choices(&self) -> Vec<DeviceChoice> {
+        if self.side != PairingSide::Servant {
+            return Vec::new();
+        }
+        let Some(discovery) = self.discovery.as_ref() else {
+            return Vec::new();
+        };
+        discovery
+            .devices()
+            .into_iter()
+            .filter_map(|device| {
+                let address = device.address()?.to_owned();
+                Some(DeviceChoice {
+                    label: device.label(),
+                    chosen: address == self.address,
+                    address,
+                })
+            })
+            .collect()
     }
 
     /// Close by user request.
@@ -312,6 +378,7 @@ impl PairingController {
                 && self.entered.len() == 6
                 && (self.side == PairingSide::Master || !self.address.is_empty()),
             needs_address: self.side == PairingSide::Servant,
+            devices: self.device_choices(),
             open: true,
         }
     }
@@ -519,6 +586,7 @@ mod tests {
             side,
             clock: Arc::new(|| T0),
             rng: seeded(1),
+            discovery: None,
         }
     }
 
@@ -603,7 +671,7 @@ mod tests {
     #[test]
     fn a_servant_cannot_submit_without_an_address() {
         // It is the side that dials, and §1.2's modal has nowhere to dial to
-        // until mDNS lands in P8.
+        // until an address is picked or typed.
         let slot = PairingSlot::new();
         let mut c = PairingController::new(slot);
         let deps = deps(PairingSide::Servant);
@@ -616,6 +684,109 @@ mod tests {
         c.set_address("  192.168.1.20:7645 ");
         assert_eq!(c.address(), "192.168.1.20:7645", "trimmed");
         assert!(c.tick(T0).can_submit);
+    }
+
+    /// A stand-in for the mDNS browser.
+    struct FakeDiscovery(Vec<maple_sync::DiscoveredDevice>);
+
+    impl DeviceSource for FakeDiscovery {
+        fn devices(&self) -> Vec<maple_sync::DiscoveredDevice> {
+            self.0.clone()
+        }
+    }
+
+    fn found(name: &str, address: &str) -> maple_sync::DiscoveredDevice {
+        maple_sync::DiscoveredDevice {
+            device_id: format!("dev-{name}"),
+            name: name.to_owned(),
+            protocol: maple_sync::PROTOCOL_VERSION,
+            addresses: if address.is_empty() {
+                Vec::new()
+            } else {
+                vec![address.to_owned()]
+            },
+        }
+    }
+
+    fn servant_with(devices: Vec<maple_sync::DiscoveredDevice>) -> (PairingController, PairingDeps) {
+        let mut deps = deps(PairingSide::Servant);
+        deps.discovery = Some(Arc::new(FakeDiscovery(devices)));
+        let mut c = PairingController::new(PairingSlot::new());
+        c.open(&deps, T0).unwrap();
+        (c, deps)
+    }
+
+    #[test]
+    fn choosing_a_discovered_device_fills_in_the_address() {
+        // The whole point of §2.4 from the user's side: two clicks instead of
+        // an IP address read off another screen.
+        let (mut c, deps) = servant_with(vec![
+            found("Studio", "192.168.1.20:7645"),
+            found("Attic", "192.168.1.31:7645"),
+        ]);
+        c.set_entered("482107");
+
+        let view = c.tick(T0);
+        assert_eq!(view.devices.len(), 2);
+        assert!(view.devices.iter().all(|d| !d.chosen), "nothing picked yet");
+        assert!(!view.can_submit, "a servant still needs somewhere to dial");
+
+        c.choose_device("192.168.1.31:7645");
+        let view = c.tick(T0);
+        assert_eq!(c.address(), "192.168.1.31:7645");
+        assert!(view.can_submit);
+        assert_eq!(
+            view.devices.iter().filter(|d| d.chosen).map(|d| d.label.as_str()).collect::<Vec<_>>(),
+            vec!["Attic · 192.168.1.31:7645"],
+            "exactly the picked row is ticked"
+        );
+
+        // And a picked address is still just an address: typing over it wins,
+        // which is what keeps the modal usable where multicast is blocked.
+        c.set_address("10.0.0.9:7645");
+        let view = c.tick(T0);
+        assert!(view.devices.iter().all(|d| !d.chosen));
+        assert!(view.can_submit);
+        let _ = deps;
+    }
+
+    #[test]
+    fn a_device_with_no_reachable_address_is_not_offered() {
+        // Its record resolved without a usable address — link-local IPv6
+        // only, say. Listing it would offer a row that cannot be picked.
+        let (mut c, _deps) = servant_with(vec![found("Ghost", "")]);
+        assert!(c.tick(T0).devices.is_empty());
+    }
+
+    #[test]
+    fn a_master_is_offered_no_devices_at_all() {
+        // It is claimed, not claiming. A pick-list on this side would invite
+        // the user to dial a device that is about to dial them.
+        let mut deps = deps(PairingSide::Master);
+        deps.discovery = Some(Arc::new(FakeDiscovery(vec![found(
+            "Studio",
+            "192.168.1.20:7645",
+        )])));
+        let mut c = PairingController::new(PairingSlot::new());
+        c.open(&deps, T0).unwrap();
+
+        let view = c.tick(T0);
+        assert!(view.devices.is_empty());
+        assert!(!view.needs_address);
+    }
+
+    #[test]
+    fn a_committed_pairing_ignores_a_later_pick() {
+        // The secret is already derived from the code and the claim is in
+        // flight; quietly repointing it at another machine would produce a
+        // failure nobody could explain.
+        let (mut c, deps) = servant_with(vec![found("Studio", "192.168.1.20:7645")]);
+        c.set_entered("482107");
+        c.choose_device("192.168.1.20:7645");
+        c.submit(&deps, T0).unwrap();
+
+        c.choose_device("10.0.0.9:7645");
+        assert_eq!(c.address(), "192.168.1.20:7645");
     }
 
     #[test]

@@ -82,6 +82,14 @@ ureq = { version = "3", features = ["json"] }
 # the architecture the rest of the workspace commits to.
 tiny_http = "0.12"
 
+# mDNS service discovery for the sync master (§2.4). Chosen for what its own
+# tagline says: no async runtime dependency, so it fits the std::thread model
+# the rest of the workspace uses instead of dragging tokio in through a side
+# door. default-features = false drops its `async` (flume/async) and `log`
+# features — the daemon is driven from a blocking recv_timeout, and this
+# workspace logs through tracing.
+mdns-sd = { version = "0.21", default-features = false }
+
 # Thumbnail cache
 redb = "4"
 webp = "0.3"

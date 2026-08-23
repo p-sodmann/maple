@@ -5,6 +5,15 @@ import { ScrollView, LineEdit } from "std-widgets.slint";
 // One paired device, as the Sync card renders it. `mode` and `last-seen` are
 // pre-formatted in Rust — the markup holds presentation, never the mapping
 // from a stored `'relay'` to the word the user reads.
+// One master mDNS turned up while the pairing modal is open. `address` is
+// what choosing the row writes into the address field; `chosen` is whether
+// the field already holds exactly that.
+export struct PairingDeviceItem {
+    label: string,
+    address: string,
+    chosen: bool,
+}
+
 export struct SyncPeerItem {
     device-id: string,
     name: string,
@@ -147,6 +156,47 @@ component RoleOption inherits Rectangle {
 
 // One paired device: status dot, name, click-to-cycle file mode, last seen,
 // and an unpair button.
+// A row in the pairing modal's discovered-devices list. Selection is shown
+// by the border and the tick rather than by filling the row, so a list of
+// three does not read as three buttons.
+component DiscoveredDeviceRow inherits Rectangle {
+    in property <PairingDeviceItem> device;
+    callback chosen;
+
+    height: 32px;
+    border-radius: 8px;
+    border-width: 1px;
+    border-color: root.device.chosen ? Theme.accent : Theme.border;
+    background: row-ta.has-hover ? Theme.field : Theme.surface;
+    animate background { duration: 100ms; }
+
+    row-ta := TouchArea {
+        clicked => { root.chosen(); }
+    }
+
+    HorizontalLayout {
+        padding-left: 10px;
+        padding-right: 10px;
+        spacing: 8px;
+
+        Text {
+            text: root.device.label;
+            color: root.device.chosen ? Theme.ink : Theme.ink-2;
+            font-size: 12px;
+            vertical-alignment: center;
+            horizontal-stretch: 1;
+            overflow: elide;
+        }
+        Text {
+            text: root.device.chosen ? "✓" : "";
+            color: Theme.accent;
+            font-size: 12px;
+            vertical-alignment: center;
+            horizontal-stretch: 0;
+        }
+    }
+}
+
 component SyncPeerRow inherits Rectangle {
     in property <SyncPeerItem> peer;
     callback mode-cycled;
@@ -271,8 +321,10 @@ export component SettingsWindow inherits Window {
     in property <string>     pairing-message:   "";
     in property <bool>       pairing-can-submit: false;
     // Only a servant dials, so only a servant needs somewhere to dial to.
-    // Until mDNS lands in P8 this is typed by hand.
+    // The address can be picked from `pairing-devices` (mDNS, §2.4) or typed
+    // — the field stays editable, because plenty of networks block multicast.
     in property <bool>       pairing-needs-address: false;
+    in property <[PairingDeviceItem]> pairing-devices: [];
 
     callback close-requested;
     callback sync-role-selected(string);
@@ -282,6 +334,7 @@ export component SettingsWindow inherits Window {
     callback pairing-begin;
     callback pairing-code-edited(string);
     callback pairing-address-edited(string);
+    callback pairing-device-chosen(string);
     callback pairing-submit;
     callback pairing-cancel;
     callback clear-ai-descriptions;
@@ -799,8 +852,22 @@ export component SettingsWindow inherits Window {
                         font-size: 11.5px;
                     }
 
+                    if root.pairing-needs-address && root.pairing-devices.length > 0: Text {
+                        text: "Masters on this network";
+                        color: Theme.ink-2;
+                        font-size: 12px;
+                        font-weight: 500;
+                    }
+                    if root.pairing-needs-address && root.pairing-devices.length > 0: VerticalLayout {
+                        spacing: 6px;
+                        for device in root.pairing-devices: DiscoveredDeviceRow {
+                            device: device;
+                            chosen => { root.pairing-device-chosen(device.address); }
+                        }
+                    }
+
                     if root.pairing-needs-address: Text {
-                        text: "Master address";
+                        text: root.pairing-devices.length > 0 ? "…or type the address" : "Master address";
                         color: Theme.ink-2;
                         font-size: 12px;
                         font-weight: 500;

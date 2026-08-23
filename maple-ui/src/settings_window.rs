@@ -27,7 +27,7 @@ use maple_sync::TrustedPeer;
 use crate::services::settings as settings_service;
 use crate::sync_pairing::{PairingController, PairingDeps, PairingSide};
 use crate::sync_supervisor::SyncSupervisor;
-use crate::{SettingsWindow, SyncPeerItem};
+use crate::{PairingDeviceItem, SettingsWindow, SyncPeerItem};
 
 /// How often the pairing modal's countdown refreshes.
 const PAIRING_TICK: Duration = Duration::from_secs(1);
@@ -378,6 +378,20 @@ fn wire_sync(
         }
     });
 
+    window.on_pairing_device_chosen({
+        let w = window.as_weak();
+        let pairing = pairing.clone();
+        move |address| {
+            let Some(w) = w.upgrade() else { return };
+            pairing.borrow_mut().choose_device(&address);
+            // Written back into the field as well, because the field is the
+            // single source of truth for what gets dialled — see
+            // `PairingController::choose_device`.
+            w.set_pairing_address(address);
+            refresh_pairing(&w, &pairing);
+        }
+    });
+
     window.on_pairing_submit({
         let w = window.as_weak();
         let db = db.clone();
@@ -442,6 +456,14 @@ fn pairing_deps(db: &Arc<Mutex<maple_db::Database>>, sync: &Rc<SyncSupervisor>) 
         },
         clock: sync.clock(),
         rng: sync.rng(),
+        // Starts a browse the first time a servant-side modal opens, and
+        // hands the master side `None` — a master is claimed, it dials
+        // nobody, and a listener browsing for itself is noise.
+        discovery: if role == SyncRole::Master {
+            None
+        } else {
+            sync.discovery()
+        },
     }
 }
 
@@ -604,6 +626,18 @@ fn refresh_pairing(window: &SettingsWindow, pairing: &Rc<RefCell<PairingControll
     window.set_pairing_message(SharedString::from(view.message));
     window.set_pairing_can_submit(view.can_submit);
     window.set_pairing_needs_address(view.needs_address);
+    let devices: Vec<PairingDeviceItem> = view
+        .devices
+        .into_iter()
+        .map(|device| PairingDeviceItem {
+            label: SharedString::from(device.label),
+            address: SharedString::from(device.address),
+            chosen: device.chosen,
+        })
+        .collect();
+    // Replaced wholesale each tick: mDNS answers trickle in over the first
+    // few seconds a modal is open, and the list is three rows at most.
+    window.set_pairing_devices(slint::ModelRc::new(slint::VecModel::from(devices)));
     if window.get_pairing_entered().as_str() != view.entered {
         window.set_pairing_entered(SharedString::from(view.entered));
     }

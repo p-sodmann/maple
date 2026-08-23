@@ -14,6 +14,17 @@
 //! [`SyncSupervisor::restart`] is the single funnel for all of them, so no
 //! call site has to work out which parts to tear down.
 //!
+//! # Discovery
+//!
+//! The two mDNS halves have opposite lifetimes, so they are owned here
+//! rather than started once at boot. A **master** advertises only while its
+//! listener is up, and only after it is up — the record has to carry the
+//! port the listener actually bound, which `listen_addr` need not name. A
+//! **servant** browses for as long as it is a servant, because the worker
+//! re-resolves on every failed pass; a device that is Off or a master keeps
+//! no browser, except for the one the pairing modal starts on demand, which
+//! the next `restart` clears.
+//!
 //! # Threading
 //!
 //! Lives on the UI thread and is not `Send`. The handles it owns each carry
@@ -28,6 +39,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use maple_state::SyncRole;
+use maple_sync::discovery::{Advertiser, Browser, DeviceSource};
 use maple_sync::server::{ServerConfig, ServerDeps, ThumbRenderer};
 use maple_sync::worker::{WorkerConfig, WorkerDeps};
 use maple_sync::{
@@ -51,6 +63,13 @@ pub struct SyncSupervisor {
     rng: SharedRandom,
     server: RefCell<Option<SyncServer>>,
     worker: RefCell<Option<SyncWorker>>,
+    /// The master's mDNS registration. Alive exactly as long as the listener
+    /// it names.
+    advertiser: RefCell<Option<Advertiser>>,
+    /// The servant's mDNS browse. Started on demand by [`Self::discovery`],
+    /// because a master never needs one and an `Off` device needs one only
+    /// while its pairing modal is open.
+    browser: RefCell<Option<Arc<Browser>>>,
     /// The master's own thumbnail store, so a servant's `/blob/thumb` request
     /// is answered from cache when the master has already rendered it.
     thumbs: Arc<maple_db::ThumbnailCache>,
@@ -86,6 +105,8 @@ impl SyncSupervisor {
             rng,
             server: RefCell::new(None),
             worker: RefCell::new(None),
+            advertiser: RefCell::new(None),
+            browser: RefCell::new(None),
             thumbs,
             thumb_px,
             thumb_quality,
@@ -117,6 +138,9 @@ impl SyncSupervisor {
     pub fn restart(self: &Rc<Self>) {
         *self.worker.borrow_mut() = None;
         *self.server.borrow_mut() = None;
+        // Dropped before the listener is rebuilt, so no window exists where
+        // a record points at a port nothing answers on.
+        *self.advertiser.borrow_mut() = None;
         // Cleared unconditionally, then re-set below only if this device is
         // still a servant with a paired master. Leaving a stale client in
         // place would have every remote thumbnail keep dialling a device we
@@ -129,6 +153,13 @@ impl SyncSupervisor {
             db.sync_role().unwrap_or(SyncRole::Off)
         };
 
+        // A browse is only ever useful to a servant. Dropping it here also
+        // reaps the one a pairing modal started on a device that has since
+        // become a master.
+        if role != SyncRole::Servant {
+            *self.browser.borrow_mut() = None;
+        }
+
         match role {
             SyncRole::Off => {
                 set_status(&self.status, SyncStatus::for_role(SyncRole::Off));
@@ -138,10 +169,35 @@ impl SyncSupervisor {
         }
     }
 
+    /// The device list the pairing modal and the sync worker read.
+    ///
+    /// Starts a browse on first use and keeps it: mDNS answers arrive over
+    /// the following seconds, so a browser created per lookup would report
+    /// an empty network every time. A failure to start is logged once and
+    /// then simply means no discovery — every caller treats `None` as "type
+    /// the address by hand", which is the documented fallback (§2.4).
+    pub fn discovery(&self) -> Option<Arc<dyn DeviceSource>> {
+        if self.browser.borrow().is_none() {
+            match Browser::start() {
+                Ok(browser) => *self.browser.borrow_mut() = Some(Arc::new(browser)),
+                Err(e) => {
+                    tracing::warn!("sync: mDNS discovery unavailable: {e}");
+                    return None;
+                }
+            }
+        }
+        self.browser
+            .borrow()
+            .as_ref()
+            .map(|browser| browser.clone() as Arc<dyn DeviceSource>)
+    }
+
     /// Stop everything. Called when the app closes.
     pub fn stop(&self) {
         *self.worker.borrow_mut() = None;
         *self.server.borrow_mut() = None;
+        *self.advertiser.borrow_mut() = None;
+        *self.browser.borrow_mut() = None;
         self.blobs.clear();
     }
 
@@ -173,6 +229,7 @@ impl SyncSupervisor {
         match result {
             Ok(server) => {
                 tracing::info!("sync: listening on {}", server.local_addr());
+                self.advertise(server.local_addr().port());
                 *self.server.borrow_mut() = Some(server);
             }
             Err(e) => {
@@ -184,6 +241,25 @@ impl SyncSupervisor {
                 status.last_error = Some(e.to_string());
                 set_status(&self.status, status);
             }
+        }
+    }
+
+    /// Publish this master's `_maple-sync._tcp` record.
+    ///
+    /// Not fatal if it fails: a servant that already knows the address keeps
+    /// working, and one that does not can still be given it by hand. The
+    /// listener is the feature; discovery is how it gets found.
+    fn advertise(&self, port: u16) {
+        let (device_id, name) = {
+            let db = maple_db::lock_db(&self.db);
+            (
+                db.device_id().to_owned(),
+                db.device_name().unwrap_or_default(),
+            )
+        };
+        match Advertiser::start(&device_id, &name, port) {
+            Ok(advertiser) => *self.advertiser.borrow_mut() = Some(advertiser),
+            Err(e) => tracing::warn!("sync: could not advertise over mDNS: {e}"),
         }
     }
 
@@ -206,6 +282,26 @@ impl SyncSupervisor {
         // same trust-store lookup rather than a second, separately-stale one.
         self.point_blobs_at(&master_device_id, &address);
 
+        // …and it has to follow the master when discovery moves it, or a
+        // relay servant would keep syncing while every tile on screen stayed
+        // blank. Everything this closure captures is `Send + Sync`, which is
+        // why it can be built here and called from the worker thread; the
+        // supervisor itself is `Rc` and could not be.
+        let on_relocate: maple_sync::worker::RelocateHook = {
+            let blobs = self.blobs.clone();
+            let trust = self.trust.clone();
+            let clock = self.clock.clone();
+            let rng = self.rng.clone();
+            let device_id = {
+                let db = maple_db::lock_db(&self.db);
+                db.device_id().to_owned()
+            };
+            let master = master_device_id.clone();
+            Arc::new(move |address: &str| {
+                point_blobs_at(&blobs, &trust, &clock, &rng, &device_id, &master, address);
+            })
+        };
+
         let worker = maple_sync::worker::spawn(
             WorkerConfig {
                 address,
@@ -221,35 +317,28 @@ impl SyncSupervisor {
                 clock: self.clock.clone(),
                 rng: self.rng.clone(),
                 on_change: Arc::new(on_change),
+                discovery: self.discovery(),
+                on_relocate,
             },
         );
         *self.worker.borrow_mut() = Some(worker);
     }
 
     /// Point the grid and detail view at `address` for remote pixels.
-    ///
-    /// A missing key is not an error worth surfacing here: the worker is
-    /// about to hit the same gap and report it through the status pill, and
-    /// two messages for one cause is one too many.
     fn point_blobs_at(&self, master_device_id: &str, address: &str) {
-        let key = {
-            let trust = lock(&self.trust);
-            trust.peer(master_device_id).map(|p| p.key.clone())
+        let device_id = {
+            let db = maple_db::lock_db(&self.db);
+            db.device_id().to_owned()
         };
-        let Some(key) = key else {
-            tracing::warn!("sync: no key for master {master_device_id}, remote photos unavailable");
-            return;
-        };
-        let client = SyncClient::new(
+        point_blobs_at(
+            &self.blobs,
+            &self.trust,
+            &self.clock,
+            &self.rng,
+            &device_id,
+            master_device_id,
             address,
-            {
-                let db = maple_db::lock_db(&self.db);
-                db.device_id().to_owned()
-            },
-            self.clock.clone(),
-            self.rng.clone(),
         );
-        self.blobs.set(master_device_id.to_owned(), client, key);
     }
 
     /// The closure the listener renders thumbnails through.
@@ -267,16 +356,60 @@ impl SyncSupervisor {
     ///
     /// P5 supports exactly one master, which is what a star topology means
     /// from the servant's side. The address comes from the trust file, where
-    /// pairing recorded it — mDNS re-resolution (P8) is what will eventually
-    /// heal a DHCP lease change; until then a moved master needs re-pairing
-    /// or a hand-edited address.
+    /// pairing recorded it, and an **empty** one is returned rather than
+    /// nothing at all: a device paired from the other side has a master it
+    /// has never dialled, and since P8 that is a job for discovery rather
+    /// than a dead end. The peer with an address wins over one without, so a
+    /// known master is never passed over for an unknown one.
     fn master_endpoint(&self) -> Option<(String, String)> {
         let trust = lock(&self.trust);
-        trust
-            .peers()
+        let peers = trust.peers();
+        let peer = peers
             .iter()
-            .find_map(|peer| Some((peer.device_id.clone(), peer.address.clone()?)))
+            .find(|peer| peer.address.is_some())
+            .or_else(|| peers.first())?;
+        Some((
+            peer.device_id.clone(),
+            peer.address.clone().unwrap_or_default(),
+        ))
     }
+}
+
+/// Build the blob client and hand it to [`RemoteBlobs`].
+///
+/// A free function because it is called from two places that cannot share a
+/// receiver: the supervisor on the UI thread, and the sync worker's relocate
+/// hook on its own. Every argument is `Send + Sync` for that reason.
+///
+/// A missing key is not an error worth surfacing: the worker is about to hit
+/// the same gap and report it through the status pill, and two messages for
+/// one cause is one too many.
+#[allow(clippy::too_many_arguments)]
+fn point_blobs_at(
+    blobs: &RemoteBlobs,
+    trust: &Arc<Mutex<TrustStore>>,
+    clock: &Clock,
+    rng: &SharedRandom,
+    device_id: &str,
+    master_device_id: &str,
+    address: &str,
+) {
+    let key = {
+        let trust = lock(trust);
+        trust.peer(master_device_id).map(|p| p.key.clone())
+    };
+    let Some(key) = key else {
+        tracing::warn!("sync: no key for master {master_device_id}, remote photos unavailable");
+        return;
+    };
+    // An address discovery has not found yet would build a client that can
+    // only fail; leaving the handle cleared makes a fetch fail at once and
+    // say why, instead of after a connect timeout per tile.
+    if address.is_empty() {
+        return;
+    }
+    let client = SyncClient::new(address, device_id.to_owned(), clock.clone(), rng.clone());
+    blobs.set(master_device_id.to_owned(), client, key);
 }
 
 /// Where this device files a photo that arrives over the wire.

@@ -112,6 +112,19 @@ single binary; the backend is fixed at compile time.
   the RNG — `now_ms` is an argument and randomness arrives through `RandomSource`
   (production: `Database::random_bytes`, SQLite `randomblob`), so every handshake and
   signature is reproducible in a test.
+- **Discovery** (`maple-sync/src/discovery.rs`, P8): a master advertises
+  `_maple-sync._tcp.local.` (`mdns-sd`, no async runtime) with `device_id`, `name` and
+  `protocol` in TXT; a servant browses so the pairing modal can offer a pick-list and so
+  the worker can **re-resolve on the failure path** — a moved master heals without
+  re-pairing. A record is unauthenticated hearsay, so discovery may only choose *where*
+  to dial, never *who* to trust: the only thing it is allowed to do afterwards is move an
+  already-paired device id to a new address, and the credential does not travel with the
+  record. Manual `host:port` stays the fallback for networks that block multicast
+  (`discovery: None` is a fully working link). `ServiceDaemon` has **no `Drop`**, so
+  `Advertiser` and `Browser` shut theirs down in their own — dropping one otherwise
+  leaks a thread and two sockets per role switch. Everything downstream takes a
+  `DeviceSource`, which a test implements in five lines; only those two structs touch a
+  socket.
 - **Relay** (`images.locality`, V20): a servant can browse the master's library while
   storing no originals. `locality='remote'` rows are `status='present'` and list
   normally; `all_paths()` filters them out so the 60-second scanner does not mark them

@@ -39,6 +39,7 @@
 pub mod auth;
 pub mod backoff;
 pub mod client;
+pub mod discovery;
 pub mod merge;
 pub mod pairing;
 pub mod protocol;
@@ -57,6 +58,7 @@ pub use pairing::{
 pub use protocol::{ErrorBody, ErrorCode, Hello, PullRequest, PushResponse, PROTOCOL_VERSION};
 pub use random::{FnRandom, RandomSource, SharedRandom};
 pub use client::{SyncClient, SyncFailure};
+pub use discovery::{Advertiser, Browser, DeviceSource, DiscoveredDevice};
 pub use server::{Clock, SyncServer, ThumbRenderer};
 pub use worker::{SyncWorker, WorkerConfig};
 pub use status::{

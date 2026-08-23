@@ -22,6 +22,7 @@ use maple_db::Database;
 use maple_state::PeerMode;
 use maple_sync::auth::SignedRequest;
 use maple_sync::backoff::FailureKind;
+use maple_sync::discovery::{DeviceSource, DiscoveredDevice};
 use maple_sync::pairing::{PairError, PairOutcome, MAX_ATTEMPTS};
 use maple_sync::protocol::{route, ErrorCode};
 use maple_sync::trust::TrustedPeer;
@@ -974,8 +975,252 @@ fn spawn_worker(
             clock: clock.handle(),
             rng: seeded(90),
             on_change,
+            discovery: None,
+            on_relocate: Arc::new(|_| {}),
         },
     )
+}
+
+/// A device list a test writes by hand, standing in for mDNS.
+///
+/// Discovery is the one part of P8 that has to touch a socket, and it is
+/// deliberately thin for exactly this reason: everything downstream of it —
+/// the worker's relocation, the pairing modal's pick-list — takes a
+/// [`DeviceSource`] and is driven from data.
+struct FakeDiscovery(Mutex<Vec<DiscoveredDevice>>);
+
+impl FakeDiscovery {
+    fn holding(device_id: &str, address: &str) -> Arc<Self> {
+        Arc::new(Self(Mutex::new(vec![DiscoveredDevice {
+            device_id: device_id.to_owned(),
+            name: "Workstation".into(),
+            protocol: maple_sync::PROTOCOL_VERSION,
+            addresses: vec![address.to_owned()],
+        }])))
+    }
+}
+
+impl DeviceSource for FakeDiscovery {
+    fn devices(&self) -> Vec<DiscoveredDevice> {
+        self.0.lock().expect("not poisoned").clone()
+    }
+}
+
+/// The key a pairing left behind.
+///
+/// Read into a local before the store is written again: `Install::trust`
+/// takes the same mutex each time, so building an argument out of a second
+/// call to it deadlocks against the first.
+fn paired_key(install: &Install, peer: &str) -> maple_sync::PeerKey {
+    install.trust().peer(peer).expect("paired").key.clone()
+}
+
+/// Where the worker is currently dialling, as its relocate hook reported it.
+fn relocation_spy() -> (Arc<Mutex<Vec<String>>>, maple_sync::worker::RelocateHook) {
+    let seen: Arc<Mutex<Vec<String>>> = Arc::default();
+    let hook = {
+        let seen = seen.clone();
+        Arc::new(move |address: &str| {
+            seen.lock().expect("not poisoned").push(address.to_owned());
+        }) as maple_sync::worker::RelocateHook
+    };
+    (seen, hook)
+}
+
+#[test]
+fn a_master_that_moved_is_found_again_and_the_link_heals() {
+    // §1.4's DHCP story, and the reason discovery keeps running after
+    // pairing: the address on file is stale, every pass fails against it,
+    // and nothing but mDNS can say where the master went.
+    let clock = TestClock::new();
+    let master = Master::start(&clock, seeded(120));
+    let servant = Install::new("Laptop");
+    let client = client(&master, &servant, &clock, seeded(121));
+    pair(&master, &servant, &client, &clock, "482107", "314159").unwrap();
+
+    // Nothing is listening on port 9 (discard), so the stored address is
+    // wrong in the way a moved master is wrong: reachable syntax, dead host.
+    let stale = "127.0.0.1:9".to_owned();
+    let key = paired_key(&servant, &master.install.device_id);
+    servant
+        .trust()
+        .upsert_peer(TrustedPeer {
+            device_id: master.install.device_id.clone(),
+            key,
+            address: Some(stale.clone()),
+        })
+        .unwrap();
+
+    master
+        .install
+        .db()
+        .create_collection("From the master", "#3584e4", None)
+        .unwrap();
+
+    let (relocations, on_relocate) = relocation_spy();
+    let status = maple_sync::SyncStatus::cell(maple_state::SyncRole::Servant);
+    let worker = maple_sync::worker::spawn(
+        maple_sync::WorkerConfig {
+            address: stale.clone(),
+            master_device_id: master.install.device_id.clone(),
+            interval: Duration::from_millis(50),
+            max_revs: 500,
+            layout: servant.layout(),
+        },
+        maple_sync::worker::WorkerDeps {
+            db: servant.db.clone(),
+            trust: servant.trust.clone(),
+            status,
+            clock: clock.handle(),
+            rng: seeded(122),
+            on_change: Arc::new(|| {}),
+            discovery: Some(FakeDiscovery::holding(
+                &master.install.device_id,
+                &master.address(),
+            )),
+            on_relocate,
+        },
+    );
+
+    wait_until("the servant to sync at the address it discovered", || {
+        collection_names(&servant) == vec!["From the master".to_owned()]
+    });
+    worker.stop();
+
+    assert_eq!(
+        relocations.lock().unwrap().as_slice(),
+        &[master.address()],
+        "the blob client has to follow the master, or a relay servant syncs \
+         while every tile on screen stays blank"
+    );
+    let recorded = servant
+        .trust()
+        .peer(&master.install.device_id)
+        .expect("paired")
+        .address
+        .clone();
+    assert_eq!(
+        recorded,
+        Some(master.address()),
+        "the new address is written down, so the next launch starts there"
+    );
+}
+
+#[test]
+fn a_master_this_device_has_never_dialled_is_found_from_nothing() {
+    // The case only discovery can serve: these two paired in the other
+    // direction, so this side holds a key and a peer row but has never had
+    // an address at all. Before P8 that was a servant that could not start.
+    let clock = TestClock::new();
+    let master = Master::start(&clock, seeded(123));
+    let servant = Install::new("Laptop");
+    let client = client(&master, &servant, &clock, seeded(124));
+    pair(&master, &servant, &client, &clock, "482107", "314159").unwrap();
+    let key = paired_key(&servant, &master.install.device_id);
+    servant
+        .trust()
+        .upsert_peer(TrustedPeer {
+            device_id: master.install.device_id.clone(),
+            key,
+            address: None,
+        })
+        .unwrap();
+
+    master
+        .install
+        .db()
+        .create_collection("From the master", "#3584e4", None)
+        .unwrap();
+
+    let (relocations, on_relocate) = relocation_spy();
+    let status = maple_sync::SyncStatus::cell(maple_state::SyncRole::Servant);
+    let worker = maple_sync::worker::spawn(
+        maple_sync::WorkerConfig {
+            address: String::new(),
+            master_device_id: master.install.device_id.clone(),
+            interval: Duration::from_millis(50),
+            max_revs: 500,
+            layout: servant.layout(),
+        },
+        maple_sync::worker::WorkerDeps {
+            db: servant.db.clone(),
+            trust: servant.trust.clone(),
+            status,
+            clock: clock.handle(),
+            rng: seeded(125),
+            on_change: Arc::new(|| {}),
+            discovery: Some(FakeDiscovery::holding(
+                &master.install.device_id,
+                &master.address(),
+            )),
+            on_relocate,
+        },
+    );
+
+    wait_until("a servant with no address to find its master", || {
+        collection_names(&servant) == vec!["From the master".to_owned()]
+    });
+    worker.stop();
+    assert_eq!(relocations.lock().unwrap().as_slice(), &[master.address()]);
+}
+
+#[test]
+fn a_worker_with_no_discovery_keeps_dialling_what_it_was_given() {
+    // The fallback §2.4 promises: on a network where multicast is blocked,
+    // `discovery: None` behaves exactly as P7 did — retry the stored
+    // address, forever, and never invent a different one.
+    let clock = TestClock::new();
+    let servant = Install::new("Laptop");
+    servant
+        .db()
+        .upsert_sync_peer("dev-ghost", Some("Workstation"), PeerMode::Relay)
+        .unwrap();
+    servant
+        .trust()
+        .upsert_peer(TrustedPeer {
+            device_id: "dev-ghost".into(),
+            key: maple_sync::PeerKey::from_bytes([9u8; 32]),
+            address: Some("127.0.0.1:9".into()),
+        })
+        .unwrap();
+
+    let (relocations, on_relocate) = relocation_spy();
+    let status = maple_sync::SyncStatus::cell(maple_state::SyncRole::Servant);
+    let worker = maple_sync::worker::spawn(
+        maple_sync::WorkerConfig {
+            address: "127.0.0.1:9".into(),
+            master_device_id: "dev-ghost".into(),
+            interval: Duration::from_millis(50),
+            max_revs: 500,
+            layout: servant.layout(),
+        },
+        maple_sync::worker::WorkerDeps {
+            db: servant.db.clone(),
+            trust: servant.trust.clone(),
+            status: status.clone(),
+            clock: clock.handle(),
+            rng: seeded(126),
+            on_change: Arc::new(|| {}),
+            discovery: None,
+            on_relocate,
+        },
+    );
+
+    wait_until("the pill to report a retry", || {
+        matches!(
+            status.lock().unwrap().state,
+            maple_sync::status::SyncState::Offline { .. }
+        )
+    });
+    worker.stop();
+
+    assert!(relocations.lock().unwrap().is_empty());
+    let recorded = servant.trust().peer("dev-ghost").expect("paired").address.clone();
+    assert_eq!(
+        recorded.as_deref(),
+        Some("127.0.0.1:9"),
+        "a failing link must not have its address rewritten"
+    );
 }
 
 fn collection_names(install: &Install) -> Vec<String> {
@@ -1173,6 +1418,8 @@ fn a_worker_with_no_master_listening_shows_a_retry_countdown() {
             clock: clock.handle(),
             rng: seeded(47),
             on_change: Arc::new(|| {}),
+            discovery: None,
+            on_relocate: Arc::new(|_| {}),
         },
     );
 
@@ -1256,6 +1503,8 @@ fn a_master_that_comes_back_refreshes_the_ui_with_nothing_to_merge() {
                     changes.fetch_add(1, Ordering::Relaxed);
                 })
             },
+            discovery: None,
+            on_relocate: Arc::new(|_| {}),
         },
     );
 

@@ -24,6 +24,7 @@ anyhow = { workspace = true }
 tracing = { workspace = true }
 ureq = { workspace = true }
 tiny_http = { workspace = true }
+mdns-sd = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

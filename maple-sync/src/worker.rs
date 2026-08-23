@@ -30,6 +30,17 @@
 //! and permanently, and nothing later notices, because the row's stamp is
 //! below the watermark forever after.
 //!
+//! # A master that moved
+//!
+//! §1.4 asks for the address to be re-resolved on reconnect, so a DHCP lease
+//! change heals itself. The loop does that on the *failure* path and only
+//! there: a pass that worked proves the address is right, and asking mDNS
+//! anyway would let an unauthenticated record pull a working link somewhere
+//! else. What discovery may do is narrow — move an **already paired** peer,
+//! identified by the device id in its TXT record, to a new address. The
+//! credential does not travel with the record, so a machine advertising
+//! someone else's id gains nothing but a connection that fails its MAC.
+//!
 //! # Why an auth failure ends the thread
 //!
 //! §1.4: a rejected credential is not a network problem and will not fix
@@ -45,6 +56,7 @@ use maple_db::Database;
 
 use crate::backoff::{Backoff, FailureKind, Retry};
 use crate::client::{SyncClient, SyncFailure};
+use crate::discovery::DeviceSource;
 use crate::merge::{apply_and_refresh, may_advance};
 use crate::server::Clock;
 use crate::transfer::{self, LibraryLayout};
@@ -59,6 +71,9 @@ use maple_state::{PeerMode, SyncRole};
 /// Whatever is left is picked up on the next pass, one interval later.
 const MAX_ROUNDS: usize = 64;
 
+/// Told where the master moved to, so the rest of the app can follow.
+pub type RelocateHook = Arc<dyn Fn(&str) + Send + Sync>;
+
 /// The handles the worker borrows from the app.
 pub struct WorkerDeps {
     pub db: Arc<Mutex<Database>>,
@@ -70,12 +85,26 @@ pub struct WorkerDeps {
     /// reload whatever it is showing. Called from the worker thread, so a UI
     /// caller must marshal (`slint::Weak::upgrade_in_event_loop`).
     pub on_change: Arc<dyn Fn() + Send + Sync>,
+    /// Where to look when the master stops answering. `None` on a network
+    /// with no mDNS, or before the browser has started — the loop then does
+    /// exactly what it did before P8 and retries the stored address.
+    pub discovery: Option<Arc<dyn DeviceSource>>,
+    /// Called with the new `host:port` whenever discovery moves the master.
+    ///
+    /// The worker is not the only thing dialling it: a relay servant's grid
+    /// and detail view fetch pixels through their own client, and one built
+    /// for the old address would keep failing long after sync had healed.
+    /// Called from the worker thread, like [`Self::on_change`].
+    pub on_relocate: RelocateHook,
 }
 
 /// Which master to talk to and how often.
 #[derive(Debug, Clone)]
 pub struct WorkerConfig {
-    /// `host:port` of the master.
+    /// `host:port` of the master, as last recorded. May be **empty**: a
+    /// device paired from the other side has a master it has never dialled,
+    /// and discovery is what finds it. The loop treats that as a failed pass
+    /// and goes looking.
     pub address: String,
     /// The master's device id — the key in the trust file, and the
     /// `sync_peers` row that holds both watermarks.
@@ -96,6 +125,15 @@ pub struct WorkerConfig {
 /// fortnight. Not zero, so the loop still yields and a quit is still noticed
 /// promptly.
 const CATCHUP_INTERVAL: Duration = Duration::from_secs(2);
+
+/// How long to wait before the first attempt at a *newly discovered*
+/// address.
+///
+/// Short on purpose. The backoff schedule measures how long an endpoint has
+/// been failing, and a master that just turned up at a different address is
+/// not that endpoint — waiting out a 60-second step to try it would be
+/// answering the wrong question.
+const RELOCATE_DELAY: Duration = Duration::from_secs(1);
 
 /// A running servant loop. Dropping it stops the thread.
 pub struct SyncWorker {
@@ -148,6 +186,8 @@ pub fn spawn(config: WorkerConfig, deps: WorkerDeps) -> SyncWorker {
         clock,
         rng,
         on_change,
+        discovery,
+        on_relocate,
     } = deps;
 
     let thread = std::thread::Builder::new()
@@ -157,12 +197,18 @@ pub fn spawn(config: WorkerConfig, deps: WorkerDeps) -> SyncWorker {
                 let guard = lock(&db);
                 guard.device_id().to_owned()
             };
-            let client = SyncClient::new(&config.address, device_id, clock.clone(), rng);
+            // Both mutable, because discovery may move the master: see the
+            // module docs. `address` is the `host:port` form the trust file
+            // and the mDNS record use, so it can be compared with what a
+            // browse returns; the client holds the URL built from it.
+            let mut address = config.address.clone();
+            let mut client =
+                SyncClient::new(&address, device_id.clone(), clock.clone(), rng.clone());
             let mut backoff = Backoff::new();
 
             tracing::info!(
                 "sync worker: started, master {} every {:?}",
-                config.address,
+                if address.is_empty() { "(not located yet)" } else { &address },
                 config.interval
             );
             set_state(&status, SyncState::Connecting, None);
@@ -176,7 +222,21 @@ pub fn spawn(config: WorkerConfig, deps: WorkerDeps) -> SyncWorker {
             let mut recovering = false;
 
             loop {
-                match run_pass(&db, &trust, &status, &client, &config, &stop_rx) {
+                // An empty address is a paired master this device has never
+                // reached — the far side did the dialling when they paired,
+                // so nothing recorded where it lives. Rather than a special
+                // startup path, it enters the loop as a failed pass, and the
+                // retry branch below is what goes looking for it.
+                let pass = if address.is_empty() {
+                    Err(PassError::Failed(SyncFailure {
+                        kind: FailureKind::Unreachable,
+                        code: None,
+                        message: "no address for the master yet".into(),
+                    }))
+                } else {
+                    run_pass(&db, &trust, &status, &client, &config, &stop_rx)
+                };
+                match pass {
                     Ok(outcome) => {
                         backoff.on_success();
                         publish_success(&status, &outcome, (clock)());
@@ -209,8 +269,30 @@ pub fn spawn(config: WorkerConfig, deps: WorkerDeps) -> SyncWorker {
                                 );
                                 break;
                             }
-                            Retry::After(delay) => {
+                            Retry::After(mut delay) => {
                                 recovering = true;
+                                // Before sleeping: has the master turned up
+                                // somewhere else? Only reachable from the
+                                // retryable branch, so a latched auth halt
+                                // cannot be cleared by the reset below.
+                                if let Some(found) =
+                                    relocate(&discovery, &config.master_device_id, &address)
+                                {
+                                    tracing::info!(
+                                        "sync worker: master moved from {address} to {found}"
+                                    );
+                                    note_address(&trust, &config.master_device_id, &found);
+                                    address = found;
+                                    client = SyncClient::new(
+                                        &address,
+                                        device_id.clone(),
+                                        clock.clone(),
+                                        rng.clone(),
+                                    );
+                                    backoff.reset();
+                                    delay = RELOCATE_DELAY;
+                                    on_relocate(&address);
+                                }
                                 tracing::warn!(
                                     "sync worker: {failure} — retrying in {}s",
                                     delay.as_secs()
@@ -273,7 +355,7 @@ fn run_pass(
         return Err(PassError::Failed(SyncFailure {
             kind: FailureKind::Unreachable,
             code: None,
-            message: format!("peer at {} is '{}', not a master", config.address, hello.role),
+            message: format!("peer at {} is '{}', not a master", client.address(), hello.role),
         }));
     }
 
@@ -402,6 +484,32 @@ fn run_pass(
     outcome.changed |= files.downloaded > 0;
 
     Ok(outcome)
+}
+
+/// Where discovery says the master is, if that is somewhere new.
+///
+/// `None` covers three cases that all mean the same thing to the caller —
+/// no discovery running, the master not currently on the network, and the
+/// master exactly where we already thought it was. Only a genuine move is
+/// worth rebuilding a client for.
+fn relocate(
+    discovery: &Option<Arc<dyn DeviceSource>>,
+    master_device_id: &str,
+    current: &str,
+) -> Option<String> {
+    let found = discovery.as_ref()?.address_of(master_device_id)?;
+    (found != current).then_some(found)
+}
+
+/// Remember where the master answered, so the next launch dials the right
+/// place before discovery has found anything.
+///
+/// Advisory, and a failure to write it is not worth failing a pass over: the
+/// worst case is that the next start needs one more round of discovery.
+fn note_address(trust: &Arc<Mutex<TrustStore>>, master_device_id: &str, address: &str) {
+    if let Err(e) = lock(trust).note_address(master_device_id, address) {
+        tracing::warn!("sync worker: could not record the master's address: {e}");
+    }
 }
 
 /// This link's file mode, as the *servant* has it set.
