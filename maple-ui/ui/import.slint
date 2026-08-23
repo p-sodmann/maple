@@ -34,6 +34,10 @@ export struct ImportItem {
     // it ran past its time budget and the scan moved on without it. Still
     // listed, still selectable, still copied.
     is-unreadable: bool,
+    // The display file (usually the JPEG of a RAW+JPEG pair) would not
+    // decode and the preview came off the companion raw instead. The photo
+    // is fine; the file beside it is not.
+    from-companion: bool,
     // Decided in an *earlier* session (imported then, or skipped then).
     // What "Hide old images" filters on.
     is-old: bool,
@@ -106,6 +110,25 @@ component ImportGridView {
                     // leaving an empty frame that looks like a tile still
                     // loading — the photo is copyable and the user needs to
                     // know it is there to decide about it.
+                    // Small, bottom-left, out of the way of the verdict
+                    // badge: this is information, not a decision.
+                    if item.from-companion: Rectangle {
+                        x: 4px;
+                        y: parent.height - 20px;
+                        width: 40px;
+                        height: 16px;
+                        border-radius: 8px;
+                        background: #000000.with-alpha(0.55);
+                        Text {
+                            text: "RAW ⤴";
+                            color: Theme.marked;
+                            font-size: 9px;
+                            font-weight: 700;
+                            horizontal-alignment: center;
+                            vertical-alignment: center;
+                        }
+                    }
+
                     if item.loaded && item.is-unreadable: VerticalLayout {
                         alignment: center;
                         spacing: 2px;

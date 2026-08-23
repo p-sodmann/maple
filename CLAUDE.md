@@ -179,7 +179,14 @@ single binary; the backend is fixed at compile time.
   runs on its own thread and `recv_timeout` walks away after `read_timeout_secs`, the
   same trade `image_loader.rs` makes. Its path is logged under the
   `maple::import::unreadable` target and the photo stays listed, selectable and copyable
-  with no preview.
+  with no preview. A display file that will not *decode* falls back to the group's other
+  files — a raw + JPEG pair lists the JPEG as the display file, so one corrupt JPEG would
+  otherwise lose the preview for a photo whose raw is intact. That fallback reads from a
+  decode thread, which the pipeline otherwise never does; it is safe only because it is
+  rare (once per bad file, not once per photo). Two limits on it: the row keeps the
+  **display file's** hash, since that is what the library row and `SeenSet` are keyed on,
+  and it is not attempted after a *timeout* — the card is already not answering, and
+  asking twice would double the stall.
 - **The import record lives on the medium** (`maple-state/src/seen.rs`, P9): the scan's
   "already imported" badge reads `<source>/.maple_seen.bin`, written to the card itself
   so it carries its own history to the next machine — beside `.maple_embed_cache.bin`,

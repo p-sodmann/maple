@@ -71,23 +71,30 @@ enum ScanMsg {
 enum Readable {
     #[default]
     Yes,
-    /// The bytes came back but decoded to nothing: corrupt, truncated, or a
-    /// format the decoder does not actually handle.
+    /// The display file would not decode, but another file in the group
+    /// did — a corrupt JPEG next to an intact raw. The photo is fine and
+    /// the tile is real; it just came from the other half of the pair.
+    FromCompanion,
+    /// The bytes came back but decoded to nothing, and nothing in the group
+    /// could stand in: corrupt, truncated, or a format the decoder does not
+    /// actually handle.
     NoPreview,
-    /// The read never returned inside [`PHOTO_BUDGET`] and the scan walked
-    /// away. Usually the card or the cable, not the file.
+    /// The read never returned inside the configured budget and the scan
+    /// walked away. Usually the card or the cable, not the file.
     TimedOut,
 }
 
 impl Readable {
+    /// Whether there is a picture to show. A companion preview counts.
     fn ok(self) -> bool {
-        self == Self::Yes
+        matches!(self, Self::Yes | Self::FromCompanion)
     }
 
     /// Short reason for the log summary at the end of a scan.
     fn reason(self) -> &'static str {
         match self {
             Self::Yes => "ok",
+            Self::FromCompanion => "display file unreadable, preview from companion",
             Self::NoPreview => "could not be decoded",
             Self::TimedOut => "timed out",
         }
@@ -632,7 +639,7 @@ fn spawn_scan_worker(
                             Err(_) => break,
                         };
                         match job {
-                            Ok(job) => decode_one(job, embed_tx.as_ref(), &tx),
+                            Ok(job) => decode_one(job, budget, embed_tx.as_ref(), &tx),
                             Err(_) => break,
                         }
                     }
@@ -712,6 +719,9 @@ fn read_one(
     }
 }
 
+/// Decoded thumbnail pixels: `(rgb, width, height)`.
+type Thumbnail = (Vec<u8>, u32, u32);
+
 /// What one read off the medium produces.
 struct Read {
     /// The file's BLAKE3 content hash — `None` if it could not be read in
@@ -734,10 +744,10 @@ struct Read {
 /// can prove the walk-away actually happens without waiting the configured
 /// timeout to do it.
 fn read_with_budget(path: &Path, budget: Duration) -> Read {
-    let (tx, rx) = mpsc::channel();
-    {
+    let started = std::time::Instant::now();
+    let outcome = within_budget(budget, {
         let path = path.to_path_buf();
-        std::thread::spawn(move || {
+        move || {
             // For an ordinary image these are the file's own bytes, so the
             // same read serves both the hash and the decode. Only a raw
             // needs the file opened twice — its preview is not the file.
@@ -747,14 +757,15 @@ fn read_with_budget(path: &Path, budget: Duration) -> Read {
             } else {
                 bytes.as_deref().map(maple_import::hash_bytes)
             };
-            let _ = tx.send((hash, bytes));
-        });
-    }
+            (hash, bytes)
+        }
+    });
 
-    let started = std::time::Instant::now();
-    match rx.recv_timeout(budget) {
-        Ok((hash, Some(bytes))) => Read { hash, bytes: Some(bytes), readable: Readable::Yes },
-        Ok((hash, None)) => {
+    match outcome {
+        Some((hash, Some(bytes))) => {
+            Read { hash, bytes: Some(bytes), readable: Readable::Yes }
+        }
+        Some((hash, None)) => {
             tracing::warn!(
                 target: "maple::import::unreadable",
                 "unreadable after {:?}: {}",
@@ -763,7 +774,7 @@ fn read_with_budget(path: &Path, budget: Duration) -> Read {
             );
             Read { hash, bytes: None, readable: Readable::NoPreview }
         }
-        Err(_) => {
+        None => {
             // The one the user goes hunting for: full path, not just the
             // filename, because two cards can hold the same DSCF0042.RAF.
             tracing::warn!(
@@ -778,11 +789,62 @@ fn read_with_budget(path: &Path, budget: Duration) -> Read {
     }
 }
 
+/// Run `work` on its own thread and stop waiting for it after `budget`.
+///
+/// A thread blocked on a card that has stopped answering cannot be
+/// cancelled, only outlived: on a timeout the thread is left to finish on
+/// its own and its result discarded. The same trade `image_loader.rs` makes
+/// for the detail view.
+fn within_budget<T: Send + 'static>(
+    budget: Duration,
+    work: impl FnOnce() -> T + Send + 'static,
+) -> Option<T> {
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(work());
+    });
+    rx.recv_timeout(budget).ok()
+}
+
+/// Last resort for a photo whose display file will not decode: try the
+/// other files in its group.
+///
+/// A raw + JPEG pair lists the JPEG as the display file, so one corrupt
+/// JPEG loses the preview for a photo whose raw is perfectly intact. The
+/// raw's embedded preview is right there.
+///
+/// This reads from the medium on a decode thread, which the pipeline
+/// otherwise never does. That is deliberate and safe *because it is rare*:
+/// it happens once per unreadable file, not once per photo, so it cannot
+/// put the card back under the many-reader contention the single reader
+/// exists to avoid.
+fn preview_from_companion(
+    companions: &[PathBuf],
+    budget: Duration,
+) -> Option<(Thumbnail, PathBuf)> {
+    for path in companions {
+        // `continue`, not `?`: one companion that cannot be read must not
+        // stop us trying the next one.
+        let Some(bytes) = within_budget(budget, {
+            let path = path.clone();
+            move || maple_import::loadable_image_bytes(&path).ok()
+        })
+        .flatten() else {
+            continue;
+        };
+        if let Ok(rendered) = crate::thumbnail::render_bytes_to_rgb(&bytes, 256) {
+            return Some((rendered, path.clone()));
+        }
+    }
+    None
+}
+
 /// Decode one photo's bytes into a thumbnail and hand it to the UI.
 ///
 /// Pure CPU over memory — this is the part that fans out across cores.
 fn decode_one(
     job: DecodeJob,
+    budget: Duration,
     embed_tx: Option<&mpsc::SyncSender<EmbedJob>>,
     tx: &mpsc::Sender<ScanMsg>,
 ) {
@@ -790,7 +852,8 @@ fn decode_one(
         index, path, companions, hash, imported, skipped_before, bytes, readable,
     } = job;
 
-    let rendered = bytes
+    let mut readable = readable;
+    let mut rendered = bytes
         .as_deref()
         .and_then(|b| match crate::thumbnail::render_bytes_to_rgb(b, 256) {
             Ok(out) => Some(out),
@@ -804,9 +867,28 @@ fn decode_one(
             }
         });
 
+    // Nothing from the display file — but a raw + JPEG pair has another
+    // copy of the same photo sitting next to it. Not attempted after a
+    // timeout: the card is already not answering, and trying again would
+    // only double the stall.
+    if rendered.is_none() && readable != Readable::TimedOut && !companions.is_empty() {
+        if let Some((out, from)) = preview_from_companion(&companions, budget) {
+            tracing::info!(
+                target: "maple::import::unreadable",
+                "preview recovered from {} because {} would not decode",
+                from.display(),
+                path.display()
+            );
+            rendered = Some(out);
+            readable = Readable::FromCompanion;
+        }
+    }
+
     let (rgb, width, height) = rendered.unwrap_or_default();
     let has_pixels = !rgb.is_empty() && width > 0 && height > 0;
-    let readable = if has_pixels { readable } else if readable.ok() {
+    let readable = if has_pixels {
+        readable
+    } else if readable.ok() {
         Readable::NoPreview
     } else {
         readable
@@ -1024,8 +1106,8 @@ fn finish_scan(w: &ImportWindow, ctx: &ImportCtx) {
     *ctx.groups.borrow_mut() = resolved_groups;
 
     w.set_scanning(false);
-    let unreadable = report_unreadable(&ctx.entries.borrow());
-    w.set_status_text(scan_status_text(n, unreadable).into());
+    let quality = report_scan_quality(&ctx.entries.borrow());
+    w.set_status_text(scan_status_text(n, quality).into());
     // Bulk reset — happens once when the scan finishes, not on every
     // click. This is also the point at which every entry's `decided_before`
     // is finally known, so it is where "Hide old images" can first take
@@ -1062,40 +1144,68 @@ fn sharpest_in_group(group: &[usize], entries: &[Entry]) -> usize {
     best
 }
 
-fn scan_status_text(n: usize, unreadable: usize) -> String {
-    let found = format!("{n} photo{} found", if n == 1 { "" } else { "s" });
-    if unreadable == 0 {
-        found
-    } else {
-        // Say it on screen too. The per-file warnings go to stderr, which
-        // is nowhere at all when the app was launched from a bundle.
-        format!("{found} · {unreadable} without a preview (see the log for paths)")
-    }
+/// How many photos in a finished scan needed help, or never rendered.
+#[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
+struct ScanQuality {
+    /// Display file was unreadable; the preview came off a companion.
+    recovered: usize,
+    /// Nothing in the group produced a picture.
+    unreadable: usize,
 }
 
-/// Log every photo the scan could not render, with its full path, and
-/// return how many there were.
-///
-/// One block at the end rather than only the per-file warnings, because the
-/// per-file ones are scattered through a scan's worth of output and the
-/// path is exactly what you need to go look at the file.
-fn report_unreadable(entries: &[Entry]) -> usize {
-    let failures: Vec<&Entry> = entries.iter().filter(|e| !e.readable.ok()).collect();
-    if failures.is_empty() {
-        return 0;
+fn scan_status_text(n: usize, quality: ScanQuality) -> String {
+    // Say it on screen too. The per-file warnings go to stderr, which is
+    // nowhere at all when the app was launched from a bundle.
+    let mut out = format!("{n} photo{} found", if n == 1 { "" } else { "s" });
+    if quality.recovered > 0 {
+        out.push_str(&format!(" · {} previewed from RAW", quality.recovered));
     }
-    let list = failures
+    if quality.unreadable > 0 {
+        out.push_str(&format!(" · {} without a preview", quality.unreadable));
+    }
+    if quality.recovered > 0 || quality.unreadable > 0 {
+        out.push_str(" (see the log for paths)");
+    }
+    out
+}
+
+/// Log every photo whose display file let it down, with full paths, and
+/// report the counts.
+///
+/// One block at the end rather than only the per-file lines, because those
+/// are scattered through a scan's worth of output and the path is exactly
+/// what you need in order to go look at the file. Photos recovered from a
+/// companion are listed too: the picture is fine, but the display file next
+/// to it is corrupt and the user is the only one who can decide about that.
+fn report_scan_quality(entries: &[Entry]) -> ScanQuality {
+    let notable: Vec<&Entry> = entries
+        .iter()
+        .filter(|e| e.readable != Readable::Yes)
+        .collect();
+    let quality = ScanQuality {
+        recovered: notable
+            .iter()
+            .filter(|e| e.readable == Readable::FromCompanion)
+            .count(),
+        unreadable: notable.iter().filter(|e| !e.readable.ok()).count(),
+    };
+    if notable.is_empty() {
+        return quality;
+    }
+    let list = notable
         .iter()
         .map(|e| format!("  {}: {}", e.readable.reason(), e.path.display()))
         .collect::<Vec<_>>()
         .join("\n");
     tracing::warn!(
         target: "maple::import::unreadable",
-        "{} of {} photos produced no preview:\n{list}",
-        failures.len(),
-        entries.len()
+        "{} of {} photos had an unreadable display file ({} recovered from a companion, {} with no preview at all):\n{list}",
+        notable.len(),
+        entries.len(),
+        quality.recovered,
+        quality.unreadable
     );
-    failures.len()
+    quality
 }
 
 // ── Browsing (click + navigation) ─────────────────────────────────
@@ -1754,6 +1864,9 @@ fn make_item(entries: &[Entry], selected: &HashSet<usize>, groups: &[Vec<usize>]
         // wearing the ✓ scrim, which says more.
         is_skipped: e.passed && !is_selected && !e.is_imported,
         is_unreadable: !e.readable.ok(),
+        // The picture is real, but the file the library will point at is
+        // not — worth a mark the user can notice while triaging.
+        from_companion: e.readable == Readable::FromCompanion,
         is_old: e.decided_before,
         stack_size: find_group(groups, i).map(|g| g.len() as i32).unwrap_or(0),
         has_jpg,
@@ -1974,9 +2087,51 @@ mod tests {
 
     #[test]
     fn scan_status_text_pluralises() {
-        assert_eq!(scan_status_text(1, 0), "1 photo found");
-        assert_eq!(scan_status_text(0, 0), "0 photos found");
-        assert_eq!(scan_status_text(7, 0), "7 photos found");
+        let clean = ScanQuality::default();
+        assert_eq!(scan_status_text(1, clean), "1 photo found");
+        assert_eq!(scan_status_text(0, clean), "0 photos found");
+        assert_eq!(scan_status_text(7, clean), "7 photos found");
+    }
+
+    #[test]
+    fn the_status_line_names_what_went_wrong() {
+        assert_eq!(
+            scan_status_text(7, ScanQuality { recovered: 0, unreadable: 2 }),
+            "7 photos found · 2 without a preview (see the log for paths)"
+        );
+        assert_eq!(
+            scan_status_text(7, ScanQuality { recovered: 3, unreadable: 1 }),
+            "7 photos found · 3 previewed from RAW · 1 without a preview (see the log for paths)"
+        );
+    }
+
+    #[test]
+    fn every_notable_photo_is_reported_with_its_reason() {
+        let mut entries = vec![
+            entry("/card/a.jpg", None),
+            entry("/card/stalls.raf", None),
+            entry("/card/corrupt.jpg", None),
+        ];
+        entries[1].readable = Readable::TimedOut;
+        entries[2].readable = Readable::NoPreview;
+
+        assert_eq!(
+            report_scan_quality(&entries),
+            ScanQuality { recovered: 0, unreadable: 2 }
+        );
+        assert_eq!(Readable::TimedOut.reason(), "timed out");
+        assert_eq!(Readable::NoPreview.reason(), "could not be decoded");
+        assert!(Readable::Yes.ok() && !Readable::TimedOut.ok());
+
+        // A recovered photo has a picture, so it is not a failure — but it
+        // is still reported, because its display file is corrupt and only
+        // the user can decide what to do about that.
+        assert!(Readable::FromCompanion.ok());
+        entries[0].readable = Readable::FromCompanion;
+        assert_eq!(
+            report_scan_quality(&entries),
+            ScanQuality { recovered: 1, unreadable: 2 }
+        );
     }
 
     #[test]
@@ -2253,7 +2408,7 @@ mod tests {
             readable: out.readable,
         };
         let (tx, rx) = mpsc::channel();
-        decode_one(job, None, &tx);
+        decode_one(job, Duration::from_secs(5), None, &tx);
         let ScanMsg::Thumb(t) = rx.recv().unwrap() else { panic!("expected a thumb") };
         assert_eq!(t.readable, Readable::NoPreview);
         assert!(t.rgb.is_empty());
@@ -2311,7 +2466,7 @@ mod tests {
                 display: maple_import::ImageFile { path: path.clone(), size: 0 },
                 companions: vec![],
             };
-            decode_one(read_one(index, &group, budget, &prior), None, &tx);
+            decode_one(read_one(index, &group, budget, &prior), budget, None, &tx);
         }
         drop(tx);
 
@@ -2449,6 +2604,128 @@ mod tests {
             thumbs as f64 / started.elapsed().as_secs_f64()
         );
         assert_eq!(thumbs, N);
+    }
+
+    // ── Falling back to the raw when the JPEG is corrupt ─────────
+
+    /// Decode one group and return the thumb the UI would receive.
+    fn decode_group(display: &std::path::Path, companions: Vec<PathBuf>) -> ScanThumb {
+        let prior = PriorDecisions {
+            imported: maple_state::SeenSet::new(),
+            skipped: maple_state::SeenSet::new(),
+        };
+        let group = maple_import::ImageGroup {
+            display: maple_import::ImageFile { path: display.to_path_buf(), size: 0 },
+            companions: companions
+                .into_iter()
+                .map(|path| maple_import::ImageFile { path, size: 0 })
+                .collect(),
+        };
+        let budget = Duration::from_secs(5);
+        let (tx, rx) = mpsc::channel();
+        decode_one(read_one(0, &group, budget, &prior), budget, None, &tx);
+        drop(tx);
+        match rx.recv().unwrap() {
+            ScanMsg::Thumb(t) => t,
+            _ => panic!("expected a thumb"),
+        }
+    }
+
+    /// Bytes that look like a JPEG for long enough to be picked up, and
+    /// then are not one.
+    fn write_corrupt_jpeg(path: &std::path::Path) {
+        std::fs::write(path, b"\xff\xd8\xff\xe0 not actually a jpeg").unwrap();
+    }
+
+    #[test]
+    fn a_corrupt_display_file_is_previewed_from_its_companion() {
+        let dir = tempfile::tempdir().unwrap();
+        // The shape of a RAW+JPEG pair: the JPEG is the display file, and
+        // it is the one that is corrupt.
+        let jpg = dir.path().join("DSCF0042.jpg");
+        write_corrupt_jpeg(&jpg);
+        let companion = dir.path().join("DSCF0042.png");
+        write_png(&companion);
+
+        let thumb = decode_group(&jpg, vec![companion]);
+
+        assert_eq!(thumb.readable, Readable::FromCompanion);
+        assert!(thumb.width > 0 && !thumb.rgb.is_empty(), "the companion should show");
+        // The identity stays the display file's. It is what the library row
+        // and `SeenSet` are keyed on, and the companion is a different file
+        // with a different hash — borrowing its pixels must not borrow its
+        // name.
+        assert_eq!(thumb.content_hash, maple_import::content_hash(&jpg).unwrap());
+    }
+
+    #[test]
+    fn a_corrupt_photo_with_no_usable_companion_has_no_preview() {
+        let dir = tempfile::tempdir().unwrap();
+        let jpg = dir.path().join("DSCF0043.jpg");
+        write_corrupt_jpeg(&jpg);
+        let junk = dir.path().join("DSCF0043.png");
+        std::fs::write(&junk, b"also not an image").unwrap();
+
+        let thumb = decode_group(&jpg, vec![junk]);
+        assert_eq!(thumb.readable, Readable::NoPreview);
+        assert!(thumb.rgb.is_empty());
+    }
+
+    #[test]
+    fn a_lone_corrupt_file_has_nothing_to_fall_back_on() {
+        let dir = tempfile::tempdir().unwrap();
+        let jpg = dir.path().join("DSCF0044.jpg");
+        write_corrupt_jpeg(&jpg);
+
+        let thumb = decode_group(&jpg, vec![]);
+        assert_eq!(thumb.readable, Readable::NoPreview);
+    }
+
+    #[test]
+    fn a_healthy_photo_is_not_reported_as_recovered() {
+        let dir = tempfile::tempdir().unwrap();
+        let png = dir.path().join("DSCF0045.png");
+        write_png(&png);
+        let companion = dir.path().join("DSCF0045-companion.png");
+        write_png(&companion);
+
+        let thumb = decode_group(&png, vec![companion]);
+        assert_eq!(thumb.readable, Readable::Yes, "the companion was not needed");
+    }
+
+    /// A card that has stopped answering must not be asked twice: falling
+    /// back after a timeout would double every stall.
+    #[cfg(unix)]
+    #[test]
+    fn a_timed_out_photo_does_not_also_wait_on_its_companion() {
+        let dir = tempfile::tempdir().unwrap();
+        let stalled = dir.path().join("stalls.jpg");
+        make_stalling_file(&stalled);
+        let companion = dir.path().join("stalls-companion.jpg");
+        make_stalling_file(&companion);
+
+        let prior = PriorDecisions {
+            imported: maple_state::SeenSet::new(),
+            skipped: maple_state::SeenSet::new(),
+        };
+        let group = maple_import::ImageGroup {
+            display: maple_import::ImageFile { path: stalled, size: 0 },
+            companions: vec![maple_import::ImageFile { path: companion, size: 0 }],
+        };
+        let budget = Duration::from_millis(200);
+        let (tx, rx) = mpsc::channel();
+
+        let started = std::time::Instant::now();
+        decode_one(read_one(0, &group, budget, &prior), budget, None, &tx);
+        let waited = started.elapsed();
+        drop(tx);
+
+        let ScanMsg::Thumb(t) = rx.recv().unwrap() else { panic!("expected a thumb") };
+        assert_eq!(t.readable, Readable::TimedOut);
+        assert!(
+            waited < budget * 2,
+            "waited {waited:?} — the companion was tried after a timeout"
+        );
     }
 
     #[test]
