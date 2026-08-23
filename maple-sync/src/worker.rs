@@ -205,6 +205,13 @@ pub fn spawn(config: WorkerConfig, deps: WorkerDeps) -> SyncWorker {
             let mut client =
                 SyncClient::new(&address, device_id.clone(), clock.clone(), rng.clone());
             let mut backoff = Backoff::new();
+            // Every address tried since the last time a pass worked. It is
+            // what tells a *new* candidate (worth a fresh retry schedule)
+            // from one we are cycling back through (which must not reset the
+            // schedule, or a master that is genuinely down would be dialled
+            // once a second forever — see the loop below).
+            let mut tried: std::collections::HashSet<String> = std::collections::HashSet::new();
+            tried.insert(address.clone());
 
             tracing::info!(
                 "sync worker: started, master {} every {:?}",
@@ -239,6 +246,10 @@ pub fn spawn(config: WorkerConfig, deps: WorkerDeps) -> SyncWorker {
                 match pass {
                     Ok(outcome) => {
                         backoff.on_success();
+                        // This address works; anything tried on the way here
+                        // is history, so a future outage starts fresh.
+                        tried.clear();
+                        tried.insert(address.clone());
                         publish_success(&status, &outcome, (clock)());
                         if outcome.changed || recovering {
                             on_change();
@@ -282,6 +293,7 @@ pub fn spawn(config: WorkerConfig, deps: WorkerDeps) -> SyncWorker {
                                         "sync worker: master moved from {address} to {found}"
                                     );
                                     note_address(&trust, &config.master_device_id, &found);
+                                    let first_time = tried.insert(found.clone());
                                     address = found;
                                     client = SyncClient::new(
                                         &address,
@@ -289,9 +301,18 @@ pub fn spawn(config: WorkerConfig, deps: WorkerDeps) -> SyncWorker {
                                         clock.clone(),
                                         rng.clone(),
                                     );
-                                    backoff.reset();
-                                    delay = RELOCATE_DELAY;
                                     on_relocate(&address);
+                                    // A schedule measures how long *one*
+                                    // endpoint has been failing, so a new
+                                    // one starts over. Coming back round a
+                                    // multi-homed master's address ring is
+                                    // not new, and resetting there would
+                                    // pin the retry delay at one second for
+                                    // as long as the master stayed down.
+                                    if first_time {
+                                        backoff.reset();
+                                        delay = RELOCATE_DELAY;
+                                    }
                                 }
                                 tracing::warn!(
                                     "sync worker: {failure} — retrying in {}s",
@@ -486,19 +507,20 @@ fn run_pass(
     Ok(outcome)
 }
 
-/// Where discovery says the master is, if that is somewhere new.
+/// The next address to dial for the master, if there is one worth trying.
 ///
-/// `None` covers three cases that all mean the same thing to the caller —
-/// no discovery running, the master not currently on the network, and the
-/// master exactly where we already thought it was. Only a genuine move is
-/// worth rebuilding a client for.
+/// `None` covers everything that means "stay put": no discovery running, the
+/// master not currently on the network, and a master that publishes exactly
+/// the one address we are already failing against. The rotation itself lives
+/// in [`crate::discovery::next_address`], which explains why a multi-homed
+/// master needs one.
 fn relocate(
     discovery: &Option<Arc<dyn DeviceSource>>,
     master_device_id: &str,
     current: &str,
 ) -> Option<String> {
-    let found = discovery.as_ref()?.address_of(master_device_id)?;
-    (found != current).then_some(found)
+    let candidates = discovery.as_ref()?.addresses_of(master_device_id);
+    crate::discovery::next_address(&candidates, current)
 }
 
 /// Remember where the master answered, so the next launch dials the right

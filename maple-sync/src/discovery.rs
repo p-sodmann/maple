@@ -38,7 +38,7 @@
 //! deliberately thin.
 
 use std::collections::HashMap;
-use std::net::IpAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -126,15 +126,45 @@ pub trait DeviceSource: Send + Sync {
     /// Everything seen recently, best-labelled first.
     fn devices(&self) -> Vec<DiscoveredDevice>;
 
-    /// Where one particular device is right now.
+    /// Every address one particular device answered from, best first.
     ///
     /// This is the reconnect path (§1.4): the worker knows *which* master it
-    /// is paired to and needs its current address, not a list.
-    fn address_of(&self, device_id: &str) -> Option<String> {
+    /// is paired to. It gets the whole list rather than the best entry
+    /// because "best" is a guess — see [`next_address`], which is what
+    /// stops a wrong guess becoming permanent.
+    fn addresses_of(&self, device_id: &str) -> Vec<String> {
         self.devices()
             .into_iter()
             .find(|device| device.device_id == device_id)
-            .and_then(|device| device.addresses.into_iter().next())
+            .map(|device| device.addresses)
+            .unwrap_or_default()
+    }
+}
+
+/// The next address to try for a master that is not answering.
+///
+/// A multi-homed master publishes *all* of its addresses — Wi-Fi and
+/// Ethernet, a VPN's `utun`, a Docker bridge — and this crate has no way to
+/// know which of them a given servant can reach. [`rank`] puts them in a
+/// sensible order and then sorts ties by their text, which means a `10.x`
+/// container bridge sorts ahead of the `192.168.x` the user actually meant.
+/// Always dialling the first one would turn that into a permanent dead end:
+/// one unreachable address, chosen once, retried forever, with the rest of
+/// the list never tried at all.
+///
+/// So a failing address advances to the next, wrapping. `None` means there
+/// is nothing new to try — no record, or one address and we are already on
+/// it — and the caller then leaves the client alone.
+pub fn next_address(candidates: &[String], current: &str) -> Option<String> {
+    match candidates.iter().position(|a| a == current) {
+        // Never heard of the address we are on: this is a genuine move (or a
+        // servant that has never had one), so start at the top of the list.
+        None => candidates.first().cloned(),
+        // We are on one of them and it is failing. Rotate — unless it is the
+        // only one, in which case rebuilding the client would achieve
+        // nothing but churn.
+        Some(i) if candidates.len() > 1 => Some(candidates[(i + 1) % candidates.len()].clone()),
+        Some(_) => None,
     }
 }
 
@@ -160,7 +190,11 @@ pub fn describe(
         .map(|name| name.trim())
         .filter(|name| !name.is_empty())
         .map(str::to_owned)
-        .unwrap_or_else(|| format!("maple-{}", &device_id[..device_id.len().min(6)]));
+        // `clip`, not a byte slice: this record was written by whatever is on
+        // the network, not by us, and slicing arbitrary UTF-8 at byte 6
+        // panics — on the browse thread, which would take discovery down
+        // silently for the rest of the session.
+        .unwrap_or_else(|| format!("maple-{}", clip(device_id, 6)));
 
     Some(DiscoveredDevice {
         device_id: device_id.to_owned(),
@@ -220,6 +254,37 @@ fn socket_addr(ip: &IpAddr, port: u16) -> String {
     }
 }
 
+/// At most `max` **bytes**, never splitting a character.
+///
+/// Used on both sides of the wire: on what a stranger advertised (which may
+/// be any UTF-8 at all) and on what this device advertises (where the limit
+/// is the protocol's, see [`Advertiser::start`]).
+fn clip(text: &str, max: usize) -> &str {
+    if text.len() <= max {
+        return text;
+    }
+    let mut end = max;
+    while end > 0 && !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    &text[..end]
+}
+
+/// Longest device name this puts in a TXT record.
+///
+/// RFC 6763 caps one TXT string at 255 bytes including its `key=`, and
+/// `ServiceInfo::new` *rejects* anything longer — which would mean a user
+/// with a very long device name silently has no discovery at all. The name
+/// is a label in a pick-list; clipping it is strictly better than that.
+const MAX_TXT_NAME: usize = 200;
+
+/// Longest instance name this registers under.
+///
+/// A DNS label is 63 bytes, and the instance name is one label. Everything
+/// that identifies the device is in the TXT records anyway, so the clipped
+/// part is decoration.
+const MAX_INSTANCE_NAME: usize = 48;
+
 /// The DNS-SD instance name this device registers under.
 ///
 /// The display name is what a person recognises in someone else's mDNS
@@ -229,11 +294,13 @@ fn socket_addr(ip: &IpAddr, port: u16) -> String {
 /// renaming itself, which is not a negotiation to leave to chance.
 pub fn instance_name(device_id: &str, name: &str) -> String {
     let name = name.trim();
-    let short = &device_id[..device_id.len().min(6)];
+    let short = clip(device_id, 6);
     if name.is_empty() {
         format!("maple-{short}")
     } else {
-        format!("{name} ({short})")
+        // The id suffix is the half that has to survive: it is what makes
+        // the name unique, so the *name* is what gets clipped.
+        format!("{} ({short})", clip(name, MAX_INSTANCE_NAME - short.len() - 3))
     }
 }
 
@@ -243,10 +310,31 @@ pub fn instance_name(device_id: &str, name: &str) -> String {
 /// guaranteed unique, it is stable across a rename, and it does not leak
 /// whatever the user called their laptop to the whole network.
 pub fn host_name(device_id: &str) -> String {
-    format!("maple-{}.local.", &device_id[..device_id.len().min(12)])
+    format!("maple-{}.local.", clip(device_id, 12))
 }
 
 // ── Advertising ─────────────────────────────────────────────────
+
+/// Which addresses to publish for a listener bound to `addr`.
+///
+/// An **empty** result means "let the daemon decide", which is right only
+/// when the listener answers on every interface: `0.0.0.0` or `::` is the
+/// one case where this crate genuinely does not know which address a servant
+/// should use, and `enable_addr_auto` both fills them all in and keeps them
+/// current as interfaces come and go.
+///
+/// A listener bound to *one* address is the opposite situation — we know
+/// exactly which one answers, and publishing the rest advertises addresses
+/// that will refuse the connection. A servant tries them in order, so the
+/// cost is a failed pass and a retry per wrong address, on a link that is
+/// working perfectly.
+fn advertised_ips(addr: SocketAddr) -> Vec<IpAddr> {
+    if addr.ip().is_unspecified() {
+        Vec::new()
+    } else {
+        vec![addr.ip()]
+    }
+}
 
 /// A master's registration. Dropping it takes the service off the network.
 pub struct Advertiser {
@@ -257,32 +345,36 @@ pub struct Advertiser {
 impl Advertiser {
     /// Announce this master on the LAN.
     ///
-    /// `port` is the port the listener actually bound, not the one in
-    /// settings: `listen_addr` may name port 0, and advertising a port
-    /// nothing is listening on is worse than not advertising at all.
-    pub fn start(device_id: &str, name: &str, port: u16) -> anyhow::Result<Self> {
+    /// `bound` is what the listener actually bound, not what settings asked
+    /// for: `listen_addr` may name port 0, and advertising a port nothing is
+    /// listening on is worse than not advertising at all. Its *address* half
+    /// matters too — see [`advertised_ips`].
+    pub fn start(device_id: &str, name: &str, bound: SocketAddr) -> anyhow::Result<Self> {
         let daemon = ServiceDaemon::new()?;
         let properties = HashMap::from([
             (txt::DEVICE_ID.to_owned(), device_id.to_owned()),
-            (txt::NAME.to_owned(), name.to_owned()),
+            (txt::NAME.to_owned(), clip(name, MAX_TXT_NAME).to_owned()),
             (txt::PROTOCOL.to_owned(), PROTOCOL_VERSION.to_string()),
         ]);
+        let ips = advertised_ips(bound);
         let info = ServiceInfo::new(
             SERVICE_TYPE,
             &instance_name(device_id, name),
             &host_name(device_id),
-            // Empty, because `enable_addr_auto` fills in every local address
-            // and keeps them current. The listener binds `0.0.0.0`, so this
-            // crate genuinely does not know which address a servant should
-            // use — the daemon does.
-            "",
-            port,
+            &ips[..],
+            bound.port(),
             properties,
-        )?
-        .enable_addr_auto();
+        )?;
+        // Only when the listener answers on every interface: `addr_auto`
+        // publishes all of them and keeps them current as they change.
+        let info = if ips.is_empty() {
+            info.enable_addr_auto()
+        } else {
+            info
+        };
         let fullname = info.get_fullname().to_owned();
         daemon.register(info)?;
-        tracing::info!("sync discovery: advertising {fullname} on port {port}");
+        tracing::info!("sync discovery: advertising {fullname} on {bound}");
         Ok(Self { daemon, fullname })
     }
 
@@ -313,12 +405,14 @@ impl Drop for Advertiser {
 /// A running browse. Dropping it stops the thread and the daemon.
 pub struct Browser {
     daemon: ServiceDaemon,
-    /// Keyed by DNS-SD fullname, because that is what a removal names. Two
-    /// entries can carry one device id — a master that was renamed and
-    /// re-registered before its old record expired — and [`devices`] is
-    /// where that is collapsed.
-    ///
-    /// [`devices`]: DeviceSource::devices
+    /// Keyed by DNS-SD fullname **lower-cased**, because that is what a
+    /// removal names and DNS names are case-insensitive: a peer is free to
+    /// answer `Studio._maple-sync…` to one query and `studio._maple-sync…`
+    /// to the next, and a case-sensitive key would then fail to remove the
+    /// record and leave a dead master in the pick-list for the rest of the
+    /// session. Two entries can still carry one device id — a master
+    /// renamed and re-registered before its old record expired — and
+    /// [`collapse`] is where that is resolved.
     found: Arc<Mutex<HashMap<String, DiscoveredDevice>>>,
     stop: Arc<AtomicBool>,
     thread: Option<std::thread::JoinHandle<()>>,
@@ -360,11 +454,11 @@ impl Browser {
                                         device.address().unwrap_or("nowhere")
                                     );
                                     lock(&found)
-                                        .insert(service.get_fullname().to_owned(), device);
+                                        .insert(key(service.get_fullname()), device);
                                 }
                             }
                             Ok(ServiceEvent::ServiceRemoved(_, fullname)) => {
-                                lock(&found).remove(&fullname);
+                                lock(&found).remove(&key(&fullname));
                             }
                             Ok(_) => {}
                             // The daemon is gone; nothing further will
@@ -373,6 +467,14 @@ impl Browser {
                             Err(mdns_sd::RecvTimeoutError::Timeout) => {}
                         }
                     }
+                    // Nothing is listening to the network any more, so
+                    // nothing here can be trusted to still be true — records
+                    // expire through events this thread is no longer
+                    // receiving. Better to report an empty network than a
+                    // remembered one: an empty pick-list sends the user to
+                    // the address field, while a stale row sends them to a
+                    // machine that may be long gone.
+                    lock(&found).clear();
                 }
             })?;
 
@@ -387,14 +489,28 @@ impl Browser {
 
 impl DeviceSource for Browser {
     fn devices(&self) -> Vec<DiscoveredDevice> {
-        let mut devices: Vec<DiscoveredDevice> = lock(&self.found).values().cloned().collect();
-        devices.sort_by(|a, b| {
-            (&a.name, &a.device_id)
-                .cmp(&(&b.name, &b.device_id))
-        });
-        devices.dedup_by(|a, b| a.device_id == b.device_id);
-        devices
+        collapse(lock(&self.found).values().cloned().collect())
     }
+}
+
+/// One row per device, sorted for display.
+///
+/// Two records can describe one device — a master that was renamed and
+/// re-registered before its old record expired, or one answering on two
+/// interfaces — and the pick-list must not show it twice. The order matters
+/// more than it looks: `dedup_by` only removes *adjacent* equals, so the
+/// collapsing pass has to sort by the key it collapses on, and the display
+/// sort has to come afterwards. Within a device, a record carrying a usable
+/// address beats one carrying none.
+fn collapse(mut devices: Vec<DiscoveredDevice>) -> Vec<DiscoveredDevice> {
+    devices.sort_by(|a, b| {
+        a.device_id
+            .cmp(&b.device_id)
+            .then_with(|| b.addresses.len().cmp(&a.addresses.len()))
+    });
+    devices.dedup_by(|a, b| a.device_id == b.device_id);
+    devices.sort_by(|a, b| (&a.name, &a.device_id).cmp(&(&b.name, &b.device_id)));
+    devices
 }
 
 impl Drop for Browser {
@@ -407,6 +523,11 @@ impl Drop for Browser {
             let _ = thread.join();
         }
     }
+}
+
+/// A DNS name as a map key. Case-insensitive, per RFC 1035 §2.3.3.
+fn key(fullname: &str) -> String {
+    fullname.to_lowercase()
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
@@ -538,6 +659,86 @@ mod tests {
     }
 
     #[test]
+    fn one_device_answering_twice_is_listed_once() {
+        // A master renamed and re-registered before its old record expired.
+        // Both names are on the network; the pick-list must not offer the
+        // same machine twice, and must keep the record that can be dialled.
+        let stale = DiscoveredDevice {
+            device_id: "dev-a".into(),
+            name: "Zebra (old name)".into(),
+            protocol: PROTOCOL_VERSION,
+            addresses: Vec::new(),
+        };
+        let current = DiscoveredDevice {
+            device_id: "dev-a".into(),
+            name: "Attic".into(),
+            protocol: PROTOCOL_VERSION,
+            addresses: vec!["192.168.1.9:7645".into()],
+        };
+        let other = DiscoveredDevice {
+            device_id: "dev-b".into(),
+            name: "Studio".into(),
+            protocol: PROTOCOL_VERSION,
+            addresses: vec!["192.168.1.20:7645".into()],
+        };
+
+        let listed = collapse(vec![stale, current, other]);
+        assert_eq!(
+            listed.iter().map(|d| d.name.as_str()).collect::<Vec<_>>(),
+            vec!["Attic", "Studio"],
+            "one row per device, sorted by name, and the dialable record wins"
+        );
+    }
+
+    #[test]
+    fn a_record_written_by_a_stranger_cannot_panic_the_browse_thread() {
+        // Every field here came off the network. Slicing `device_id` at byte
+        // 6 to build the fallback name splits this one mid-character, which
+        // would take the browse thread down for the rest of the session.
+        // `a🍁🍁device` is chosen precisely because byte 6 falls *inside*
+        // the second leaf — `&id[..6]` on it panics, verified.
+        let device = describe(
+            &properties(&[(txt::DEVICE_ID, "a🍁🍁device")]),
+            &[v4("192.168.1.20")],
+            7645,
+        )
+        .expect("a device id is a device id whatever it is made of");
+        assert_eq!(device.name, "maple-a🍁");
+        assert_eq!(device.device_id, "a🍁🍁device");
+    }
+
+    #[test]
+    fn a_very_long_device_name_still_advertises() {
+        // `ServiceInfo::new` rejects a TXT string over 255 bytes and a DNS
+        // label is 63 — so without clipping, a user with a long device name
+        // gets no discovery at all, and only a log line to say why.
+        let name = "Ludwig".repeat(60);
+        let instance = instance_name("aaaaaa111111", &name);
+        assert!(instance.len() <= 48, "{} bytes", instance.len());
+        assert!(instance.ends_with(" (aaaaaa)"), "the unique half survives: {instance}");
+        assert!(clip(&name, MAX_TXT_NAME).len() <= MAX_TXT_NAME);
+
+        // …and clipping never splits a character, whatever the boundary.
+        let emoji = "🍁".repeat(30);
+        assert!(clip(&emoji, 7).chars().all(|c| c == '🍁'));
+        assert_eq!(clip(&emoji, 7), "🍁");
+    }
+
+    #[test]
+    fn a_listener_on_one_interface_advertises_only_that_one() {
+        // Binding `0.0.0.0` is "answer everywhere", and only the daemon knows
+        // what everywhere is today. Binding one address is the opposite: we
+        // know exactly which one answers, and the others would each cost a
+        // servant a failed pass.
+        assert!(advertised_ips("0.0.0.0:7645".parse().unwrap()).is_empty());
+        assert!(advertised_ips("[::]:7645".parse().unwrap()).is_empty());
+        assert_eq!(
+            advertised_ips("192.168.1.20:7645".parse().unwrap()),
+            vec![v4("192.168.1.20")]
+        );
+    }
+
+    #[test]
     fn two_devices_of_the_same_name_get_different_instances() {
         assert_ne!(
             instance_name("aaaaaa111111", "MacBook"),
@@ -566,7 +767,8 @@ mod tests {
         // really does take it off the network rather than leaving a record
         // to expire.
         let device_id = "dev-live-0123456789";
-        let advertiser = Advertiser::start(device_id, "Live Test", 7645).expect("advertise");
+        let advertiser = Advertiser::start(device_id, "Live Test", "0.0.0.0:7645".parse().unwrap())
+            .expect("advertise");
         let browser = Browser::start().expect("browse");
 
         let found = wait_for(&browser, |devices| {
@@ -608,6 +810,35 @@ mod tests {
     }
 
     #[test]
+    fn a_failing_address_moves_on_to_the_next_one() {
+        // The dead end this exists to prevent: a master publishing a Docker
+        // bridge and a real LAN address, where the bridge sorts first and
+        // cannot be reached from the servant.
+        let both = vec!["10.0.0.4:7645".to_owned(), "192.168.1.20:7645".to_owned()];
+        assert_eq!(
+            next_address(&both, "10.0.0.4:7645").as_deref(),
+            Some("192.168.1.20:7645")
+        );
+        // …and back again, so neither is abandoned permanently.
+        assert_eq!(
+            next_address(&both, "192.168.1.20:7645").as_deref(),
+            Some("10.0.0.4:7645")
+        );
+        // A stale stored address is not in the list at all: start at the top.
+        assert_eq!(next_address(&both, "127.0.0.1:9").as_deref(), Some("10.0.0.4:7645"));
+    }
+
+    #[test]
+    fn one_address_that_is_already_current_is_not_a_move() {
+        // Nothing to rotate to. Rebuilding the client every failed pass
+        // would be churn, and resetting the backoff with it would stop the
+        // retry schedule ever growing.
+        let one = vec!["192.168.1.20:7645".to_owned()];
+        assert_eq!(next_address(&one, "192.168.1.20:7645"), None);
+        assert_eq!(next_address(&[], "192.168.1.20:7645"), None);
+    }
+
+    #[test]
     fn a_source_resolves_one_device_by_id() {
         let source = Fake(vec![
             DiscoveredDevice {
@@ -623,7 +854,10 @@ mod tests {
                 addresses: vec!["192.168.1.5:7645".into(), "127.0.0.1:7645".into()],
             },
         ]);
-        assert_eq!(source.address_of("dev-b").as_deref(), Some("192.168.1.5:7645"));
-        assert_eq!(source.address_of("dev-c"), None);
+        assert_eq!(
+            source.addresses_of("dev-b"),
+            vec!["192.168.1.5:7645".to_owned(), "127.0.0.1:7645".to_owned()]
+        );
+        assert!(source.addresses_of("dev-c").is_empty());
     }
 }

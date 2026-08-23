@@ -19,7 +19,7 @@ use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use slint::{ComponentHandle, SharedString, Timer, TimerMode};
+use slint::{ComponentHandle, Model, SharedString, Timer, TimerMode};
 
 use maple_state::SyncRole;
 use maple_sync::TrustedPeer;
@@ -273,15 +273,27 @@ fn wire_sync(
         let sync = sync.clone();
         move |name| {
             let Some(w) = w.upgrade() else { return };
+            let mut renamed = false;
             {
                 let guard = maple_db::lock_db(&db);
                 match guard.set_device_name(&name) {
-                    Ok(()) => w.set_status_text(SharedString::from("Device renamed.")),
+                    Ok(()) => {
+                        w.set_status_text(SharedString::from("Device renamed."));
+                        renamed = true;
+                    }
                     Err(e) => {
                         tracing::error!("Failed to rename device: {e}");
                         w.set_status_text(SharedString::from(format!("Could not rename: {e}")));
                     }
                 }
+            }
+            if renamed {
+                // The name is baked into the mDNS record, so a master that
+                // does not re-publish keeps introducing itself by its old
+                // name in every pick-list on the network. Only on success:
+                // a rename that failed left the stored name alone, and the
+                // record already carries it.
+                sync.renamed();
             }
             populate_sync(&w, &db, &sync);
         }
@@ -635,12 +647,25 @@ fn refresh_pairing(window: &SettingsWindow, pairing: &Rc<RefCell<PairingControll
             chosen: device.chosen,
         })
         .collect();
-    // Replaced wholesale each tick: mDNS answers trickle in over the first
-    // few seconds a modal is open, and the list is three rows at most.
-    window.set_pairing_devices(slint::ModelRc::new(slint::VecModel::from(devices)));
+    // Only when it actually changed. This runs once a second for as long as
+    // the modal is open, and replacing the model rebuilds the repeater's
+    // items — which resets the `has-hover` a row is drawing itself from, so
+    // an unconditional set makes the highlight blink under the pointer once
+    // a second. Same rule as the library grid's refresh.
+    if !same_devices(&window.get_pairing_devices(), &devices) {
+        window.set_pairing_devices(slint::ModelRc::new(slint::VecModel::from(devices)));
+    }
     if window.get_pairing_entered().as_str() != view.entered {
         window.set_pairing_entered(SharedString::from(view.entered));
     }
+}
+
+/// Whether the pick-list on screen already says exactly this.
+fn same_devices(shown: &slint::ModelRc<PairingDeviceItem>, fresh: &[PairingDeviceItem]) -> bool {
+    shown.row_count() == fresh.len()
+        && shown.iter().zip(fresh).all(|(a, b)| {
+            a.address == b.address && a.label == b.label && a.chosen == b.chosen
+        })
 }
 
 /// Start the one-second countdown. Replaces any timer already running, so

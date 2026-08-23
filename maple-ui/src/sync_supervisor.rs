@@ -229,7 +229,7 @@ impl SyncSupervisor {
         match result {
             Ok(server) => {
                 tracing::info!("sync: listening on {}", server.local_addr());
-                self.advertise(server.local_addr().port());
+                self.advertise(server.local_addr());
                 *self.server.borrow_mut() = Some(server);
             }
             Err(e) => {
@@ -244,12 +244,41 @@ impl SyncSupervisor {
         }
     }
 
-    /// Publish this master's `_maple-sync._tcp` record.
+    /// Re-publish the mDNS record under a new device name.
     ///
-    /// Not fatal if it fails: a servant that already knows the address keeps
-    /// working, and one that does not can still be given it by hand. The
-    /// listener is the feature; discovery is how it gets found.
-    fn advertise(&self, port: u16) {
+    /// Deliberately not a [`Self::restart`]: the name is the *only* thing
+    /// that went stale. `/sync/hello` reads it from the database on every
+    /// request, so the listener is already correct, and tearing it down
+    /// would drop whatever a servant had in flight for a cosmetic change.
+    /// A no-op when this device is not advertising.
+    pub fn renamed(&self) {
+        let Some(bound) = self
+            .server
+            .borrow()
+            .as_ref()
+            .map(|server| server.local_addr())
+        else {
+            return;
+        };
+        // The device-name field commits on Enter, which the user may press
+        // without having changed anything. Re-publishing then would take the
+        // record off every browser on the network and put an identical one
+        // back, for nothing.
+        if self.advertising_current_name() {
+            return;
+        }
+        // Dropped first, so the old instance name gets its goodbye instead
+        // of sitting beside the new one on every browser until it expires.
+        *self.advertiser.borrow_mut() = None;
+        self.advertise(bound);
+    }
+
+    /// Whether the live registration already carries the stored name.
+    fn advertising_current_name(&self) -> bool {
+        let Some(advertiser) = self.advertiser.borrow().as_ref().map(|a| a.fullname().to_owned())
+        else {
+            return false;
+        };
         let (device_id, name) = {
             let db = maple_db::lock_db(&self.db);
             (
@@ -257,7 +286,23 @@ impl SyncSupervisor {
                 db.device_name().unwrap_or_default(),
             )
         };
-        match Advertiser::start(&device_id, &name, port) {
+        advertiser.starts_with(&maple_sync::discovery::instance_name(&device_id, &name))
+    }
+
+    /// Publish this master's `_maple-sync._tcp` record.
+    ///
+    /// Not fatal if it fails: a servant that already knows the address keeps
+    /// working, and one that does not can still be given it by hand. The
+    /// listener is the feature; discovery is how it gets found.
+    fn advertise(&self, bound: std::net::SocketAddr) {
+        let (device_id, name) = {
+            let db = maple_db::lock_db(&self.db);
+            (
+                db.device_id().to_owned(),
+                db.device_name().unwrap_or_default(),
+            )
+        };
+        match Advertiser::start(&device_id, &name, bound) {
             Ok(advertiser) => *self.advertiser.borrow_mut() = Some(advertiser),
             Err(e) => tracing::warn!("sync: could not advertise over mDNS: {e}"),
         }

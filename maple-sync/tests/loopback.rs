@@ -991,11 +991,15 @@ struct FakeDiscovery(Mutex<Vec<DiscoveredDevice>>);
 
 impl FakeDiscovery {
     fn holding(device_id: &str, address: &str) -> Arc<Self> {
+        Self::holding_all(device_id, &[address])
+    }
+
+    fn holding_all(device_id: &str, addresses: &[&str]) -> Arc<Self> {
         Arc::new(Self(Mutex::new(vec![DiscoveredDevice {
             device_id: device_id.to_owned(),
             name: "Workstation".into(),
             protocol: maple_sync::PROTOCOL_VERSION,
-            addresses: vec![address.to_owned()],
+            addresses: addresses.iter().map(|a| (*a).to_owned()).collect(),
         }])))
     }
 }
@@ -1162,6 +1166,68 @@ fn a_master_this_device_has_never_dialled_is_found_from_nothing() {
     });
     worker.stop();
     assert_eq!(relocations.lock().unwrap().as_slice(), &[master.address()]);
+}
+
+#[test]
+fn a_master_whose_first_address_is_unreachable_is_reached_at_its_second() {
+    // A multi-homed master publishes every address it has, and this crate
+    // cannot tell which one a given servant can reach — a Docker bridge on
+    // `10.x` even sorts ahead of the `192.168.x` that works. Dialling only
+    // the first would make one wrong guess permanent.
+    let clock = TestClock::new();
+    let master = Master::start(&clock, seeded(130));
+    let servant = Install::new("Laptop");
+    let client = client(&master, &servant, &clock, seeded(131));
+    pair(&master, &servant, &client, &clock, "482107", "314159").unwrap();
+
+    master
+        .install
+        .db()
+        .create_collection("From the master", "#3584e4", None)
+        .unwrap();
+
+    let (relocations, on_relocate) = relocation_spy();
+    let status = maple_sync::SyncStatus::cell(maple_state::SyncRole::Servant);
+    let worker = maple_sync::worker::spawn(
+        maple_sync::WorkerConfig {
+            address: "127.0.0.1:9".into(),
+            master_device_id: master.install.device_id.clone(),
+            interval: Duration::from_millis(50),
+            max_revs: 500,
+            layout: servant.layout(),
+        },
+        maple_sync::worker::WorkerDeps {
+            db: servant.db.clone(),
+            trust: servant.trust.clone(),
+            status,
+            clock: clock.handle(),
+            rng: seeded(132),
+            on_change: Arc::new(|| {}),
+            // Port 8 is discard, port 9 is discard: neither answers. The
+            // real master is last in the list, so only rotation finds it.
+            discovery: Some(FakeDiscovery::holding_all(
+                &master.install.device_id,
+                &["127.0.0.1:8", &master.address()],
+            )),
+            on_relocate,
+        },
+    );
+
+    wait_until("the servant to work down the list to a live address", || {
+        collection_names(&servant) == vec!["From the master".to_owned()]
+    });
+    worker.stop();
+
+    let seen = relocations.lock().unwrap().clone();
+    assert_eq!(
+        seen.first().map(String::as_str),
+        Some("127.0.0.1:8"),
+        "the first candidate is tried first: {seen:?}"
+    );
+    assert!(
+        seen.contains(&master.address()),
+        "and the ring reaches the one that answers: {seen:?}"
+    );
 }
 
 #[test]

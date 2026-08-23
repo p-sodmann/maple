@@ -55,6 +55,15 @@ const CLAIM_TIMEOUT: Duration = Duration::from_secs(8);
 /// How long the servant waits between `TooEarly` answers.
 const CLAIM_POLL: Duration = Duration::from_secs(1);
 
+/// Most devices the pick-list will show.
+///
+/// The modal is a fixed-width card in a `VerticalLayout` with no scroll
+/// area, so its height is the sum of its rows: on a network with twenty
+/// masters an uncapped list would run off the bottom of the screen, taking
+/// the Pair button with it. Anything not shown is still reachable by typing
+/// its address — the same fallback a blocked-multicast network uses.
+const MAX_DEVICES_SHOWN: usize = 6;
+
 /// Which half of the handshake this device is playing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PairingSide {
@@ -273,6 +282,7 @@ impl PairingController {
                     address,
                 })
             })
+            .take(MAX_DEVICES_SHOWN)
             .collect()
     }
 
@@ -748,6 +758,16 @@ mod tests {
         assert!(view.devices.iter().all(|d| !d.chosen));
         assert!(view.can_submit);
         let _ = deps;
+    }
+
+    #[test]
+    fn a_crowded_network_does_not_grow_the_modal_off_the_screen() {
+        // The card has no scroll area, so its height is the sum of its rows.
+        let crowd: Vec<_> = (0..20)
+            .map(|i| found(&format!("Master{i}"), &format!("192.168.1.{i}:7645")))
+            .collect();
+        let (mut c, _deps) = servant_with(crowd);
+        assert_eq!(c.tick(T0).devices.len(), MAX_DEVICES_SHOWN);
     }
 
     #[test]
