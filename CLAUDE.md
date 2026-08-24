@@ -11,6 +11,22 @@ cargo test --workspace
 cargo clippy --workspace
 ```
 
+### Dependency updates
+
+```sh
+./scripts/update-deps.py            # report only
+./scripts/update-deps.py --apply    # bump manifests, cargo update, cargo check
+```
+
+Stdlib-only Python: reads the requirements out of every `Cargo.toml`, asks the
+crates.io sparse index for the newest non-yanked release, and compares both
+against `Cargo.lock`. A `lock` row is inside the existing requirement (`cargo
+update` alone gets it); a `bump` row is semver-incompatible and rewrites the
+version literal in the manifest, keeping the requirement's precision and the
+comments around it. `=x.y.z` pins (`ort`) are reported and skipped unless
+`--include-pinned` — the pin is deliberate, and ort's index carries only
+prereleases.
+
 No system GTK headers needed — Slint ships its own renderer. A C toolchain is
 still required (MSVC Build Tools on Windows, Xcode CLT on macOS,
 `build-essential` on Linux): `rusqlite` (`bundled`), `sqlite-vec`, and `webp`
