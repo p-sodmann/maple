@@ -225,7 +225,7 @@ component ImportGridView {
                     }
 
                     // One corner, one verdict — a yellow dot for "import
-                    // it", a red ✗ for "moved past it", nothing at all for
+                    // it", a red × for "moved past it", nothing at all for
                     // one not looked at yet. Which of the three applies is
                     // settled in `make_item`, not here.
                     if item.is-selected: Rectangle {
@@ -250,7 +250,8 @@ component ImportGridView {
                         // scrubbing the strip.
                         background: #000000.with-alpha(0.55);
                         Text {
-                            text: "✗";
+                            // U+00D7 — see the note on the tag chip.
+                            text: "×";
                             color: Theme.rejected;
                             font-size: 12px;
                             font-weight: 700;
@@ -767,7 +768,7 @@ export component ImportWindow inherits Window {
                                         text: root.preview-state == 1
                                             ? "● marked for import"
                                             : (root.preview-state == 2
-                                                ? "✗ not imported"
+                                                ? "× not imported"
                                                 : "✓ already in library");
                                         color: root.preview-state == 1
                                             ? Theme.marked
@@ -870,7 +871,7 @@ export component ImportWindow inherits Window {
         // Deliberately not a modal, and deliberately without a TouchArea of
         // its own: a bare Rectangle does not intercept pointer events in
         // Slint, so clicks land on the preview underneath and triage carries
-        // on around it. Only the ✕ on a chip takes a click.
+        // on around it. Only the × on a chip takes a click.
         //
         // Always present in the browser rather than only when tags are set —
         // the brush is invisible state that silently changes what an import
@@ -939,7 +940,12 @@ export component ImportWindow inherits Window {
                         chip-x := TouchArea {
                             width: 18px;
                             Text {
-                                text: "✕";
+                                // U+00D7, not U+2715. The Dingbats X renders
+                                // as tofu in the default macOS UI font even
+                                // though the check mark beside it (U+2713)
+                                // does not; the Latin-1 multiplication sign
+                                // is in every font that can draw the label.
+                                text: "×";
                                 color: chip-x.has-hover ? Theme.fg : Theme.dim-fg;
                                 font-size: 10px;
                                 horizontal-alignment: center;
