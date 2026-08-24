@@ -5,7 +5,7 @@
 
 import { Theme } from "theme.slint";
 import { FlatButton, PillButton, ProgressBar } from "widgets.slint";
-import { ScrollView } from "std-widgets.slint";
+import { ScrollView, LineEdit } from "std-widgets.slint";
 
 // ── Exported structs ──────────────────────────────────────────────
 
@@ -17,6 +17,17 @@ export struct ImportLocation {
     count:       int,
     is-starred:  bool,
     is-selected: bool,
+}
+
+// A label the import brush can apply. Backed by a row in `collections` —
+// Maple has one labelling system, and an import tag is a collection you
+// happened to assign while triaging rather than afterwards.
+export struct ImportTag {
+    id: int,
+    name: string,
+    color: color,
+    // Picker only: this tag is on the brush right now.
+    chosen: bool,
 }
 
 export struct ImportItem {
@@ -436,6 +447,15 @@ export component ImportWindow inherits Window {
     // hide.
     in property <int> old-count: 0;
     in-out property <bool> hide-old: true;
+    // The brush: the tags every photo marked from here on will carry. Shown
+    // in the floating panel so it is legible while triaging, because it
+    // changes *within* a pass rather than being set once per import.
+    in property <[ImportTag]> tags;
+    // Every tag in the library, `chosen` set for the ones on the brush.
+    // Only populated while the picker is open.
+    in property <[ImportTag]> tag-choices;
+    in-out property <bool> tag-picker-open: false;
+
     // Verdict on the photo in the big preview: 0 undecided, 1 marked for
     // import, 2 moved past, 3 already in the library. Mirrors the badge on
     // its tile, where the user is not necessarily looking.
@@ -466,8 +486,21 @@ export component ImportWindow inherits Window {
     callback nav-next;
     // rotate(clockwise): true = 90° CW, false = 90° CCW.
     callback rotate(bool);
+    callback open-tag-picker;
+    callback close-tag-picker;
+    // Add or remove one tag from the brush, by collection id.
+    callback tag-toggled(int);
+    // Create a tag by name and put it on the brush. An existing name is
+    // adopted rather than rejected — `collections.name` is UNIQUE.
+    callback tag-created(string);
+    callback clear-tags;
+    // Hand the keyboard back to the triage scope. The picker's name field
+    // takes focus while it is open, and nothing returns it on close — the
+    // hotkeys would stay dead until the user clicked somewhere.
+    callback refocus-keys;
 
     init => { key-scope.focus(); }
+    refocus-keys => { key-scope.focus(); }
 
     key-scope := FocusScope {
         width: 100%;
@@ -475,10 +508,20 @@ export component ImportWindow inherits Window {
 
         key-pressed(event) => {
             if event.text == Key.Escape {
+                // The picker is the innermost thing open, so it swallows the
+                // first Escape — closing the whole window out from under a
+                // half-typed tag name would be the wrong reading.
+                if root.tag-picker-open {
+                    root.close-tag-picker();
+                    return accept;
+                }
                 root.close-requested();
                 return accept;
             }
-            if root.in-browser {
+            // While the picker is open every letter belongs to its name
+            // field, so the triage hotkeys stand down rather than firing
+            // behind it.
+            if root.in-browser && !root.tag-picker-open {
                 if event.text == Key.LeftArrow || event.text == Key.UpArrow {
                     root.nav-prev();
                     return accept;
@@ -489,6 +532,14 @@ export component ImportWindow inherits Window {
                 }
                 if event.text == "x" || event.text == "X" {
                     root.item-clicked(root.current-index);
+                    return accept;
+                }
+                if event.text == "s" || event.text == "S" {
+                    root.open-tag-picker();
+                    return accept;
+                }
+                if event.text == "c" || event.text == "C" {
+                    root.clear-tags();
                     return accept;
                 }
             }
@@ -808,6 +859,238 @@ export component ImportWindow inherits Window {
                             vertical-alignment: center;
                             horizontal-alignment: center;
                             overflow: elide;
+                        }
+                    }
+                }
+            }
+        }
+
+        // ── The brush, floating over the preview ──────────────────
+        //
+        // Deliberately not a modal, and deliberately without a TouchArea of
+        // its own: a bare Rectangle does not intercept pointer events in
+        // Slint, so clicks land on the preview underneath and triage carries
+        // on around it. Only the ✕ on a chip takes a click.
+        //
+        // Always present in the browser rather than only when tags are set —
+        // the brush is invisible state that silently changes what an import
+        // writes, so "none" needs saying as loudly as a name does, and it is
+        // where both hotkeys are advertised.
+        if root.in-browser: Rectangle {
+            x: 16px;
+            y: parent.height - self.height - 44px;
+            width: 194px;
+            height: 26px + Math.max(root.tags.length, 1) * 24px + 12px;
+            background: Theme.card-bg;
+            border-radius: Theme.radius-card;
+            border-width: 1px;
+            border-color: Theme.separator-color;
+            drop-shadow-blur: 18px;
+            drop-shadow-offset-y: 4px;
+            drop-shadow-color: Theme.dark ? #00000070 : #00000024;
+
+            VerticalLayout {
+                padding: 8px;
+                spacing: 2px;
+
+                Text {
+                    text: "IMPORT TAGS  ·  S ADD  ·  C CLEAR";
+                    color: Theme.dim-fg;
+                    font-size: 9px;
+                    font-weight: 700;
+                    letter-spacing: 0.5px;
+                    height: 16px;
+                    overflow: elide;
+                }
+
+                if root.tags.length == 0: Text {
+                    text: "none — imports stay untagged";
+                    color: Theme.dim-fg;
+                    font-size: 11px;
+                    height: 24px;
+                    vertical-alignment: center;
+                    overflow: elide;
+                }
+
+                for t in root.tags: Rectangle {
+                    height: 24px;
+
+                    HorizontalLayout {
+                        spacing: 6px;
+
+                        Rectangle {
+                            width: 9px;
+                            Rectangle {
+                                width: 9px;
+                                height: 9px;
+                                y: (parent.height - self.height) / 2;
+                                border-radius: 4.5px;
+                                background: t.color;
+                            }
+                        }
+                        Text {
+                            text: t.name;
+                            color: Theme.fg;
+                            font-size: 12px;
+                            vertical-alignment: center;
+                            horizontal-stretch: 1;
+                            overflow: elide;
+                        }
+                        chip-x := TouchArea {
+                            width: 18px;
+                            Text {
+                                text: "✕";
+                                color: chip-x.has-hover ? Theme.fg : Theme.dim-fg;
+                                font-size: 10px;
+                                horizontal-alignment: center;
+                                vertical-alignment: center;
+                            }
+                            clicked => { root.tag-toggled(t.id); }
+                        }
+                    }
+                }
+            }
+        }
+
+        // ── Tag picker (S) ────────────────────────────────────────
+        //
+        // This one *is* modal: it owns the keyboard while it is open (the
+        // triage hotkeys stand down for it), and a name being typed should
+        // not also be marking photos.
+        if root.tag-picker-open: Rectangle {
+            x: 0;
+            y: 0;
+            width: 100%;
+            height: 100%;
+            background: #000000.with-alpha(0.45);
+
+            TouchArea {
+                width: 100%;
+                height: 100%;
+                clicked => { root.close-tag-picker(); }
+            }
+
+            Rectangle {
+                x: (parent.width - self.width) / 2;
+                y: (parent.height - self.height) / 2;
+                width: 340px;
+                height: 400px;
+                background: Theme.card-bg;
+                border-radius: Theme.radius-card;
+                border-width: 1px;
+                border-color: Theme.separator-color;
+                drop-shadow-blur: 32px;
+                drop-shadow-offset-y: 8px;
+                drop-shadow-color: Theme.dark ? #00000070 : #00000028;
+                clip: true;
+
+                // Absorb pointer events, or a click on the card reaches the
+                // backdrop behind it and closes the picker.
+                TouchArea { width: 100%; height: 100%; }
+
+                VerticalLayout {
+                    padding: 16px;
+                    spacing: 10px;
+
+                    Text {
+                        text: "Tag photos as…";
+                        color: Theme.fg;
+                        font-size: 15px;
+                        font-weight: 700;
+                        height: 20px;
+                    }
+                    Text {
+                        text: "Applies to every photo you mark from now on. Photos already marked keep the tags they were marked with.";
+                        color: Theme.dim-fg;
+                        font-size: 11px;
+                        wrap: word-wrap;
+                    }
+
+                    name-field := LineEdit {
+                        placeholder-text: "New tag name…";
+                        // The picker is opened from the keyboard, so it has
+                        // to be typeable without reaching for the mouse:
+                        // S, type, Enter.
+                        init => { name-field.focus(); }
+                        accepted(t) => {
+                            if t != "" {
+                                root.tag-created(t);
+                                name-field.text = "";
+                            }
+                        }
+                    }
+
+                    if root.tag-choices.length == 0: Text {
+                        text: "No tags yet — type a name above and press Enter.";
+                        color: Theme.dim-fg;
+                        font-size: 11px;
+                        vertical-stretch: 1;
+                        wrap: word-wrap;
+                    }
+
+                    if root.tag-choices.length > 0: choices := ScrollView {
+                        vertical-stretch: 1;
+                        viewport-width: choices.visible-width;
+                        viewport-height: root.tag-choices.length * 30px;
+
+                        for t[i] in root.tag-choices: Rectangle {
+                            y: i * 30px;
+                            width: 100%;
+                            height: 28px;
+                            border-radius: 6px;
+                            background: row-ta.has-hover ? Theme.card-bg-hover : transparent;
+
+                            row-ta := TouchArea {
+                                clicked => { root.tag-toggled(t.id); }
+                            }
+
+                            HorizontalLayout {
+                                padding-left: 8px;
+                                padding-right: 8px;
+                                spacing: 8px;
+
+                                Rectangle {
+                                    width: 9px;
+                                    Rectangle {
+                                        width: 9px;
+                                        height: 9px;
+                                        y: (parent.height - self.height) / 2;
+                                        border-radius: 4.5px;
+                                        background: t.color;
+                                    }
+                                }
+                                Text {
+                                    text: t.name;
+                                    color: Theme.fg;
+                                    font-size: 12px;
+                                    vertical-alignment: center;
+                                    horizontal-stretch: 1;
+                                    overflow: elide;
+                                }
+                                Text {
+                                    text: t.chosen ? "✓" : "";
+                                    color: Theme.accent;
+                                    font-size: 13px;
+                                    font-weight: 700;
+                                    vertical-alignment: center;
+                                }
+                            }
+                        }
+                    }
+
+                    HorizontalLayout {
+                        height: 30px;
+                        spacing: 8px;
+
+                        FlatButton {
+                            text: "Clear all";
+                            enabled: root.tags.length > 0;
+                            clicked => { root.clear-tags(); }
+                        }
+                        Rectangle { horizontal-stretch: 1; }
+                        FlatButton {
+                            text: "Done";
+                            clicked => { root.close-tag-picker(); }
                         }
                     }
                 }

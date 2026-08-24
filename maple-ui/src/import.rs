@@ -308,6 +308,21 @@ struct ImportCtx {
     /// Detected burst groups from the last scan — each a sorted list of
     /// flat `entries` indices. Populated once, when the scan finishes.
     groups: Rc<RefCell<Vec<Vec<usize>>>>,
+    /// The tags every photo marked from *now on* will carry.
+    ///
+    /// A brush, not a batch setting: it survives a copy, changes mid-pass,
+    /// and is cleared with `c`. Which is exactly why it needs the floating
+    /// panel — invisible state that silently changes what an import writes
+    /// would be a trap.
+    brush: Rc<RefCell<Vec<Tag>>>,
+    /// Entry index → the collection ids that were on the brush at the moment
+    /// that photo was marked.
+    ///
+    /// Recorded at mark time rather than read at copy time, so changing the
+    /// brush half way through a pass tags the two halves differently.
+    /// Unmarking a photo drops its record, so this can never outlive the
+    /// selection it belongs to.
+    brushed: Rc<RefCell<HashMap<usize, Vec<i64>>>>,
     /// Timer slots for the in-flight background jobs. Each holds its poller
     /// alive for as long as the job it drains can still report back.
     scan_timer: Rc<RefCell<Option<Timer>>>,
@@ -413,6 +428,8 @@ fn build(db: Arc<Mutex<maple_db::Database>>) -> Result<Import, slint::PlatformEr
         source: Rc::new(RefCell::new(PathBuf::new())),
         dest,
         groups: Rc::new(RefCell::new(Vec::new())),
+        brush: Rc::new(RefCell::new(Vec::new())),
+        brushed: Rc::new(RefCell::new(HashMap::new())),
         scan_timer: Rc::new(RefCell::new(None)),
         copy_timer: Rc::new(RefCell::new(None)),
         copy_done_timer: Rc::new(RefCell::new(None)),
@@ -424,6 +441,7 @@ fn build(db: Arc<Mutex<maple_db::Database>>) -> Result<Import, slint::PlatformEr
     wire_browse(&window, &ctx);
     wire_copy(&window, &ctx);
     wire_rotate(&window, &ctx);
+    wire_tags(&window, &ctx);
 
     Ok(Import { window, ctx })
 }
@@ -1398,14 +1416,22 @@ fn wire_browse(window: &ImportWindow, ctx: &ImportCtx) {
             // on screen — `current` alone isn't enough, since it defaults to
             // 0 before anything has ever been previewed.
             let already_shown = ctx.preview_shown_idx.get() == Some(idx);
-            {
+            let marked = {
                 let mut sel = ctx.selected.borrow_mut();
                 if sel.contains(&idx) {
                     sel.remove(&idx);
+                    false
                 } else {
                     sel.insert(idx);
+                    true
                 }
-            }
+            };
+            record_brush(
+                &mut ctx.brushed.borrow_mut(),
+                idx,
+                marked,
+                &ctx.brush.borrow(),
+            );
             w.set_copy_done(false);
             w.set_selected_count(ctx.selected.borrow().len() as i32);
             // A click only ever changes this one row's selection state —
@@ -1584,6 +1610,218 @@ fn show_preview(w: &ImportWindow, entries: &Rc<RefCell<Vec<Entry>>>, idx: usize)
             });
         });
     }
+}
+
+// ── Import tags ───────────────────────────────────────────────────
+//
+// Maple has one labelling system, `collections`, so an import tag *is* a
+// collection — one you happened to assign while triaging rather than
+// afterwards. Nothing new is stored: the tag a photo picks up here is
+// visible in the Collections window, filterable in the library, and
+// replicated by sync, all for free.
+
+/// One label the brush can apply, denormalised out of a `collections` row
+/// so the picker does not hold the database lock while it is open.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Tag {
+    id: i64,
+    name: String,
+    /// Hex, as stored in `collections.color`.
+    color: String,
+}
+
+/// Colours a newly minted import tag can take.
+///
+/// Chosen *from the name* rather than at random or by position, so two
+/// devices that both create "Holiday" before they ever sync agree on what
+/// it looks like — and so re-creating a deleted tag brings its colour back.
+const TAG_PALETTE: [&str; 8] = [
+    "#B5543E", "#3388FF", "#33B073", "#D79A1B", "#9B59B6", "#1ABC9C", "#E4572E", "#5B7DB1",
+];
+
+fn tag_color_for(name: &str) -> &'static str {
+    let sum: usize = name.bytes().map(usize::from).sum();
+    TAG_PALETTE[sum % TAG_PALETTE.len()]
+}
+
+/// Find the collection called `name`, creating it if there isn't one.
+///
+/// An existing name wins rather than erroring: `collections.name` is UNIQUE,
+/// and a user typing a name that already exists means "that one". This is
+/// also the path that lets the picker's text field double as a search box.
+fn ensure_tag(db: &Arc<Mutex<maple_db::Database>>, name: &str) -> Option<Tag> {
+    let name = name.trim();
+    if name.is_empty() {
+        return None;
+    }
+    let guard = maple_db::lock_db(db);
+    match guard.all_collections() {
+        Ok(all) => {
+            if let Some(c) = all.into_iter().find(|c| c.name == name) {
+                return Some(Tag { id: c.id, name: c.name, color: c.color });
+            }
+        }
+        Err(err) => {
+            // Fall through and try to create it: a failed read must not stop
+            // the user tagging, and a name collision is caught below anyway.
+            tracing::warn!("ensure_tag: all_collections failed: {err}");
+        }
+    }
+    let color = tag_color_for(name);
+    match guard.create_collection(name, color, None) {
+        Ok(id) => Some(Tag { id, name: name.to_string(), color: color.to_string() }),
+        Err(err) => {
+            tracing::warn!("ensure_tag: could not create tag {name:?}: {err}");
+            None
+        }
+    }
+}
+
+/// Every tag in the library, with `chosen` set for the ones on the brush.
+fn tag_choices(db: &Arc<Mutex<maple_db::Database>>, brush: &[Tag]) -> Vec<Tag> {
+    match maple_db::lock_db(db).all_collections() {
+        Ok(all) => all
+            .into_iter()
+            .map(|c| Tag { id: c.id, name: c.name, color: c.color })
+            .collect(),
+        Err(err) => {
+            // Better a picker holding only what is already on the brush than
+            // no picker at all — the name field still works.
+            tracing::warn!("tag_choices: all_collections failed: {err}");
+            brush.to_vec()
+        }
+    }
+}
+
+/// Stamp (or clear) the brush on one photo as it is marked.
+///
+/// Reading the brush *here*, at mark time, rather than at copy time is what
+/// makes it a brush: change tags half way through a pass and the two halves
+/// are tagged differently. Unmarking drops the record rather than keeping it
+/// around, so a photo re-marked under a different brush cannot pick the old
+/// tags back up.
+fn record_brush(
+    brushed: &mut HashMap<usize, Vec<i64>>,
+    idx: usize,
+    marked: bool,
+    brush: &[Tag],
+) {
+    if marked {
+        brushed.insert(idx, brush.iter().map(|t| t.id).collect());
+    } else {
+        brushed.remove(&idx);
+    }
+}
+
+fn to_ui_tag(tag: &Tag, chosen: bool) -> crate::ImportTag {
+    crate::ImportTag {
+        id: tag.id as i32,
+        name: SharedString::from(tag.name.as_str()),
+        color: crate::transforms::hex_to_color(&tag.color),
+        chosen,
+    }
+}
+
+/// Push the brush into the floating panel, and — while the picker is open —
+/// into its list too.
+///
+/// One function because the two views must agree: a tag ticked in the picker
+/// and missing from the panel would leave the user unsure what an import is
+/// about to write.
+fn publish_tags(w: &ImportWindow, ctx: &ImportCtx) {
+    let brush = ctx.brush.borrow();
+    let chips: Vec<crate::ImportTag> = brush.iter().map(|t| to_ui_tag(t, true)).collect();
+    w.set_tags(ModelRc::new(VecModel::from(chips)));
+
+    if !w.get_tag_picker_open() {
+        return;
+    }
+    let choices: Vec<crate::ImportTag> = tag_choices(&ctx.db, &brush)
+        .iter()
+        .map(|t| to_ui_tag(t, brush.iter().any(|b| b.id == t.id)))
+        .collect();
+    w.set_tag_choices(ModelRc::new(VecModel::from(choices)));
+}
+
+fn wire_tags(window: &ImportWindow, ctx: &ImportCtx) {
+    window.on_open_tag_picker({
+        let ctx = ctx.clone();
+        move || {
+            let Some(w) = ctx.window.upgrade() else { return };
+            // Set the flag first: `publish_tags` only fills the choice list
+            // when the picker is actually open.
+            w.set_tag_picker_open(true);
+            publish_tags(&w, &ctx);
+        }
+    });
+
+    window.on_close_tag_picker({
+        let ctx = ctx.clone();
+        move || {
+            let Some(w) = ctx.window.upgrade() else { return };
+            w.set_tag_picker_open(false);
+            // The picker owned the keyboard while it was open; hand it back
+            // or the triage hotkeys stay dead until the user clicks.
+            w.invoke_refocus_keys();
+        }
+    });
+
+    window.on_tag_toggled({
+        let ctx = ctx.clone();
+        move |id| {
+            let Some(w) = ctx.window.upgrade() else { return };
+            let id = id as i64;
+            let held = ctx.brush.borrow().iter().position(|t| t.id == id);
+            match held {
+                Some(at) => {
+                    ctx.brush.borrow_mut().remove(at);
+                }
+                None => {
+                    // The name is not on the brush, so it has to come from
+                    // the library — and looking it up by id keeps the picker
+                    // honest if a collection was renamed under it.
+                    let found = maple_db::lock_db(&ctx.db)
+                        .collection_by_id(id)
+                        .ok()
+                        .flatten()
+                        .map(|c| Tag { id: c.id, name: c.name, color: c.color });
+                    let Some(tag) = found else {
+                        tracing::warn!("tag_toggled: no collection {id}");
+                        return;
+                    };
+                    ctx.brush.borrow_mut().push(tag);
+                }
+            }
+            publish_tags(&w, &ctx);
+        }
+    });
+
+    window.on_tag_created({
+        let ctx = ctx.clone();
+        move |name| {
+            let Some(w) = ctx.window.upgrade() else { return };
+            let Some(tag) = ensure_tag(&ctx.db, name.as_str()) else { return };
+            // Typing a name already on the brush is a no-op rather than a
+            // duplicate chip.
+            if !ctx.brush.borrow().iter().any(|t| t.id == tag.id) {
+                ctx.brush.borrow_mut().push(tag);
+            }
+            publish_tags(&w, &ctx);
+        }
+    });
+
+    window.on_clear_tags({
+        let ctx = ctx.clone();
+        move || {
+            let Some(w) = ctx.window.upgrade() else { return };
+            // Only the brush. Photos already marked keep what they were
+            // marked with — `c` means "stop tagging", not "untag".
+            ctx.brush.borrow_mut().clear();
+            publish_tags(&w, &ctx);
+        }
+    });
+
+    publish_tags(window, ctx);
 }
 
 // ── Copy selected ─────────────────────────────────────────────────
@@ -1840,10 +2078,11 @@ fn finish_copy(
     // existing the moment the card is ejected.
     let to_insert: Vec<ImportEntry> = {
         let ents = ctx.entries.borrow();
+        let brushed = ctx.brushed.borrow();
         run.sel_indices
             .iter()
-            .filter_map(|&i| ents.get(i))
-            .filter_map(|e| {
+            .filter_map(|&i| ents.get(i).map(|e| (i, e)))
+            .filter_map(|(i, e)| {
                 // No destination for the display file means it wasn't copied:
                 // either the copy failed, or this was a `RawOnly` run whose
                 // raw file the scanner will pick up and hash for itself.
@@ -1861,6 +2100,7 @@ fn finish_copy(
                     raw_path,
                     content_hash: e.content_hash,
                     embedding: e.embedding.clone(),
+                    collections: brushed.get(&i).cloned().unwrap_or_default(),
                 })
             })
             .collect()
@@ -1876,6 +2116,10 @@ fn finish_copy(
         })),
     );
     ctx.selected.borrow_mut().clear();
+    // These belong to the selection that was just consumed. The *brush*
+    // deliberately survives: "subsequent imports have the tag added" means
+    // the next pass keeps tagging until the user says otherwise.
+    ctx.brushed.borrow_mut().clear();
     w.set_selected_count(0);
     w.set_copying(false);
     w.set_status_text(copy_status_text(copied, failed).into());
@@ -2504,6 +2748,95 @@ mod tests {
         assert_eq!(visible.rows, vec![0, 1]);
         assert_eq!(visible.row(0), Some(0));
         assert_eq!(visible.row(1), Some(1));
+    }
+
+    // ── Import tags ──────────────────────────────────────────────
+
+    fn tag(id: i64, name: &str) -> Tag {
+        Tag { id, name: name.to_string(), color: tag_color_for(name).to_string() }
+    }
+
+    #[test]
+    fn a_tag_colour_follows_from_its_name() {
+        // Two devices that both create "Holiday" before they ever sync have
+        // to agree on what it looks like, so the colour cannot come from a
+        // counter or the RNG.
+        assert_eq!(tag_color_for("Holiday"), tag_color_for("Holiday"));
+        assert!(TAG_PALETTE.contains(&tag_color_for("Holiday")));
+        assert!(TAG_PALETTE.contains(&tag_color_for("")));
+        // Not a constant dressed up as a function.
+        let distinct: std::collections::HashSet<_> =
+            ["a", "b", "c", "d", "e", "f", "g", "h"].iter().map(|n| tag_color_for(n)).collect();
+        assert!(distinct.len() > 1, "every name got the same colour");
+    }
+
+    #[test]
+    fn marking_a_photo_stamps_the_brush_as_it_stands() {
+        let mut brushed = HashMap::new();
+        let brush = vec![tag(7, "Holiday"), tag(9, "Family")];
+
+        record_brush(&mut brushed, 3, true, &brush);
+        assert_eq!(brushed.get(&3), Some(&vec![7, 9]));
+
+        // Marking with nothing on the brush is a photo with no tags, not an
+        // absent record — `unwrap_or_default` at copy time reads both the
+        // same way, but the distinction is what makes unmarking meaningful.
+        record_brush(&mut brushed, 4, true, &[]);
+        assert_eq!(brushed.get(&4), Some(&vec![]));
+    }
+
+    #[test]
+    fn changing_the_brush_mid_pass_tags_the_two_halves_differently() {
+        // The whole point of reading the brush at mark time: one triage pass
+        // can produce two differently-tagged sets without copying twice.
+        let mut brushed = HashMap::new();
+        let holiday = vec![tag(7, "Holiday")];
+        record_brush(&mut brushed, 0, true, &holiday);
+        record_brush(&mut brushed, 1, true, &holiday);
+
+        let portraits = vec![tag(11, "Portraits")];
+        record_brush(&mut brushed, 2, true, &portraits);
+
+        assert_eq!(brushed.get(&0), Some(&vec![7]));
+        assert_eq!(brushed.get(&1), Some(&vec![7]));
+        assert_eq!(brushed.get(&2), Some(&vec![11]));
+    }
+
+    #[test]
+    fn unmarking_a_photo_drops_the_tags_it_was_marked_with() {
+        let mut brushed = HashMap::new();
+        record_brush(&mut brushed, 5, true, &[tag(7, "Holiday")]);
+        record_brush(&mut brushed, 5, false, &[tag(7, "Holiday")]);
+        assert_eq!(brushed.get(&5), None);
+
+        // Re-marked under a different brush it takes the new tags, not the
+        // ones it happened to carry the first time round.
+        record_brush(&mut brushed, 5, true, &[tag(11, "Portraits")]);
+        assert_eq!(brushed.get(&5), Some(&vec![11]));
+    }
+
+    #[test]
+    fn clearing_the_brush_does_not_untag_what_is_already_marked() {
+        // `c` means "stop tagging", not "untag" — photos already marked keep
+        // what they were marked with.
+        let mut brushed = HashMap::new();
+        let mut brush = vec![tag(7, "Holiday")];
+        record_brush(&mut brushed, 0, true, &brush);
+
+        brush.clear();
+        record_brush(&mut brushed, 1, true, &brush);
+
+        assert_eq!(brushed.get(&0), Some(&vec![7]));
+        assert_eq!(brushed.get(&1), Some(&vec![]));
+    }
+
+    #[test]
+    fn the_picker_ticks_exactly_what_is_on_the_brush() {
+        let holiday = tag(7, "Holiday");
+        assert!(to_ui_tag(&holiday, true).chosen);
+        assert!(!to_ui_tag(&holiday, false).chosen);
+        assert_eq!(to_ui_tag(&holiday, true).name, "Holiday");
+        assert_eq!(to_ui_tag(&holiday, true).id, 7);
     }
 
     // ── The row the strip scrolls to ─────────────────────────────

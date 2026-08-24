@@ -215,6 +215,24 @@ single binary; the backend is fixed at compile time.
   scroll alone. The row is deliberately *not* the index — hiding old photos renumbers
   every row without moving a photo, so sending the index would scroll to the wrong place,
   and `-1` (filtered out) means "leave the scroll where it is".
+- **Import tags are collections** (`wire_tags` in `maple-ui/src/import.rs`): Maple has one
+  labelling system, so a tag assigned while triaging *is* a `collections` row — no new
+  table, and what the import writes is immediately visible in the Collections window,
+  filterable in the library and replicated by sync. The current tags are a **brush, not a
+  batch setting**: `s` opens the picker, `c` clears it, and `record_brush` stamps the
+  brush onto a photo **at the moment it is marked**, not at copy time — which is what lets
+  one triage pass produce two differently-tagged sets without copying twice. Unmarking
+  drops the record, so a photo re-marked under a different brush cannot pick the old tags
+  back up, and `c` means "stop tagging", never "untag". The brush survives a copy (the
+  next pass keeps tagging); `brushed` does not, since the selection it belongs to is gone.
+  Three smaller rules: a typed name that already exists is **adopted, not rejected**
+  (`collections.name` is UNIQUE, and the user means that one), a new tag's colour is
+  derived **from its name** so two devices that both create "Holiday" before they sync
+  agree on what it looks like, and tagging is best-effort per tag — a collection deleted
+  between marking and copying must not cost the user the import. The brush panel floats
+  over the preview with **no `TouchArea` of its own**, so clicks fall through to the photo
+  underneath and triage carries on around it; it stays visible when empty because
+  invisible state that silently changes what an import writes would be a trap.
 - **The import record lives on the medium** (`maple-state/src/seen.rs`, P9): the scan's
   "already imported" badge reads `<source>/.maple_seen.bin`, written to the card itself
   so it carries its own history to the next machine — beside `.maple_embed_cache.bin`,
