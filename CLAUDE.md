@@ -206,6 +206,15 @@ single binary; the backend is fixed at compile time.
   embedder. `ImportItem::loaded` therefore means "has a decoded preview", not "has been
   scanned", and goes false again on eviction. Requests are clamped to the retention cap —
   a window wider than what can be held would have the tail evicting the head forever.
+  The strip **follows the selection but not the scroll**: Rust sets `current-row` beside
+  `current-index` whenever *it* moves the current photo (an arrow key, a click, the
+  filter landing somewhere new), and the strip's `changed current-row` parks that row one
+  tile down from the top, so the photo just stepped past stays visible and stepping
+  forward scrolls by exactly one tile. Both ends fall out of the clamp rather than
+  needing a case. Nothing fires on `viewport-y` changing, which is what leaves a hand
+  scroll alone. The row is deliberately *not* the index — hiding old photos renumbers
+  every row without moving a photo, so sending the index would scroll to the wrong place,
+  and `-1` (filtered out) means "leave the scroll where it is".
 - **The import record lives on the medium** (`maple-state/src/seen.rs`, P9): the scan's
   "already imported" badge reads `<source>/.maple_seen.bin`, written to the card itself
   so it carries its own history to the next machine — beside `.maple_embed_cache.bin`,

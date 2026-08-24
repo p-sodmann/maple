@@ -238,6 +238,15 @@ impl Visible {
     }
 }
 
+/// The strip row showing entry `idx`, or -1 when the filter is hiding it.
+///
+/// -1 reads as "leave the scroll where it is": a photo the strip does not
+/// contain has no row to park it in, and row 0 would be a lie that jumps the
+/// user to the top of the card.
+fn strip_row(visible: &Visible, idx: usize) -> i32 {
+    visible.row(idx).map_or(-1, |r| r as i32)
+}
+
 // ── Controller struct ─────────────────────────────────────────────
 
 /// Shared state for one import window, passed to each `wire_*` function.
@@ -1415,8 +1424,7 @@ fn wire_browse(window: &ImportWindow, ctx: &ImportCtx) {
             if let Some(prev) = ctx.preview_shown_idx.get() {
                 leave(&ctx, prev);
             }
-            ctx.current.set(idx);
-            w.set_current_index(idx as i32);
+            set_current(&w, &ctx, idx);
             ctx.preview_shown_idx.set(Some(idx));
 
             show_preview(&w, &ctx.entries, idx);
@@ -1447,8 +1455,7 @@ fn wire_browse(window: &ImportWindow, ctx: &ImportCtx) {
                 return;
             }
             leave(&ctx, cur);
-            ctx.current.set(new_idx);
-            w.set_current_index(new_idx as i32);
+            set_current(&w, &ctx, new_idx);
             ctx.preview_shown_idx.set(Some(new_idx));
 
             show_preview(&w, &ctx.entries, new_idx);
@@ -2096,15 +2103,32 @@ fn refilter(w: &ImportWindow, ctx: &ImportCtx) {
         }
     };
     if let Some(idx) = landing {
-        ctx.current.set(idx);
-        w.set_current_index(idx as i32);
+        set_current(w, ctx, idx);
         ctx.preview_shown_idx.set(Some(idx));
         show_preview(w, &ctx.entries, idx);
+    } else {
+        // The photo the user is on survived the filter, but the rows around
+        // it were renumbered wholesale — re-park it, or the strip would go
+        // on showing whatever now happens to sit at the old scroll offset.
+        set_current(w, ctx, ctx.current.get());
     }
     set_preview_state(w, ctx, ctx.current.get());
     // The rows now mean different entries, so what is worth decoding has
     // changed even though the viewport has not moved.
     request_previews(ctx);
+}
+
+/// Point the window at entry `idx`: the highlighted tile, and the row the
+/// filmstrip parks it in.
+///
+/// One function because the two must not drift. The strip scrolls when the
+/// *row* changes, so setting the index alone would highlight a tile that is
+/// off screen and leave it there — which is exactly what stepping with the
+/// arrow keys used to do once the selection walked past the viewport.
+fn set_current(w: &ImportWindow, ctx: &ImportCtx, idx: usize) {
+    ctx.current.set(idx);
+    w.set_current_index(idx as i32);
+    w.set_current_row(strip_row(&ctx.visible.borrow(), idx));
 }
 
 /// Mirror the current photo's verdict into the preview bar's chip, so the
@@ -2480,6 +2504,66 @@ mod tests {
         assert_eq!(visible.rows, vec![0, 1]);
         assert_eq!(visible.row(0), Some(0));
         assert_eq!(visible.row(1), Some(1));
+    }
+
+    // ── The row the strip scrolls to ─────────────────────────────
+
+    #[test]
+    fn the_strip_is_told_the_row_not_the_scan_index() {
+        // Hiding the two old photos renumbers the rows: entry 3 is now the
+        // *second* tile. Telling the strip "3" would scroll it a screenful
+        // past the photo the user is actually looking at.
+        let entries = vec![
+            triaged("/src/a.jpg", false, true),   // old
+            triaged("/src/b.jpg", false, false),  // new
+            triaged("/src/c.jpg", false, true),   // old
+            triaged("/src/d.jpg", false, false),  // new
+        ];
+        let mut visible = Visible::default();
+        visible.rebuild(&entries, true);
+
+        assert_eq!(strip_row(&visible, 1), 0);
+        assert_eq!(strip_row(&visible, 3), 1);
+
+        // Same photo, filter off: same identity, different row.
+        let visible = all_visible(&entries);
+        assert_eq!(strip_row(&visible, 3), 3);
+    }
+
+    #[test]
+    fn a_photo_the_filter_hides_has_no_row_to_park() {
+        let entries = vec![
+            triaged("/src/a.jpg", false, true),
+            triaged("/src/b.jpg", false, false),
+        ];
+        let mut visible = Visible::default();
+        visible.rebuild(&entries, true);
+
+        // -1, not 0: the strip must leave the scroll alone rather than jump
+        // to the top of the card for a photo it is not showing.
+        assert_eq!(strip_row(&visible, 0), -1);
+        // Out of range reads the same way.
+        assert_eq!(strip_row(&visible, 99), -1);
+    }
+
+    #[test]
+    fn stepping_forward_moves_the_strip_one_row_at_a_time() {
+        // The strip parks the current photo one tile down, so consecutive
+        // arrow presses have to yield consecutive rows — that is what makes
+        // the strip walk instead of jumping a screenful per press.
+        let entries: Vec<Entry> = (0..6)
+            .map(|i| triaged(&format!("/src/{i}.jpg"), false, i % 2 == 0))
+            .collect();
+        let mut visible = Visible::default();
+        visible.rebuild(&entries, true);
+
+        let mut cur = 1;
+        let mut rows = vec![strip_row(&visible, cur)];
+        for _ in 0..2 {
+            cur = nav_visible_target(&[], &visible, cur, entries.len(), 1);
+            rows.push(strip_row(&visible, cur));
+        }
+        assert_eq!(rows, vec![0, 1, 2]);
     }
 
     #[test]

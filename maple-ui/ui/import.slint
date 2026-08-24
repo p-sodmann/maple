@@ -54,6 +54,11 @@ export struct ImportItem {
 component ImportGridView {
     in property <[ImportItem]> items;
     in property <int> current-index: -1;    // highlighted (preview target)
+    // Which row that photo sits in, or -1 while the filter is hiding it.
+    // Separate from `current-index` because the index is the photo's stable
+    // scan number and the row is where it happens to be *today* — hiding
+    // old photos renumbers every row without moving a single photo.
+    in property <int> current-row: -1;
     in property <length> cell-size: 120px;
     callback clicked(int);
     // Rows on screen (inclusive) plus the row the viewport is centred on.
@@ -84,6 +89,30 @@ component ImportGridView {
     // The list itself changing (a scan filling in, the filter toggling)
     // changes what those rows *are*, so it has to re-ask too.
     changed items => { root.window-changed(root.first-wanted, root.last-wanted, root.focus-row); }
+
+    // How far down the strip the current photo is parked: 1 = second tile,
+    // which keeps the photo you just came from on screen above it. Stepping
+    // forward then scrolls by exactly one tile, so the strip moves at the
+    // pace of the arrow key rather than jumping a screenful at a time.
+    property <int> trail: 1;
+    property <length> max-scroll: Math.max(0px, sv.viewport-height - sv.visible-height);
+
+    // Following the *selection* is not the same as following the *scroll*.
+    // This fires only when Rust moves the current photo — an arrow key, a
+    // click, the filter landing somewhere new — and never when the viewport
+    // moves, so dragging the strip by hand is left alone: scrolling ahead to
+    // look at what is coming does not get yanked back.
+    //
+    // Both ends fall out of the clamp rather than needing a case: the first
+    // photo has nothing to trail behind it, and near the end the strip is
+    // already at the bottom, so the current photo simply walks down it.
+    changed current-row => {
+        if (root.current-row >= 0) {
+            sv.viewport-y = -Math.min(
+                Math.max(root.pad + (root.current-row - root.trail) * root.pitch-y, 0px),
+                root.max-scroll);
+        }
+    }
 
     sv := ScrollView {
         viewport-width: sv.visible-width;
@@ -394,6 +423,9 @@ export component ImportWindow inherits Window {
     // Browser state
     in property <[ImportItem]> items;
     in-out property <int> current-index: 0;
+    // The strip row `current-index` occupies; -1 when it is filtered out.
+    // Rust sets it alongside `current-index` and the strip scrolls to it.
+    in property <int> current-row: -1;
     in property <image> preview-photo;
     in property <bool> preview-loading: false;
     in property <string> preview-filename: "";
@@ -736,6 +768,7 @@ export component ImportWindow inherits Window {
                         vertical-stretch: 1;
                         items: root.items;
                         current-index: root.current-index;
+                        current-row: root.current-row;
                         cell-size: 236px;
                         clicked(i) => { root.item-clicked(i); }
                         window-changed(a, b, c) => { root.preview-window(a, b, c); }
