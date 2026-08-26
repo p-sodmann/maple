@@ -1236,6 +1236,16 @@ fn apply_scan_thumb(w: &ImportWindow, ctx: &ImportCtx, msg: ScanThumb) {
             e.sharpness = sharpness;
         }
     }
+    if imported || skipped_before {
+        // Count it now rather than waiting for `refilter`. The *filter* can
+        // only be applied in bulk once every verdict is in, but "Hide old
+        // images" is gated on this count being non-zero, and a card of a few
+        // thousand photos takes minutes to read — so deferring the count
+        // hides the button for the whole scan, exactly when the user is
+        // looking for it. Each index arrives once, so incrementing is exact,
+        // and `refilter` recomputes it from scratch at the end regardless.
+        w.set_old_count(w.get_old_count() + 1);
+    }
     update_row(
         &ctx.model,
         &ctx.entries.borrow(),
@@ -2359,7 +2369,41 @@ fn refilter(w: &ImportWindow, ctx: &ImportCtx) {
     set_preview_state(w, ctx, ctx.current.get());
     // The rows now mean different entries, so what is worth decoding has
     // changed even though the viewport has not moved.
+    {
+        let visible = ctx.visible.borrow();
+        let (first, last, _) = ctx.preview_window.get();
+        let row = visible.row(ctx.current.get()).unwrap_or(0);
+        if let Some(win) = preview_window_for(visible.rows.len(), last.saturating_sub(first), row) {
+            drop(visible);
+            ctx.preview_window.set(win);
+        }
+    }
     request_previews(ctx);
+}
+
+/// Where the preview window belongs when `row` is the current photo and the
+/// strip is `rows` long, keeping a span of `span` rows. `None` for an empty
+/// strip.
+///
+/// The strip only reports its window when the *viewport* moves, and toggling
+/// "Hide old images" does not move it — it renumbers every row underneath
+/// it. So the window Rust is holding afterwards names different photos than
+/// it did, and after a filter that shrank the strip it can name rows that no
+/// longer exist at all, which makes [`request_previews`] bail out and leaves
+/// every visible tile blank. Re-deriving it from where the current photo
+/// actually landed is what keeps them filled; the strip corrects it on the
+/// next scroll.
+fn preview_window_for(rows: usize, span: usize, row: usize) -> Option<(usize, usize, usize)> {
+    if rows == 0 {
+        return None;
+    }
+    let span = span.max(INITIAL_WINDOW);
+    let last_row = rows - 1;
+    // Centre on the current photo, then let both ends fall out of the
+    // clamp: near the top `first` is 0, near the bottom `last` is the end.
+    let first = row.saturating_sub(span / 2).min(last_row);
+    let last = first.saturating_add(span).min(last_row);
+    Some((first, last, row.min(last_row)))
 }
 
 /// Point the window at entry `idx`: the highlighted tile, and the row the
@@ -2669,6 +2713,37 @@ mod tests {
     // ── Triage verdicts ──────────────────────────────────────────
 
     /// An entry in a given triage state, for the badge tests.
+    #[test]
+    fn the_preview_window_survives_a_filter_that_shrank_the_strip() {
+        // The bug: the strip reports rows 700..730 while 816 photos show,
+        // then "Hide old images" leaves 60. Re-using that window makes
+        // `request_previews` bail on `first > last` and every visible tile
+        // stays blank until the button is clicked a second time.
+        let (first, last, focus) = preview_window_for(60, 30, 12).unwrap();
+        assert!(first <= last, "an unusable window");
+        assert!(last < 60, "asked for a row the strip does not have");
+        assert!((first..=last).contains(&focus), "focus outside the window");
+        assert!((first..=last).contains(&12), "the current photo is not in it");
+    }
+
+    #[test]
+    fn the_preview_window_clamps_at_both_ends() {
+        // Top: nothing to centre behind, so it starts at 0.
+        assert_eq!(preview_window_for(100, 20, 0).unwrap().0, 0);
+        // Bottom: already at the end, so it simply stops there.
+        let (_, last, _) = preview_window_for(100, 20, 99).unwrap();
+        assert_eq!(last, 99);
+        // A span narrower than the initial one still asks for a usable
+        // screenful — a stale zero-width window must not stay zero-width.
+        let (first, last, _) = preview_window_for(100, 0, 50).unwrap();
+        assert!(last - first >= INITIAL_WINDOW);
+    }
+
+    #[test]
+    fn an_empty_strip_has_no_preview_window() {
+        assert!(preview_window_for(0, 30, 0).is_none());
+    }
+
     fn triaged(path: &str, passed: bool, imported: bool) -> Entry {
         let mut e = entry(path, None);
         e.passed = passed;

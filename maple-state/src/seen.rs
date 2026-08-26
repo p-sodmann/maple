@@ -134,17 +134,26 @@ impl SeenSet {
         Self::load_from(&dir.join(record.replica()))
     }
 
-    /// Load `record` for an import medium rooted at `root`.
+    /// Load `record` for an import medium rooted at `root`: the medium's own
+    /// copy **unioned with** the library replica.
     ///
-    /// The medium's own copy is authoritative. The library replica is
-    /// consulted **only** when the medium carries no readable record of its
-    /// own — a card that was never written to because it is read-only, a
-    /// network share, a folder that has since moved. A medium record that
-    /// exists but is corrupt falls back the same way: an empty set there
-    /// would silently forget every decision ever made about it.
+    /// Neither one is authoritative, because neither one is complete. The
+    /// record is written to whatever folder was scanned, so a card scanned
+    /// once at its root and once at `DCIM/101_FUJI` ends up carrying two
+    /// disjoint records and each hides the other's decisions. The replica is
+    /// the only place every decision lands, but it is per-machine, so a card
+    /// arriving from another computer is only described by what it carries.
+    /// Reading either alone re-presents photos the user already decided
+    /// about — the one failure this whole mechanism exists to prevent.
+    ///
+    /// A union is always safe here: the set is grow-only, so there is no
+    /// "forget" for one side to be more up to date about, and no winner to
+    /// pick. A missing or corrupt record on either side contributes nothing
+    /// instead of reading as an empty set that overrides the other.
     pub fn load_for_source(root: &Path, library_dir: &Path, record: Record) -> Self {
-        Self::read_file(&root.join(record.on_medium()))
-            .unwrap_or_else(|| Self::load_replica(library_dir, record))
+        let mut set = Self::read_file(&root.join(record.on_medium())).unwrap_or_default();
+        set.merge(&Self::load_replica(library_dir, record));
+        set
     }
 
     // ── Load / Save ─────────────────────────────────────────────
@@ -612,6 +621,55 @@ mod tests {
         // Plugged into a different machine: the card still knows.
         let loaded = SeenSet::load_for_source(card.path(), other_library.path(), Record::Imported);
         assert!(loaded.contains(&fake_hash(1)));
+    }
+
+    #[test]
+    fn the_medium_and_the_replica_are_unioned_not_chosen_between() {
+        let card = tempfile::tempdir().unwrap();
+        let library = tempfile::tempdir().unwrap();
+
+        // On the medium only — e.g. imported from another machine.
+        let mut on_card = SeenSet::new();
+        on_card.insert(&fake_hash(10));
+        on_card.save_to(&card.path().join(Record::Imported.on_medium())).unwrap();
+
+        // In the replica only — e.g. imported when a *different* folder of
+        // this same card was the scan root, so it went to that folder's
+        // record and to the replica, but not to this one.
+        let mut in_library = SeenSet::new();
+        in_library.insert(&fake_hash(11));
+        in_library.save_replica(library.path(), Record::Imported).unwrap();
+
+        let loaded = SeenSet::load_for_source(card.path(), library.path(), Record::Imported);
+        assert!(loaded.contains(&fake_hash(10)), "lost the medium's own record");
+        assert!(loaded.contains(&fake_hash(11)), "lost the library replica");
+        assert_eq!(loaded.len(), 2);
+    }
+
+    #[test]
+    fn two_scan_roots_on_one_card_do_not_hide_each_other() {
+        // The bug this union exists to fix: the record is written to
+        // whatever folder was scanned, so scanning a card at its root and
+        // again at DCIM/101_FUJI leaves two disjoint records — and reading
+        // either alone re-presents photos already decided about.
+        let card = tempfile::tempdir().unwrap();
+        let library = tempfile::tempdir().unwrap();
+        let sub = card.path().join("DCIM/101_FUJI");
+        std::fs::create_dir_all(&sub).unwrap();
+
+        let mut from_root = SeenSet::new();
+        from_root.insert(&fake_hash(20));
+        from_root.merge_save_to_source(card.path(), library.path(), Record::Imported).unwrap();
+
+        let mut from_sub = SeenSet::new();
+        from_sub.insert(&fake_hash(21));
+        from_sub.merge_save_to_source(&sub, library.path(), Record::Imported).unwrap();
+
+        for root in [card.path(), sub.as_path()] {
+            let loaded = SeenSet::load_for_source(root, library.path(), Record::Imported);
+            assert!(loaded.contains(&fake_hash(20)), "{root:?} forgot the root scan");
+            assert!(loaded.contains(&fake_hash(21)), "{root:?} forgot the subfolder scan");
+        }
     }
 
     #[test]

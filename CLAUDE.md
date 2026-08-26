@@ -222,6 +222,18 @@ single binary; the backend is fixed at compile time.
   embedder. `ImportItem::loaded` therefore means "has a decoded preview", not "has been
   scanned", and goes false again on eviction. Requests are clamped to the retention cap —
   a window wider than what can be held would have the tail evicting the head forever.
+  The window itself is reported by the strip only when the **viewport** moves, so anything
+  that renumbers rows without scrolling — "Hide old images", above all — has to re-derive
+  it in Rust (`preview_window_for`, centred on wherever the current photo landed). Re-using
+  the stale one after a filter that shrank the strip names rows that no longer exist,
+  `request_previews` bails on `first > last`, and every visible tile stays blank until the
+  button is clicked a second time. Two traps met here, worth knowing before adding another
+  `changed` handler: a Slint `changed` fires only when the property's value compares
+  *unequal*, and `ModelRc`'s `PartialEq` is **pointer identity** — so `changed items` never
+  fires at all against `VecModel::set_vec`, which mutates the model behind an unchanged
+  `ModelRc`. Watch `row-count` (`items.length`, which tracks the model's own row-count
+  notification) instead. And nothing in the UI may be the *only* thing that recomputes
+  state Rust already knows changed.
   The strip **follows the selection but not the scroll**: Rust sets `current-row` beside
   `current-index` whenever *it* moves the current photo (an arrow key, a click, the
   filter landing somewhere new), and the strip's `changed current-row` parks that row one
@@ -252,15 +264,27 @@ single binary; the backend is fixed at compile time.
 - **The import record lives on the medium** (`maple-state/src/seen.rs`, P9): the scan's
   "already imported" badge reads `<source>/.maple_seen.bin`, written to the card itself
   so it carries its own history to the next machine — beside `.maple_embed_cache.bin`,
-  which established the idiom. `library_dir/seen_imported.bin` stays as a
-  *non-authoritative* replica, read only when the source has no readable record of its
-  own (read-only card, network share, a folder that moved); a **corrupt** medium record
-  falls back the same way as a missing one, since reading it as an empty set would send
-  the user re-importing a whole card. `SeenSet` is **grow-only**, so saving is a
+  which established the idiom, and unioned on load with the `library_dir/seen_imported.bin`
+  replica. **Neither side is authoritative, because neither side is complete**: the record
+  is written to whatever folder was scanned, so a card scanned once at its root and once at
+  `DCIM/101_FUJI` carries two *disjoint* records (measured on a real card: 20 and 46 hashes,
+  intersection empty, against a replica holding all 69) — and the replica, which is the only
+  place every decision lands, is per-machine, so a card arriving from another computer is
+  described only by what it carries. `load_for_source` therefore merges the two rather than
+  picking; reading either alone re-presents photos the user already decided about, the one
+  failure this mechanism exists to prevent. A missing *or* corrupt record on either side
+  contributes nothing instead of reading as an empty set that overrides the other, since
+  that would send the user re-importing a whole card. The union is always safe because
+  `SeenSet` is **grow-only** — there is no "forget" for one side to be more current about
+  and so no winner to pick. That same property makes saving a
   read-merge-write union (`merge_save_to_source`) with no locking and no conflict
   resolution — that is what makes two importers running at once combine instead of
   clobber, and it is the same code path that folds a card's history into a library that
-  has never seen it. Two invariants worth keeping: the all-zero `UNHASHED` sentinel the
+  has never seen it. Three invariants worth keeping: "Hide old images" is gated on the
+  old-count being non-zero, so that count is incremented **per photo as the scan streams**
+  and only recomputed in bulk by `refilter` at the end — deferring it entirely hides the
+  button for the whole of a multi-minute card read, which is exactly when it is wanted. The
+  all-zero `UNHASHED` sentinel the
   scan stores on a hash failure is refused by `insert` *and* dropped on load (it would
   otherwise badge every unreadable photo as imported), and `save_to` stages into a
   dot-prefixed scratch file and renames, so an ejected card mid-write leaves the previous

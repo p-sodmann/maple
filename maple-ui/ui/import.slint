@@ -99,7 +99,14 @@ component ImportGridView {
     changed last-wanted => { root.window-changed(root.first-wanted, root.last-wanted, root.focus-row); }
     // The list itself changing (a scan filling in, the filter toggling)
     // changes what those rows *are*, so it has to re-ask too.
-    changed items => { root.window-changed(root.first-wanted, root.last-wanted, root.focus-row); }
+    //
+    // Deliberately `row-count` and not `items`: a `changed` handler fires
+    // when the property's value compares unequal, and `ModelRc`'s `==` is
+    // pointer identity. Rust replaces the rows with `VecModel::set_vec`,
+    // which mutates the model *behind* the same `ModelRc` — so `changed
+    // items` compares equal and never fires at all. `row-count` reads
+    // `items.length`, which tracks the model's own row-count notification.
+    changed row-count => { root.window-changed(root.first-wanted, root.last-wanted, root.focus-row); }
 
     // How far down the strip the current photo is parked: 1 = second tile,
     // which keeps the photo you just came from on screen above it. Stepping
