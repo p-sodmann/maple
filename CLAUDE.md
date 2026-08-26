@@ -11,6 +11,40 @@ cargo test --workspace
 cargo clippy --workspace
 ```
 
+### Session-detection lab
+
+```sh
+cargo run --release -p maple-db --bin session-lab -- <dir> --out /tmp/sessions.html
+```
+
+Runs every session engine over a real folder in one pass — one decode, every
+engine sees the same frame — and reports what each cost and where each cut.
+Text gives per-engine ms/photo, bytes per signature, session-size statistics
+and a pairwise boundary-F1 matrix (no ground truth needed: if a cheap engine
+cuts a card where DINOv2 cuts it, the expensive one has nothing left to
+justify).
+
+`--out` writes an **interactive** page, not a static contact sheet: every
+threshold, ensemble weight and time-curve point is a live slider and the
+segmentation recomputes in the browser as you drag. `s` marks the session
+under the cursor as a scene with draggable start/end handles, `x` flags an
+outlier, and the result exports as a `--truth` file — which is how "that looks
+about right" becomes a number the next run is scored against.
+
+Two things make that work. Re-segmenting needs distances between arbitrary
+pairs and a full matrix is `n²`, but segmentation only ever asks about pairs
+*inside* one session, so the page ships a **banded** matrix (`--band`, default
+48) quantised to a byte per pair; beyond the band a distance reads as 1.0,
+which ends a session by drift, so a session longer than the band is capped in
+the browser though not in Rust. And the JavaScript is a hand-written mirror of
+`maple_import::session::segment`, which can rot — so the page carries Rust's
+own answer and paints a red banner if its recomputation disagrees.
+
+Other flags: `--dino` adds the baseline (downloads the model), `--ensemble
+block-tile=2,time-gap=1` adds a weighted vote, `--cut <engine>=<f>` overrides a
+threshold, `--time-points 1=0,60=0.5,600=0.85,3600=1` reshapes the time curve,
+`--max-outliers N` sets how many non-matching frames a session may absorb.
+
 ### Dependency updates
 
 ```sh
@@ -203,6 +237,46 @@ single binary; the backend is fixed at compile time.
   **display file's** hash, since that is what the library row and `SeenSet` are keyed on,
   and it is not attempted after a *timeout* — the card is already not answering, and
   asking twice would double the stall.
+- **Session detection is segmentation, not clustering** (`maple-import/src/session/`):
+  the case is twenty pictures of one child in one room over four minutes — not a
+  drive-mode burst. Those photos are *contiguous* in capture order, and that is the whole
+  exploit: `segment` walks the sequence once (`n-1` comparisons, not `n²`), asks the local
+  question "did the scene change *here*", and cannot chain a slow pan into one 200-photo
+  group the way `maple_db::cluster_embeddings`'s union-find does — a session has two ends.
+  Path order off a camera card already *is* capture order, so the sequence exists before
+  any EXIF is read. **Time is a cost, not a cut**: a fixed gap threshold cannot work when
+  one session comes at 2 s, 3 s, 40 s (repositioning the child), 2 s — so the gap only
+  moves the *visual* evidence a cut requires (long gap → cheaper, short gap → dearer),
+  with `hard_gap_secs` the one hard rule and hysteresis so a single badly framed frame
+  does not fragment a run. `anchor_factor` is the anti-chaining rule: distance is measured
+  to the frame the session *started* on as well as to the neighbour.
+  What "the scene changed" means is a pluggable **engine** — a descriptor plus a distance,
+  with `segment` knowing nothing about either. Their distances are **not comparable to
+  each other**, so each carries its own `default_cut`. `ColorKmeansEngine` sees the palette
+  and not where any of it is; `GridHistogramEngine` sees colour *and* its layout;
+  `BlockTileEngine` counts the fraction of the frame that held still, which is the one
+  built for a moving subject in a fixed scene; `maple_db::DinoEngine` is the baseline, in
+  `maple-db` because `maple-import` must stay free of `ort`. `TimeGapEngine` is an engine
+  too, and votes on the clock alone: a curve through `1 s→0.00, 1 min→0.50,
+  10 min→0.85, 1 h→1.00`, interpolated in **log time** because the interesting range
+  spans four orders of magnitude. It is a separate mechanism from the threshold shaping
+  above — running both means time counts twice, so zero `tight_hold`/`long_drop` when an
+  ensemble already has a time member.
+  `EnsembleEngine` combines any of them with tunable weights. The trick that makes a vote
+  possible at all: each member is put on a shared scale by `d/(d+cut)` — its own cut is
+  what it means by "changed", so every member reads 0.5 at its own threshold and the
+  weighted mean crosses 0.5 exactly when the vote does.
+  **A session may absorb an outlier**: each photo is judged against the last frame
+  *accepted* into the session, not its predecessor, so one shot of the cake in the middle
+  of twenty of the child is bridged when the next frame comes back — up to `max_outliers`
+  in a row. When patience runs out the cut lands *before* the first frame that stopped
+  matching, since that is where the new scene actually started.
+  Measured on a real folder: the cheap three cost 0.13–0.37 ms/photo and 80 B–1.5 KB per
+  signature, DINOv2 26 ms and (unpooled) 385 KB — and read+decode is ~100 ms/photo, so the
+  cheap engines are free and DINOv2 is not. `grid-histogram` and `block-tile` agree with
+  each other at 0.95 boundary-F1 and with a `block-tile×2 + grid-histogram + time-gap`
+  ensemble at 0.93; `color-kmeans` is the outlier at 0.70–0.74, which is the palette
+  blindness showing.
 - **Import previews are decoded on demand** (`maple-ui/src/import_previews.rs`): a card
   of a few thousand photos will not fit in memory as decoded frames (~196 KB each) and
   almost none of them are on screen, so the browser decodes what the user is *looking at*.

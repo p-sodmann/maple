@@ -4,7 +4,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use crate::path_template::{self, TemplateContext};
-use crate::{is_raw_format, loadable_image_bytes, ExifDateTime};
+use crate::ExifDateTime;
 
 /// Result of a single file copy operation.
 #[derive(Debug, Clone)]
@@ -86,7 +86,8 @@ where
             .unwrap_or("file");
         let extension = src.extension().and_then(|e| e.to_str()).unwrap_or("");
 
-        let (datetime, camera) = read_exif_context(src);
+        let ctx = crate::exif_read::read(src);
+        let (datetime, camera) = (ctx.datetime, ctx.camera);
         let datetime = datetime.or_else(|| mtime_fallback(src));
         let ctx = TemplateContext {
             datetime,
@@ -187,7 +188,8 @@ pub fn place_file(
         .unwrap_or("file");
     let extension = original.extension().and_then(|e| e.to_str()).unwrap_or("");
 
-    let (datetime, camera) = read_exif_context(staged);
+    let ctx = crate::exif_read::read(staged);
+    let (datetime, camera) = (ctx.datetime, ctx.camera);
     let datetime = datetime.or_else(|| mtime_fallback(staged));
     let ctx = TemplateContext {
         datetime,
@@ -221,61 +223,6 @@ pub fn place_file(
     }
     tracing::info!("Placed {} → {}", original_name, dest.display());
     Ok(dest)
-}
-
-/// Read EXIF `DateTimeOriginal` and Make/Model (for the `{camera}` token)
-/// from `path` in a single reader pass. For raw files, reads from the
-/// embedded preview (raw containers aren't parsed directly) — see
-/// [`crate::loadable_image_bytes`]. Returns `(None, None)` on any
-/// read/parse failure rather than erroring.
-fn read_exif_context(path: &Path) -> (Option<ExifDateTime>, Option<String>) {
-    let exif = if is_raw_format(path) {
-        let Ok(bytes) = loadable_image_bytes(path) else {
-            return (None, None);
-        };
-        let mut cursor = std::io::Cursor::new(bytes);
-        exif::Reader::new().read_from_container(&mut cursor)
-    } else {
-        let Ok(file) = std::fs::File::open(path) else {
-            return (None, None);
-        };
-        let mut reader = std::io::BufReader::new(file);
-        exif::Reader::new().read_from_container(&mut reader)
-    };
-    let Ok(exif) = exif else {
-        return (None, None);
-    };
-
-    let datetime = exif
-        .fields()
-        .find(|f| f.tag == exif::Tag::DateTimeOriginal)
-        .and_then(ascii_value)
-        .and_then(|s| ExifDateTime::parse(&s));
-
-    let make = exif
-        .fields()
-        .find(|f| f.tag == exif::Tag::Make)
-        .and_then(ascii_value);
-    let model = exif
-        .fields()
-        .find(|f| f.tag == exif::Tag::Model)
-        .and_then(ascii_value);
-    let camera = match (make, model) {
-        (Some(make), Some(model)) => Some(format!("{} {}", make.trim(), model.trim())),
-        (Some(v), None) | (None, Some(v)) => Some(v.trim().to_owned()),
-        (None, None) => None,
-    };
-
-    (datetime, camera)
-}
-
-fn ascii_value(field: &exif::Field) -> Option<String> {
-    if let exif::Value::Ascii(ref v) = field.value {
-        let bytes = v.first()?;
-        std::str::from_utf8(bytes).ok().map(|s| s.to_owned())
-    } else {
-        None
-    }
 }
 
 /// Fall back to the file's mtime when no EXIF date is available.
