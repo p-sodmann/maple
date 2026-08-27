@@ -43,14 +43,10 @@ use anyhow::{Context, Result};
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 use image::RgbImage;
 use maple_import::session::{
-    segment, BlockTileEngine, ColorKmeansEngine, EnsembleEngine, Frame,
+    segment_with_holes, BlockTileEngine, ColorKmeansEngine, EnsembleEngine, Frame,
     GridHistogramEngine, SegmentParams, Segmentation, SessionEngine, Signature, TimeGapEngine,
 };
 
-/// Longest edge of the frame handed to every engine. Matches what the
-/// import pipeline already renders in `decode_one`, so a measurement here
-/// is a measurement of the real thing.
-const FRAME_PX: u32 = 256;
 
 fn main() {
     tracing_subscriber::fmt()
@@ -214,6 +210,25 @@ struct EngineRun {
     bytes: usize,
 }
 
+/// The parameters this engine is actually segmented with.
+///
+/// Mirrors `SegmentParams::for_spec`: an engine that already votes on the
+/// clock gets no threshold shaping, because time as a *cost*
+/// (`tight_hold`/`long_drop`) plus time as a *vote* counts it twice. The
+/// lab is where thresholds get chosen, so it has to segment the way the
+/// importer will — a number tuned here against different parameters would
+/// simply not transfer.
+fn params_for(run: &EngineRun, base: &SegmentParams) -> SegmentParams {
+    let votes_on_time = run.name == TimeGapEngine::NAME
+        || run.members.iter().any(|(name, _, _)| name == TimeGapEngine::NAME);
+    SegmentParams {
+        cut: run.cut,
+        tight_hold: if votes_on_time { 0.0 } else { base.tight_hold },
+        long_drop: if votes_on_time { 0.0 } else { base.long_drop },
+        ..*base
+    }
+}
+
 fn run() -> Result<()> {
     let args = parse_args()?;
     let (mut engines, memberships) = build_engines(&args)?;
@@ -227,7 +242,11 @@ fn run() -> Result<()> {
     anyhow::ensure!(!paths.is_empty(), "no images under {}", args.dir.display());
 
     println!("session-lab: {} photos from {}", paths.len(), args.dir.display());
-    println!("decoding at {FRAME_PX} px, {} engine(s)\n", engines.len());
+    println!(
+        "decoding at {} px via the canonical preview, {} engine(s)\n",
+        maple_import::preview::PREVIEW_PX,
+        engines.len()
+    );
 
     let mut runs: Vec<EngineRun> = engines
         .iter()
@@ -314,8 +333,7 @@ fn run() -> Result<()> {
         .iter()
         .zip(&runs)
         .map(|(engine, run)| {
-            let p = SegmentParams { cut: run.cut, ..base };
-            segment_with_holes(engine.as_ref(), &run.signatures, &times, &p)
+            segment_with_holes(engine.as_ref(), &run.signatures, &times, &params_for(run, &base))
         })
         .collect();
 
@@ -422,11 +440,18 @@ fn build_engines(args: &Args) -> Result<EngineSet> {
     Ok((all, memberships))
 }
 
-/// Decode `path` (raw preview included) down to the shared working frame.
+/// The frame every engine sees — byte-for-byte what the import scan hands
+/// its own engines.
+///
+/// It goes through the *canonical preview* rather than decoding straight to
+/// a working size, and that round trip is the point: the importer computes
+/// on the WebP it keeps, so a lab that measured pristine pixels would be
+/// tuning thresholds against an image the scan never sees. These two
+/// diverged once already — the lab downsampled with `image::thumbnail`
+/// while the scan used Lanczos3 — which is why the shared definition now
+/// lives in [`maple_import::preview`] and neither side has a copy.
 fn load_frame(path: &Path) -> Option<RgbImage> {
-    let bytes = maple_import::loadable_image_bytes(path).ok()?;
-    let img = maple_import::decode_image_bytes(&bytes).ok()?;
-    Some(img.thumbnail(FRAME_PX, FRAME_PX).into_rgb8())
+    maple_import::preview::decode(&maple_import::preview::encode_path(path).ok()?).ok()
 }
 
 fn encode_thumb(frame: &RgbImage, px: u32) -> String {
@@ -441,44 +466,6 @@ fn encode_thumb(frame: &RgbImage, px: u32) -> String {
     STANDARD.encode(&jpeg)
 }
 
-/// [`segment`] over a sequence that may have holes in it.
-///
-/// A photo that would not decode has no signature. Dropping it would join
-/// the sessions on either side, so instead the run is cut around it: an
-/// undecodable frame is its own session, which is also the honest answer —
-/// nothing is known about it.
-fn segment_with_holes(
-    engine: &dyn SessionEngine,
-    signatures: &[Option<Signature>],
-    times: &[Option<f64>],
-    p: &SegmentParams,
-) -> Segmentation {
-    use maple_import::session::{Link, Session};
-    let mut sessions = Vec::new();
-    let mut links = Vec::new();
-    let mut outliers = Vec::new();
-    let mut at = 0usize;
-    while at < signatures.len() {
-        if signatures[at].is_none() {
-            sessions.push(Session { start: at, end: at + 1 });
-            at += 1;
-            continue;
-        }
-        let end = signatures[at..]
-            .iter()
-            .position(Option::is_none)
-            .map(|off| at + off)
-            .unwrap_or(signatures.len());
-        let run: Vec<Signature> = signatures[at..end].iter().map(|s| s.clone().unwrap()).collect();
-        let seg = segment(engine, &run, &times[at..end], p);
-        sessions.extend(seg.sessions.iter().map(|s| Session { start: s.start + at, end: s.end + at }));
-        links.extend(seg.links.iter().map(|l| Link { at: l.at + at, from: l.from + at, ..*l }));
-        outliers.extend(seg.outliers.iter().map(|o| o + at));
-        at = end;
-    }
-    outliers.sort_unstable();
-    Segmentation { sessions, links, outliers }
-}
 
 /// Every pair of photos within `band` of each other, as one quantised byte
 /// each — what the browser needs to re-segment without an `n²` matrix.
@@ -740,7 +727,7 @@ fn render_html(
     h.push_str("<script>window.LAB=");
     h.push('{');
     let _ = write!(h, "dir:{},", json_str(&args.dir.display().to_string()));
-    let _ = write!(h, "band:{},framePx:{FRAME_PX},", args.band);
+    let _ = write!(h, "band:{},framePx:{},", args.band, maple_import::preview::PREVIEW_PX);
     let _ = write!(h, "defaultEngine:{},", json_str(&runs.last().map(|r| r.name.clone()).unwrap_or_default()));
 
     h.push_str("params:{");
@@ -1044,8 +1031,19 @@ function thresholdFor(p, gap, streak){
   return Math.max(t, 0);
 }
 
+// Mirrors `params_for` in Rust: an engine that already votes on the clock
+// gets no threshold shaping, or time would count twice — once as a cost
+// and once as a vote. The sliders stay live for every other engine, which
+// is why this is decided per engine rather than by hiding the controls.
+function votesOnTime(name){
+  if (name === 'time-gap') return true;
+  const e = L.engines.find(e => e.name === name);
+  return !!e && (e.members || []).some(m => m.name === 'time-gap');
+}
+
 function segment(name){
   const p = {...state.params, cut: state.cuts[name]};
+  if (votesOnTime(name)){ p.tightHold = 0; p.longDrop = 0; }
   const sessions = [], outliers = [], links = new Array(N).fill(null);
   const gapBetween = (a,b) => {
     const x = L.photos[a].t, y = L.photos[b].t;

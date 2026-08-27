@@ -19,6 +19,10 @@ cargo run --release -p maple-db --bin session-lab -- <dir> --out /tmp/sessions.h
 
 Runs every session engine over a real folder in one pass — one decode, every
 engine sees the same frame — and reports what each cost and where each cut.
+That frame is the **canonical preview** (`maple_import::preview`), byte-for-byte
+what the import scan hands its own engines: the lab measured pristine pixels
+once while the scan measured Lanczos3-resized ones, which quietly meant nothing
+tuned here transferred.
 Text gives per-engine ms/photo, bytes per signature, session-size statistics
 and a pairwise boundary-F1 matrix (no ground truth needed: if a cheap engine
 cuts a card where DINOv2 cuts it, the expensive one has nothing left to
@@ -209,23 +213,100 @@ single binary; the backend is fixed at compile time.
   all do. `ServerDeps::on_change` is the master's equivalent of the servant worker's:
   a master polls nothing, so without it a photo a servant sent sits unseen until the app
   restarts. (The 60-second scanner still refreshes nothing — that gap predates sync.)
-- **Import scan pipeline** (`maple-ui/src/import.rs`): three stages split along where
+- **One preview, and everything reads it** (`maple-import/src/preview.rs`): a photo's
+  pixels are wanted by four things — the tile, the sharpness score, the session
+  signature, sometimes the embedder — and the obvious implementation gives each whatever
+  decode is in hand, leaving no answer to "which pixels did the detector actually see".
+  So the pipeline narrows to one artefact: `preview::encode` makes a 256 px WebP
+  (~15 KB against a decoded frame's ~196 KB), `preview::decode` turns it back into a
+  frame, and **every check runs on the output of `decode`** while the WebP is the only
+  thing kept. Two properties fall out. What was checked is what is shown — the signature
+  that grouped a photo came from the same lossy pixels on screen, not a pristine decode
+  that exists nowhere. And a recomputation *agrees*: re-deriving a signature or a
+  sharpness score from a stored preview, days later or on another machine, reproduces
+  the scan's own answer, because there was no other input it could have used. The
+  round trip costs an encode plus a decode on the pipeline's *parallel* stage while the
+  one serial reader spends ~100 ms/photo — nothing that shows on a clock. It lives in
+  `maple-import` because the importer and `session-lab` must see byte-identical frames
+  or a threshold tuned in the lab does not transfer; they had already drifted apart once
+  (the lab downsampling with `image::thumbnail` against the scan's Lanczos3), which is
+  the divergence the shared module exists to make impossible. `maple-ui/src/thumbnail.rs`
+  keeps only the library's own cover crop and delegates the rest. One measured
+  consequence, recorded in the module docs rather than discovered later: compression
+  artefacts are high-frequency, which is what variance-of-Laplacian measures, so
+  sharpness reads slightly high — pristine 966/157/27/4 over a progressively blurred
+  image comes back as 930/192/58/20. Ordering survives, which was all the old
+  auto-picking needed and is all the tournament's on-screen hint claims; the floor
+  only makes two already-blurry photos harder to tell apart.
+- **The medium remembers its own previews** (`maple-import/src/preview_cache.rs`):
+  `.maple_previews.bin` beside `.maple_seen.bin` and `.maple_embed_cache.bin`, so a card
+  carries to the next machine the previews already made from it. Unlike its neighbour
+  `EmbeddingCache` it is keyed by **path, size and mtime — not content hash** — and the
+  difference is the entire point: a content hash can only be computed by reading the
+  whole file, which is precisely the cost a hit is meant to avoid. Keyed this way a hit
+  never opens the file at all, so rescanning an unchanged card is a `stat` per photo
+  instead of a ~100 ms read, and the *content hash rides in the record* for the same
+  reason. The trade, stated in the module docs because the failure would be silent:
+  `(path, size, mtime)` is taken as the file's identity, so a file replaced in place at
+  the same size and mtime would be served the previous one's preview **and its hash**,
+  and could be badged with the wrong import history. Camera cards write once and every
+  editor moves the mtime — the same assumption `make` and `rsync` ship with. The file is
+  **append-only** (tens of megabytes of previews; rewriting it per batch the way
+  `EmbeddingCache` does would spend the savings back on the card), later records win,
+  each record is length-prefixed so a card pulled mid-write costs exactly the truncated
+  tail, and `flush` compacts whenever dead records outnumber live ones — which is what
+  stops a card formatted and refilled a few times carrying every generation of
+  `DSCF0001.JPG` forever. Writes go through one `preview_cache_stage` thread for the
+  same reason there is one reader: a card is one bus, and N decoders appending to it
+  would contend with the reads still going on.
+- **Import scan pipeline** (`maple-ui/src/import.rs`): four stages split along where
   the work blocks. **Reading is serial**, on one thread — a camera card is a single bus,
   and twelve readers on it each get a twelfth of the bandwidth and all finish late
   *together*, so the grid sits empty for minutes and then fills in a burst (measured: it
   made time-to-first-tile worse, not better). One reader also opens each file **once**;
   hashing and decoding used to open it separately, doubling traffic over the slowest link
-  in the pipeline. `read_with_budget` hashes the *file* bytes — never a raw's preview, so
-  the digest stays the identifier `SeenSet` and the library use. **Decoding fans out**
+  in the pipeline — and increasingly it opens each file **not at all**: `read_one`
+  consults the medium's own preview cache from the directory entry first, and a hit
+  supplies the preview, the capture time *and* the content hash without a read.
+  `read_with_budget` hashes the *file* bytes — never a raw's preview, so the digest
+  stays the identifier `SeenSet` and the library use. **Decoding fans out**
   across `[import] decode_threads` workers pulling from one bounded queue: pure CPU over
-  bytes already in memory, so it cannot stall on the card. **Embedding is serial again**,
-  behind everything, because it owns the single `&mut` ONNX session and the embedding
-  cache; its results arrive later as `ScanMsg::Embedding`, after the tile is already on
-  screen. Three rules: the tile is sent *before* the embed job (that queue blocks, and
-  the user should already have the picture); every queue is bounded (`sync_channel`),
-  since an unbounded one would pull a whole card into RAM; and each stage's original
-  sender is dropped inside the `thread::scope` body, or the stages wait on each other
-  forever. A file the card never returns from is **outlived, not cancelled** — the read
+  bytes already in memory, so it cannot stall on the card — and it is where the
+  canonical preview is *made*, for the same reason EXIF is parsed here: the reader is the
+  one serial stage and the slowest link, and this is pure CPU over bytes already in hand.
+  **Signing is serial again**,
+  behind everything: `signature_stage` owns the one `&mut dyn SessionEngine`, and that is
+  load-bearing rather than incidental — `TimeGapEngine` latches its epoch on the first
+  frame it sees, so one engine per decode thread would give each its own origin and make
+  their signatures incomparable. Its results arrive later as `ScanMsg::Signature`, after
+  the tile is already on screen, and frames reach it in *decode-completion* order, which
+  is fine: a signature describes one photo and nothing else, and scan order is restored
+  on the UI thread where each lands in its own entry. The DINOv2 embed stage still runs
+  beside it when `[stacks] enabled` is on, but only to **store** an embedding with the
+  copied photo so the library's own stacker need not compute it again — it no longer
+  groups anything here. Cost is why: 26 ms/photo against the session engines' ~0.2 ms,
+  and its bounded queue backpressures the decoders and thence the reader. EXIF is parsed
+  on the *decode* thread from the bytes already in hand (`exif_read::read_bytes`), never
+  on the reader — the reader is the one serial stage and the slowest link, and reopening
+  each file for its timestamp would pay for session detection twice over. **Writing the
+  medium's preview cache is serial too** (`preview_cache_stage`), and for the reader's
+  own reason rather than the engine's: a card is one bus, so N decoders appending to it
+  independently would contend with reads still in flight. It batches
+  `PREVIEW_CACHE_FLUSH_EVERY` records per append and holds the cache lock across the
+  write — the right way round, since a scan that is *writing* the cache is one whose
+  lookups are missing anyway. Three rules:
+  the tile is sent *before* the pixel jobs (those queues block, and the user should
+  already have the picture); every queue is bounded (`sync_channel`), since an unbounded
+  one would pull a whole card into RAM; and each stage's original sender is dropped
+  inside the `thread::scope` body, or the stages wait on each other forever. On the UI
+  side the drain is **time-boxed, not count-boxed** (`SCAN_DRAIN_BUDGET`), and only
+  messages that actually paint are charged against the budget. A fixed ten-per-tick cap
+  sized on a small folder turns a real card into a trickle: 954 photos are 1,910
+  messages, six seconds of ticking before `finish_scan` — which runs on the *last*
+  message and is the only thing that segments — can produce a single session. The `f`
+  grid spent all of that displaying its literal "no sessions detected" string, which is
+  how this was found; it now says "scanning" until the scan is actually over, because
+  "none yet" and "none found" are different answers. A file the card never returns from is **outlived, not cancelled** — the read
   runs on its own thread and `recv_timeout` walks away after `read_timeout_secs`, the
   same trade `image_loader.rs` makes. Its path is logged under the
   `maple::import::unreadable` target and the photo stays listed, selectable and copyable
@@ -277,24 +358,142 @@ single binary; the backend is fixed at compile time.
   each other at 0.95 boundary-F1 and with a `block-tile×2 + grid-histogram + time-gap`
   ensemble at 0.93; `color-kmeans` is the outlier at 0.70–0.74, which is the palette
   blindness showing.
-- **Import previews are decoded on demand** (`maple-ui/src/import_previews.rs`): a card
+- **Sessions are what the importer groups by** (`[sessions]` in settings.toml): they
+  replaced the DINOv2 burst clustering, which cost 26 ms/photo, throttled the whole scan
+  through its embed queue, defaulted to off, and chained transitively besides. `[stacks]
+  enabled` now governs only post-import stacking in the library; when it is on the scan
+  still computes an embedding, but purely to *store* it with the copied photo.
+  `engine_from_spec` is the one place a **string** becomes an engine, so settings.toml,
+  the lab's `--ensemble` and any future UI resolve a name identically. Two rules travel
+  with it. A `cut` of `0` means "ask the engine", never "no threshold" — engine distances
+  are not comparable to each other, so a number carried over from a different engine is
+  meaningless rather than merely wrong. And `SegmentParams::for_spec` **zeroes
+  `tight_hold`/`long_drop` when the spec already contains a time member**, because time
+  as a *cost* plus time as a *vote* counts the one signal most likely to be wrong (a
+  camera with the wrong clock, a card holding two days) twice over. The lab mirrors that
+  in `params_for` **and again in its JavaScript** — the lab is where thresholds get
+  chosen, so it has to segment the way the importer will or nothing tuned there transfers.
+- **The `f` grid is where a session gets corrected** (`toggle_boundary` /
+  `ensure_boundary` in `maple-ui/src/import.rs`): `f` swaps the preview for every photo
+  at once with sessions drawn as tinted bands, `esc` or `f` goes back. There are two
+  vocabularies for the same edit. **Keys toggle**: `[` sets the start at the current
+  photo and `]` the stop, and pressing one where a boundary already sits removes it,
+  merging. **Clicks ensure**: the first click opens a session on that photo and the next
+  closes it there, so a session is drawn by its two ends — and a click saying "it starts
+  here" about a photo that already starts one must *leave* it starting one, which is
+  exactly what toggling would not do. That is why `ensure_boundary` exists beside
+  `toggle_boundary` rather than reusing it. A grid click also moves the cursor, so
+  opening a session does not cost the ability to navigate by clicking. The half-finished
+  edit lives in `ctx.pending_cut` and is dropped when the view closes: it describes an
+  intention, and until the second click there is no boundary to record. Opening the grid
+  **during a scan parks on the scan's own frontier** (`scanned_count`), not on wherever
+  the cursor was left — the reason to open it mid-scan is to watch the card come in, and
+  that happens at the far end of what has been read. Four things make it small. A boundary is the only thing a session
+  *is* — sessions **tile** the sequence, so inserting one splits and removing one merges,
+  which means "set the start here" and "set the stop here" are a single toggle one photo
+  apart and there is no merge key, no drag state and no separate model. Correcting a
+  boundary **rebuilds the tournament** rather than patching it, which costs nothing
+  because a rebuild carries every verdict forward and re-asks only about photos still
+  undecided — the user was correcting the grouping, not giving up a decision. And the
+  grid **suspends "Hide old images"** rather
+  than working around it, so one model serves both views — a band drawn over a sequence
+  with photos missing from the middle would lie about what it contains.
+  Two traps this view sprang, both about *rows*. `ImportGridView` scrolls to
+  `current-grid-row` = `current-row / columns`, **not** to `current-row`: with tiles
+  abreast, strip row 500 sits on grid row 500/columns, so scrolling to the strip row
+  overshoots by exactly that factor — straight to the bottom of a real card. The
+  one-column filmstrip made the two the same number, so the bug could not appear until
+  something asked for more than one column. And the grid is created fresh each time it
+  opens, while a Slint `changed` handler does **not** fire for a value an element was
+  born with — hence the `init => park()` beside `changed current-grid-row`, or it would
+  open at the top however far down the card the cursor is.
+- **Nothing is preselected; the keeper is chosen in a tournament**
+  (`maple-ui/src/import_tournament.rs`): the importer used to auto-mark the sharpest
+  photo of each detected session. That is a guess dressed as a decision — variance-of-
+  Laplacian ranks a crisp badly-framed frame above the one where the child is looking at
+  the camera, and once it is marked nobody looks again. So the marking is gone and the
+  comparison is put in front of the user: two photos side by side, `1` keeps the left,
+  `2` the right, `3` both. It is a switch in the header beside "Hide old images", so
+  the ordinary one-photo triage is still there for anyone who wants it.
+  A real bracket does not fit: ⌈log₂ n⌉ rounds re-show photos already judged and there
+  is nowhere in one to put "keep both", which is the answer often enough that leaving it
+  out would be the feature's worst flaw. So it is a **single pass with an incumbent** —
+  left is whatever is still being defended, right is the next photo in capture order,
+  and the challenger takes over on both `2` and `3` because the scene drifts across a
+  session and the more recent frame is the better thing to compare the next one against.
+  One invariant carries the whole design: **only the incumbent's fate is still open.**
+  Everything behind it is settled and never asked about twice, the last one standing is
+  kept when a session runs out, and a session of *n* costs exactly *n* − 1 keystrokes
+  with every one of its photos decided. Losing is a **skip**, not an absence — it sets
+  `passed`, so `commit_skips` writes it to the medium's Skipped record and a re-scan
+  does not offer it again; recording it as "no answer yet" would hand the whole card
+  back next time. `u` undoes, and that is not a nicety: `1` and `2` are one key apart
+  and every press decides a photo for good.
+  The rounds are **rebuilt, never resumed**, from the groups and the verdicts carried
+  inside the `Tournament` itself (`carry`) rather than in a second copy beside it. That
+  one rule buys three behaviours free: switching the mode off and on resumes, correcting
+  a session boundary re-groups what is *left*, and a photo already in the library never
+  enters a comparison whose result could not be acted on.
+  **Paired zooming is the reason it can replace a sharpness score at all**, and it only
+  works because the crop comes off the *original*: scaling up a 256 px canonical preview
+  would show big soft blocks, which is the exact opposite of the judgement being asked
+  for. So `PairRenderer` keeps two decodes alive (capped at `MAX_SOURCE_PX` = 4096 px,
+  ~34 MB a side) on one worker thread and `maple_import::preview::render_region` cuts the
+  visible rectangle out of one at pane resolution — Rust renders to exactly the pane's
+  pixel size rather than letting Slint scale, or a zoomed pixel would be a resampled
+  resample. The incumbent's decode carries forward, so a verdict costs one new decode.
+  Requests **coalesce** — a drag makes them faster than they can be served, so the queue
+  is drained to its newest entry per side, the same "re-prioritise by overwriting, never
+  by cancelling" trade `import_previews.rs` makes. There is **one** zoom and **one**
+  centre, in Rust, and both panes are drawn from them; two panes each keeping their own
+  and following each other would drift the first time a render was dropped. The centre
+  is *normalised* (`crop_for` takes `cx`/`cy` in 0..1), which is what keeps a portrait
+  and a landscape frame paired, and `clamp_center` reads **one** image rather than
+  reconciling both — near an edge the shorter frame simply stops instead of dragging the
+  other off whatever was being compared. Two smaller rules with visible consequences: a
+  new pair resets to fit (`PairView::fit`), because a zoom is a question about *these*
+  two frames; and a pane whose photo did **not** change is left alone, or `1` — the most
+  common keystroke — would drop the one thing being compared back to its placeholder and
+  redraw the identical crop a moment later. The placeholder itself is the canonical
+  preview inflated inline (~1 ms), because a raw's decode can take half a second and an
+  empty frame for that long on every verdict reads as broken. The zoom **survives inside
+  a session and is dropped between them**: twenty frames of one child in one room are
+  framed alike, so re-zooming onto the eyes nineteen times is the tedium the feature
+  exists to remove, while the next session is a different scene.
+  One trap worth knowing before hanging anything else off a `changed` handler here: the
+  panes report their own pixel size, and *everything* on screen is rendered to that
+  number, so a report that never arrives leaves both panes blank forever. It is reported
+  through derived `int` properties (the proven `row-count` pattern) rather than `changed
+  width`, **and** `pane_size` falls back to half the window when nothing has been
+  reported — a slightly soft render until the real number lands is a better failure than
+  a feature that does not draw.
+- **Import previews are inflated on demand** (`maple-ui/src/import_previews.rs`): a card
   of a few thousand photos will not fit in memory as decoded frames (~196 KB each) and
-  almost none of them are on screen, so the browser decodes what the user is *looking at*.
-  Two ideas carry it. **Priority is evaluated when a worker picks up work, not when it is
+  almost none of them are on screen, so the browser holds the canonical WebPs and decodes
+  what the user is *looking at*. The service itself is now the **recovery** path, not the
+  main one: the scan makes a preview for every photo it reads and the medium's cache
+  holds the ones an earlier run made, so by the time the strip asks here it is a photo
+  the scan has not reached yet, or one whose display file will not decode. Two ideas
+  carry it. **Priority is evaluated when a worker picks up work, not when it is
   queued**: the queue holds wanted indices plus one `focus`, and a worker always takes the
   pending index nearest it, so scrolling re-prioritises everything already queued by
   writing a single number — no re-sorting, no cancelling, and no waiting out a backlog of
   photos that scrolled past before the ones now on screen get decoded. **Retention is
   two-tier**: `Retained` is an LRU of decoded frames capped by `[import]
   max_loaded_previews`, keyed on *when the photo was last in view* (scrolling back to one
-  saves it), and eviction drops the pixels down to a ~15 KB WebP kept from the first
-  decode — so scrolling back re-inflates from memory and never returns to the card.
-  Reading still happens one file at a time (same bus argument as the scan); only the
-  decode fans out. The scan itself no longer produces tile pixels at all: it sends the
-  full listing up front (so the count and every filename are right from the first frame),
-  then reads and hashes, and only decodes when burst detection needs pixels for the
-  embedder. `ImportItem::loaded` therefore means "has a decoded preview", not "has been
-  scanned", and goes false again on eviction. Requests are clamped to the retention cap —
+  saves it), and eviction drops the pixels down to the ~15 KB canonical WebP — so
+  scrolling back re-inflates from memory and never returns to the card. Every photo the
+  scan touched has one, so the second tier is now essentially always populated; the arithmetic
+  that buys it is ~15 KB × the whole card (a 5,000-photo card is ~75 MB resident, and the
+  same on disk in `.maple_previews.bin`). Reading still happens one file at a time (same
+  bus argument as the scan); only the decode fans out, and the WebP *encode* happens on
+  a worker rather than the UI thread. The scan sends the full listing up front (so the
+  count and every filename are right from the first frame), then reads, hashes and
+  previews. `ImportItem::loaded` therefore means "has a decoded preview", not "has been
+  scanned", and goes false again on eviction. One consequence with no other owner:
+  `apply_scan_thumb` inflates a just-arrived preview itself when the row is inside the
+  current window (`in_preview_window`), because the window is only re-requested when the
+  viewport *moves* and a user watching a scan fill in is not scrolling. Requests are clamped to the retention cap —
   a window wider than what can be held would have the tail evicting the head forever.
   The window itself is reported by the strip only when the **viewport** moves, so anything
   that renumbers rows without scrolling — "Hide old images", above all — has to re-derive
@@ -386,5 +585,5 @@ single binary; the backend is fixed at compile time.
 maple-ui/ui/                 — Slint markup (app.slint, detail.slint, library.slint, …)
 maple-ui/src/                — Rust UI controllers (grid.rs, detail.rs, import.rs, …)
 maple-db/src/models/         — ONNX inference framework (detection, embedding, session)
-maple-import/src/            — scan, copy, hash, raw format support
+maple-import/src/            — scan, copy, hash, canonical preview, raw format support
 ```

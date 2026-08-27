@@ -25,6 +25,7 @@ mod image_loader;
 mod import;
 mod import_page;
 mod import_previews;
+mod import_tournament;
 mod library_page;
 mod paging;
 mod path_template_window;

@@ -36,6 +36,10 @@ impl Default for GridHistogramEngine {
 }
 
 impl GridHistogramEngine {
+    /// This engine's spec name, as `engine_from_spec` and settings.toml
+    /// spell it.
+    pub const NAME: &'static str = NAME;
+
     pub fn new(grid: usize, bins: usize, cell_px: usize) -> Self {
         Self { grid: grid.max(1), bins: bins.max(2), cell_px: cell_px.max(1) }
     }

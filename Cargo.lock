@@ -3383,12 +3383,14 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "blake3",
+ "fast_image_resize",
  "image",
  "kamadak-exif",
  "maple-state",
  "tempfile",
  "tokio",
  "tracing",
+ "webp",
  "zune-jpeg",
 ]
 

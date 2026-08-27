@@ -16,6 +16,7 @@ use std::sync::{mpsc, Arc, Mutex};
 use std::time::Duration;
 
 use image::{DynamicImage, RgbImage};
+use maple_import::Signature;
 use slint::{ComponentHandle, Model, ModelRc, SharedString, Timer, TimerMode, VecModel};
 
 use crate::import_previews::{PhotoRef, PreviewMsg, PreviewService, Retained};
@@ -56,6 +57,40 @@ const READ_AHEAD_PER_DECODER: usize = 3;
 /// user already has 64 tiles on screen.
 const EMBED_QUEUE_DEPTH: usize = 64;
 
+/// Rendered frames allowed to queue up for the session engine.
+///
+/// Deeper than the embedder's because the stage behind it is ~0.2 ms a
+/// photo against the card's ~100 ms, so this queue is almost always empty;
+/// the depth is there for the burst that arrives when several decoders
+/// finish at once, not to smooth out a slow consumer.
+const SIGNATURE_QUEUE_DEPTH: usize = 128;
+
+/// Previews allowed to queue up for the medium's own cache.
+///
+/// Deep, because the stage behind it writes to the card in batches and
+/// must never make a decoder wait on one: the whole point of the cache is
+/// to spend less time on the card, not more.
+const PREVIEW_CACHE_QUEUE_DEPTH: usize = 256;
+
+/// Previews written back to the medium per batch.
+///
+/// The cache file is append-only, so a flush costs only the new records —
+/// about 1 MB at this size. Small enough that a card pulled mid-scan loses
+/// little, large enough that the scan is not writing after every photo.
+const PREVIEW_CACHE_FLUSH_EVERY: usize = 64;
+
+/// How long the scan drain may spend applying messages in one tick.
+///
+/// A *time* budget, not a message count. The work per message is nowhere
+/// near uniform — a `Thumb` patches a model row and repaints, a `Signature`
+/// writes one field and shows nothing — and a fixed count sized on a small
+/// folder turns a real card into a trickle: 954 photos are 1,910 messages,
+/// and at ten per 30 ms tick that is six seconds of draining before
+/// `finish_scan` (which runs on the *last* message) can segment anything.
+/// The `f` grid spends all of it saying "no sessions detected", which is
+/// how this was found.
+const SCAN_DRAIN_BUDGET: Duration = Duration::from_millis(8);
+
 thread_local! {
     static IMPORT: RefCell<Option<Import>> = const { RefCell::new(None) };
 }
@@ -69,8 +104,12 @@ enum ScanMsg {
     /// service has the paths it needs to decode on demand.
     Found(Vec<PhotoRef>),
     Thumb(ScanThumb),
-    /// A burst-detection embedding, arriving separately and later than the
-    /// photo's tile — see [`spawn_scan_worker`].
+    /// A session-detection signature, arriving separately and later than
+    /// the photo's tile — see [`spawn_scan_worker`].
+    Signature { index: usize, signature: Signature },
+    /// A DINOv2 embedding, when `[stacks] enabled` turned the embedder on.
+    /// It no longer groups anything here — it is carried so the copy can
+    /// store it, sparing the library's own stacker a second inference pass.
     Embedding { index: usize, embedding: Vec<f32> },
     Done,
     Error(String),
@@ -134,9 +173,16 @@ struct ScanThumb {
     /// exists either way and can still be selected and copied; it just has
     /// no picture to show.
     readable: Readable,
-    /// Variance-of-Laplacian sharpness score, computed whenever an
-    /// embedding is (used to auto-pick the "best" shot in a burst).
+    /// Variance-of-Laplacian sharpness score, computed whenever a
+    /// signature is — it is what picks the keeper out of a session.
     sharpness: Option<f32>,
+    /// Capture instant, fractional seconds since the epoch. Parsed from the
+    /// bytes already in hand, so it costs no extra card I/O.
+    taken: Option<f64>,
+    /// The canonical preview, made from this photo's bytes or taken
+    /// straight out of the medium's cache. `None` only when nothing about
+    /// the file could be decoded.
+    preview: Option<Vec<u8>>,
 }
 
 enum CopyMsg {
@@ -187,16 +233,30 @@ struct Entry {
     /// Decoded thumbnail, present only while this photo is in the retained
     /// tier. `None` means never decoded, or evicted — `webp` says which.
     thumb: Option<slint::Image>,
-    /// A 256 px WebP of the thumbnail, kept from the first time this photo
-    /// was decoded (~15 KB against the decoded frame's ~196 KB). Evicting
-    /// drops the pixels down to this, so scrolling back re-inflates from
-    /// memory instead of going to the card again.
+    /// The canonical preview (see [`maple_import::preview`]) — ~15 KB
+    /// against the decoded frame's ~196 KB, and the *only* pixel
+    /// representation this photo keeps.
+    ///
+    /// Everything reads it: the tile inflates from it, and the sharpness
+    /// score and session signature below were computed from the frame it
+    /// decodes to. Present for every photo the scan read (or found in the
+    /// medium's cache), so eviction drops the pixels down to this and
+    /// scrolling back never returns to the card.
     webp: Option<Vec<u8>>,
-    /// DINOv2 embedding computed during the scan (`None` if stack detection
-    /// is disabled or inference failed for this photo).
+    /// What this photo looks like to the session engine (`None` if session
+    /// detection is off, or the photo never decoded). Session detection is
+    /// sequential, so this is only ever read in scan order.
+    signature: Option<Signature>,
+    /// DINOv2 embedding, present only when `[stacks] enabled` is on. Not
+    /// used for grouping here — stored with the photo on copy so the
+    /// library's stacker does not have to compute it again.
     embedding: Option<Vec<f32>>,
-    /// Variance-of-Laplacian sharpness score, used to auto-pick the "best"
-    /// shot within a detected burst group.
+    /// Capture instant, fractional seconds since the epoch, from EXIF.
+    /// `None` when the photo carries no usable timestamp — which the
+    /// segmentation reads as "no gap information", not as "no gap".
+    taken: Option<f64>,
+    /// Variance-of-Laplacian sharpness score, used to pick the keeper out
+    /// of a detected session.
     sharpness: Option<f32>,
 }
 
@@ -305,9 +365,40 @@ struct ImportCtx {
     scanned_count: Rc<Cell<usize>>,
     source: Rc<RefCell<PathBuf>>,
     dest: Rc<RefCell<PathBuf>>,
-    /// Detected burst groups from the last scan — each a sorted list of
-    /// flat `entries` indices. Populated once, when the scan finishes.
+    /// Every session the last scan detected, **tiling the whole sequence**
+    /// — solo photos included, because the `f` grid has to be able to drag
+    /// a boundary onto any photo. `groups` is the `len >= 2` subset.
+    sessions: Rc<RefCell<Vec<maple_import::Session>>>,
+    /// Whether the `f` grid is open. While it is, "Hide old images" stands
+    /// down: session boundaries are about capture *sequence*, and a strip
+    /// with photos missing from the middle of a session would draw a band
+    /// that lies about what it contains.
+    grid_open: Rc<Cell<bool>>,
+    /// The photo a grid click opened a session on, waiting for the click
+    /// that closes it. `None` when no edit is half-finished.
+    ///
+    /// It is UI-only state and deliberately not part of the session list:
+    /// an open edit describes an intention, and until the second click
+    /// there is no boundary to record.
+    pending_cut: Rc<Cell<Option<usize>>>,
+    /// Detected session groups from the last scan — each a sorted list of
+    /// flat `entries` indices. Rebuilt from `sessions` whenever a boundary
+    /// moves.
     groups: Rc<RefCell<Vec<Vec<usize>>>>,
+    /// The A-vs-B pass over those groups, while it is running.
+    ///
+    /// Rebuilt rather than resumed whenever the grouping changes — see
+    /// [`crate::import_tournament`], where skipping the already-settled is
+    /// what makes a rebuild cost the user nothing.
+    tournament: Rc<RefCell<Option<crate::import_tournament::Tournament>>>,
+    /// The shared zoom and pan — *one* of each, for both panes. Two panes
+    /// each keeping their own would have to be told to follow each other,
+    /// and would drift the first time a render was dropped.
+    pair_view: Rc<RefCell<PairView>>,
+    /// Renders the two panes; alive only while the tournament is on, since
+    /// it holds two full decodes.
+    pair_renderer: Rc<RefCell<Option<crate::import_tournament::PairRenderer>>>,
+    pair_timer: Rc<RefCell<Option<Timer>>>,
     /// The tags every photo marked from *now on* will carry.
     ///
     /// A brush, not a batch setting: it survives a copy, changes mid-pass,
@@ -427,7 +518,14 @@ fn build(db: Arc<Mutex<maple_db::Database>>) -> Result<Import, slint::PlatformEr
         scanned_count: Rc::new(Cell::new(0)),
         source: Rc::new(RefCell::new(PathBuf::new())),
         dest,
+        sessions: Rc::new(RefCell::new(Vec::new())),
+        grid_open: Rc::new(Cell::new(false)),
+        pending_cut: Rc::new(Cell::new(None)),
         groups: Rc::new(RefCell::new(Vec::new())),
+        tournament: Rc::new(RefCell::new(None)),
+        pair_view: Rc::new(RefCell::new(PairView::default())),
+        pair_renderer: Rc::new(RefCell::new(None)),
+        pair_timer: Rc::new(RefCell::new(None)),
         brush: Rc::new(RefCell::new(Vec::new())),
         brushed: Rc::new(RefCell::new(HashMap::new())),
         scan_timer: Rc::new(RefCell::new(None)),
@@ -442,6 +540,7 @@ fn build(db: Arc<Mutex<maple_db::Database>>) -> Result<Import, slint::PlatformEr
     wire_copy(&window, &ctx);
     wire_rotate(&window, &ctx);
     wire_tags(&window, &ctx);
+    wire_tournament(&window, &ctx);
 
     Ok(Import { window, ctx })
 }
@@ -555,6 +654,7 @@ fn wire_scan(window: &ImportWindow, ctx: &ImportCtx) {
             let settings = maple_state::Settings::load();
             let library_dir = settings.library_dir.clone();
             let stack_settings = settings.stacks.clone();
+            let session_settings = settings.sessions.clone();
 
             // Both records live on the medium being scanned, so a card
             // plugged into a second machine still knows what it has already
@@ -577,10 +677,26 @@ fn wire_scan(window: &ImportWindow, ctx: &ImportCtx) {
             ctx.preview_window.set((0, INITIAL_WINDOW, 0));
             ctx.hide_old.set(true);
             w.set_hide_old(true);
+            ctx.sessions.borrow_mut().clear();
+            // A new card is a new set of comparisons, and the old verdicts
+            // were about photos that are no longer on screen. Dropping the
+            // tournament drops its record with it — there is no second
+            // copy to forget about.
+            ctx.tournament.borrow_mut().take();
+            w.set_tourney_available(false);
+            w.set_tourney_on(false);
+            stop_pair_renderer(&ctx);
             w.set_old_count(0);
             w.set_preview_state(0);
 
-            spawn_scan_worker(src, stack_settings, settings.import.clone(), prior, tx.clone());
+            spawn_scan_worker(
+                src,
+                stack_settings,
+                session_settings,
+                settings.import.clone(),
+                prior,
+                tx.clone(),
+            );
 
             // Timer to drain scan results.
             let ctx2 = ctx.clone();
@@ -591,17 +707,36 @@ fn wire_scan(window: &ImportWindow, ctx: &ImportCtx) {
                 move || {
                     let Some(w) = ctx2.window.upgrade() else { return };
 
-                    for _ in 0..10 {
-                        match rx.try_recv() {
-                            Ok(ScanMsg::Found(photos)) => apply_scan_listing(&w, &ctx2, photos),
-                            Ok(ScanMsg::Thumb(thumb)) => apply_scan_thumb(&w, &ctx2, thumb),
+                    let deadline = std::time::Instant::now() + SCAN_DRAIN_BUDGET;
+                    loop {
+                        // Only messages that touch the UI are charged
+                        // against the budget. A signature backlog is pure
+                        // data — draining it costs a field write each and
+                        // paying a whole tick for ten of them is what made
+                        // a big card crawl.
+                        let painted = match rx.try_recv() {
+                            Ok(ScanMsg::Found(photos)) => {
+                                apply_scan_listing(&w, &ctx2, photos);
+                                true
+                            }
+                            Ok(ScanMsg::Thumb(thumb)) => {
+                                apply_scan_thumb(&w, &ctx2, thumb);
+                                true
+                            }
                             Ok(ScanMsg::Embedding { index, embedding }) => {
-                                // Arrives after the photo's tile and needs
-                                // no repaint — only `finish_scan`'s
-                                // clustering reads it.
                                 if let Some(e) = ctx2.entries.borrow_mut().get_mut(index) {
                                     e.embedding = Some(embedding);
                                 }
+                                false
+                            }
+                            Ok(ScanMsg::Signature { index, signature }) => {
+                                // Arrives after the photo's tile and needs
+                                // no repaint — only `finish_scan`'s
+                                // segmentation reads it.
+                                if let Some(e) = ctx2.entries.borrow_mut().get_mut(index) {
+                                    e.signature = Some(signature);
+                                }
+                                false
                             }
                             Ok(ScanMsg::Done) => {
                                 finish_scan(&w, &ctx2);
@@ -614,6 +749,9 @@ fn wire_scan(window: &ImportWindow, ctx: &ImportCtx) {
                             }
                             Err(mpsc::TryRecvError::Empty) => break,
                             Err(mpsc::TryRecvError::Disconnected) => return,
+                        };
+                        if painted && std::time::Instant::now() >= deadline {
+                            break;
                         }
                     }
                 },
@@ -639,21 +777,32 @@ fn wire_scan(window: &ImportWindow, ctx: &ImportCtx) {
 /// **Decoding fans out.** It is pure CPU over bytes already in memory, so
 /// it parallelises cleanly and cannot stall on the card.
 ///
-/// **Embedding is serial again**, behind everything else: it needs the one
-/// `&mut` ONNX session and the one embedding cache, and its results arrive
-/// later as [`ScanMsg::Embedding`], long after the tile is on screen.
+/// **Signing is serial again**, behind everything else. Session detection
+/// walks the card in order and its engine is one `&mut` — and for the time
+/// member that is load-bearing rather than incidental: [`TimeGapEngine`]
+/// anchors its epoch on the first frame it sees, so one engine per decode
+/// thread would give each its own origin and make their signatures
+/// incomparable. Results arrive later as [`ScanMsg::Signature`], long after
+/// the tile is on screen.
+///
+/// The optional DINOv2 embed stage still runs beside it when `[stacks]
+/// enabled` is on, but only to *store* embeddings for the library's own
+/// stacking — it no longer decides any grouping here. It costs 26 ms/photo
+/// against the session engines' ~0.2 ms, and its bounded queue backpressures
+/// the decoders and thence the reader, which is why it is off by default.
 ///
 /// A file the card never returns from costs one read timeout and is then
 /// abandoned — before, it stalled the scan forever. Both the pool size and
 /// that timeout come from `[import]` in settings.toml.
 ///
 /// If the embedder fails to load (e.g. no network for a first-time model
-/// fetch), log once and let the scan finish without embeddings or
-/// sharpness — this is enrichment, never a hard requirement to finish
-/// scanning.
+/// fetch), or the session engine spec does not name a real engine, log once
+/// and let the scan finish without it — both are enrichment, never a hard
+/// requirement to finish scanning.
 fn spawn_scan_worker(
     src: PathBuf,
     stack_settings: maple_state::StackSettings,
+    session_settings: maple_state::SessionSettings,
     tuning: maple_state::ImportSettings,
     prior: Arc<PriorDecisions>,
     tx: mpsc::Sender<ScanMsg>,
@@ -687,10 +836,42 @@ fn spawn_scan_worker(
             src.display(),
             budget
         );
+        // Build the engine once, up front: a spec naming nothing real is a
+        // settings mistake worth one clear line in the log, not one warning
+        // per photo.
+        let mut engine = match session_settings.enabled {
+            false => None,
+            true => match maple_import::session::engine_from_spec(&session_settings.engine) {
+                Ok(engine) => {
+                    tracing::info!("Import scan: sessions by {}", engine.describe());
+                    Some(engine)
+                }
+                Err(err) => {
+                    tracing::warn!(
+                        "Import scan: [sessions] engine = {:?} is unusable, \
+                         scanning without session detection: {err}",
+                        session_settings.engine
+                    );
+                    None
+                }
+            },
+        };
+
         let (jobs_tx, jobs_rx) =
             mpsc::sync_channel::<DecodeJob>(decoders * READ_AHEAD_PER_DECODER);
         let jobs_rx = Arc::new(Mutex::new(jobs_rx));
+        // What this medium already told us about itself. Every hit below
+        // is a file that never gets opened.
+        let preview_cache = Arc::new(Mutex::new(maple_import::PreviewCache::load_from(&src)));
+        let known = preview_cache.lock().map(|c| c.len()).unwrap_or(0);
+        if known > 0 {
+            tracing::info!("Import scan: the medium already has {known} previews");
+        }
+
         let (embed_tx, embed_rx) = mpsc::sync_channel::<EmbedJob>(EMBED_QUEUE_DEPTH);
+        let (sig_tx, sig_rx) = mpsc::sync_channel::<SignatureJob>(SIGNATURE_QUEUE_DEPTH);
+        let (cache_tx, cache_rx) = mpsc::sync_channel::<CacheJob>(PREVIEW_CACHE_QUEUE_DEPTH);
+        let sessions_on = engine.is_some();
 
         std::thread::scope(|scope| {
             if stack_settings.enabled {
@@ -699,11 +880,21 @@ fn spawn_scan_worker(
                 let settings = stack_settings.clone();
                 scope.spawn(move || embed_stage(&src, &settings, embed_rx, &tx));
             }
+            if let Some(engine) = engine.as_mut() {
+                let tx = tx.clone();
+                scope.spawn(move || signature_stage(engine.as_mut(), sig_rx, &tx));
+            }
+            {
+                let cache = preview_cache.clone();
+                scope.spawn(move || preview_cache_stage(&cache, cache_rx));
+            }
 
             for _ in 0..decoders {
                 let tx = tx.clone();
                 let jobs_rx = jobs_rx.clone();
                 let embed_tx = stack_settings.enabled.then(|| embed_tx.clone());
+                let sig_tx = sessions_on.then(|| sig_tx.clone());
+                let cache_tx = cache_tx.clone();
                 scope.spawn(move || {
                     loop {
                         // Take the job and release the lock before decoding:
@@ -714,7 +905,13 @@ fn spawn_scan_worker(
                             Err(_) => break,
                         };
                         match job {
-                            Ok(job) => decode_one(job, embed_tx.as_ref(), &tx),
+                            Ok(job) => decode_one(
+                                job,
+                                embed_tx.as_ref(),
+                                sig_tx.as_ref(),
+                                Some(&cache_tx),
+                                &tx,
+                            ),
                             Err(_) => break,
                         }
                     }
@@ -723,23 +920,26 @@ fn spawn_scan_worker(
 
             // The reader itself. Sequential, in scan order, on this thread.
             for (index, group) in scanned_groups.iter().enumerate() {
-                if jobs_tx.send(read_one(index, group, budget, &prior)).is_err() {
+                let job = read_one(index, group, budget, &prior, &src, &preview_cache);
+                if jobs_tx.send(job).is_err() {
                     break;
                 }
             }
 
-            // Both stages end when every sender is gone, so these two
+            // Every stage ends when its last sender is gone, so these
             // originals have to go before the scope joins — otherwise the
             // pipeline waits on itself forever.
             drop(jobs_tx);
             drop(embed_tx);
+            drop(sig_tx);
+            drop(cache_tx);
         });
 
         let _ = tx.send(ScanMsg::Done);
     });
 }
 
-/// One photo's bytes, read off the medium and waiting for a free core.
+/// One photo waiting for a free core, and where its pixels came from.
 struct DecodeJob {
     index: usize,
     path: PathBuf,
@@ -747,31 +947,97 @@ struct DecodeJob {
     hash: [u8; 32],
     imported: bool,
     skipped_before: bool,
-    /// What to decode: the file itself, or a raw's embedded preview.
-    /// `None` when the read failed or ran out of time.
-    bytes: Option<Vec<u8>>,
+    source: Source,
     readable: Readable,
+    /// How the medium's cache identifies this file, for writing the
+    /// preview back. `None` when the file's metadata could not be read, in
+    /// which case nothing is cached for it.
+    key: Option<maple_import::PreviewKey>,
+}
+
+/// Where one photo's pixels come from.
+enum Source {
+    /// Bytes read off the medium this run — the file itself for an
+    /// ordinary image, a raw's embedded preview for a raw. `None` when the
+    /// read failed or ran out of time. The canonical preview still has to
+    /// be made, and is then written back to the medium.
+    Fresh(Option<Vec<u8>>),
+    /// The medium's own cache already held this photo's preview, so the
+    /// file was **never opened**. That is the point of the cache: a rescan
+    /// of an unchanged card costs a `stat` per photo instead of a ~100 ms
+    /// read, and the capture time rides along because parsing it would
+    /// have meant opening the file after all.
+    Cached { webp: Vec<u8>, taken: Option<f64> },
+}
+
+/// One photo's worth of work for the session engine, queued behind the
+/// decoders.
+struct SignatureJob {
+    index: usize,
+    /// The frame the canonical preview decodes to — see
+    /// [`maple_import::preview`] for why nothing computes on anything else.
+    frame: RgbImage,
+    /// Capture instant. The engine may vote on it — `time-gap` votes on
+    /// nothing else — so it travels with the pixels rather than being
+    /// looked up later.
+    taken: Option<f64>,
 }
 
 /// One photo's worth of work for the embedder, queued behind the decoders.
 struct EmbedJob {
     index: usize,
     hash: [u8; 32],
-    rgb: Vec<u8>,
-    width: u32,
-    height: u32,
+    frame: RgbImage,
 }
 
-/// Read one photo off the medium and look up what earlier sessions decided
-/// about it. Runs on the single reader thread.
+/// One photo's preview on its way back to the medium it came from.
+struct CacheJob {
+    key: maple_import::PreviewKey,
+    preview: maple_import::CachedPreview,
+}
+
+/// Work out everything about one photo that needs the medium, and look up
+/// what earlier sessions decided about it. Runs on the single reader
+/// thread.
+///
+/// **The file is opened only if it has to be.** The medium carries a cache
+/// of the previews already made from it, keyed by what a directory entry
+/// alone reveals — path, size and mtime — so a photo the last scan already
+/// described costs one `stat` here instead of reading 25 MB off a card.
+/// The content hash rides in the cache for the same reason: computing it
+/// *is* the read being skipped.
 fn read_one(
     index: usize,
     group: &maple_import::ImageGroup,
     budget: Duration,
     prior: &PriorDecisions,
+    root: &Path,
+    cache: &Mutex<maple_import::PreviewCache>,
 ) -> DecodeJob {
     let path = group.display.path.clone();
     let companions: Vec<PathBuf> = group.companions.iter().map(|c| c.path.clone()).collect();
+    let key = maple_import::PreviewKey::for_file(root, &path);
+
+    // Cloned out from under the lock rather than borrowed: the cache is
+    // also being written to behind us, and a 15 KB memcpy is nothing
+    // against the read it saves.
+    let cached = key
+        .as_ref()
+        .and_then(|k| cache.lock().ok().and_then(|c| c.get(k).cloned()));
+
+    if let Some(maple_import::CachedPreview { content_hash, taken, webp }) = cached {
+        return DecodeJob {
+            index,
+            path,
+            companions,
+            hash: content_hash,
+            imported: prior.imported.contains(&content_hash),
+            skipped_before: prior.skipped.contains(&content_hash),
+            source: Source::Cached { webp, taken },
+            readable: Readable::Yes,
+            key,
+        };
+    }
 
     let Read { hash, bytes, readable } = read_with_budget(&path, budget);
 
@@ -789,8 +1055,9 @@ fn read_one(
         hash: hash.unwrap_or([0u8; 32]),
         imported,
         skipped_before,
-        bytes,
+        source: Source::Fresh(bytes),
         readable,
+        key,
     }
 }
 
@@ -891,35 +1158,111 @@ fn within_budget<T: Send + 'static>(
     rx.recv_timeout(budget).ok()
 }
 
-/// Turn one read photo into the metadata row the UI lists, and — only when
-/// burst detection is on — into pixels for the embedder.
+/// Turn one photo into its canonical preview, the metadata row the UI
+/// lists, and the frame every check runs on.
 ///
-/// It deliberately does **not** produce the tile's picture. Previews are
-/// decoded on demand by `import_previews`, driven by where the user is
-/// actually looking, because a card of a few thousand photos will not fit
-/// in memory as decoded frames and almost none of them are on screen.
+/// **One representation, and everything reads it.** The preview is encoded
+/// here (or arrived from the medium's cache), decoded back once, and that
+/// frame — not the pristine decode, which is thrown away — is what the
+/// sharpness score, the session signature and the embedder all see. The
+/// point is reproducibility: the only pixels the pipeline keeps are the
+/// only pixels it computed on, so re-deriving any of it later from the
+/// stored preview gives the scan's own answer back. See
+/// [`maple_import::preview`].
+///
+/// Encoding here rather than on the reader is the same argument the whole
+/// pipeline is built on: the reader is the one serial stage and the
+/// slowest link, and this is pure CPU over bytes already in hand.
 fn decode_one(
     job: DecodeJob,
     embed_tx: Option<&mpsc::SyncSender<EmbedJob>>,
+    sig_tx: Option<&mpsc::SyncSender<SignatureJob>>,
+    cache_tx: Option<&mpsc::SyncSender<CacheJob>>,
     tx: &mpsc::Sender<ScanMsg>,
 ) {
     let DecodeJob {
-        index, path, companions, hash, imported, skipped_before, bytes, readable,
+        index, path, companions, hash, imported, skipped_before, source, readable, key,
     } = job;
 
-    // Only the embedder needs pixels here, and it needs them for every
-    // photo — burst detection compares the whole card against itself. They
-    // are dropped as soon as it has them.
-    let mut sharpness = None;
-    if let Some(embed_tx) = embed_tx {
-        if let Some((rgb, width, height)) = bytes
-            .as_deref()
-            .and_then(|b| crate::thumbnail::render_bytes_to_rgb(b, 256).ok())
-        {
-            sharpness = Some(maple_import::laplacian_variance(&rgb, width, height));
-            // Blocks once the embedder is `EMBED_QUEUE_DEPTH` photos
-            // behind, which is the throttle keeping the queue bounded.
-            let _ = embed_tx.send(EmbedJob { index, hash, rgb, width, height });
+    // For a raw the bytes are the extracted preview, which carries the
+    // same EXIF block — so the capture time costs no extra card I/O
+    // either way.
+    let (preview, taken, fresh) = match source {
+        Source::Cached { webp, taken } => (Some(webp), taken, false),
+        Source::Fresh(bytes) => {
+            let taken = bytes
+                .as_deref()
+                .and_then(|b| maple_import::exif_read::read_bytes(b).capture_secs());
+            let webp = bytes.as_deref().and_then(|b| match maple_import::preview::encode(b) {
+                Ok(webp) => Some(webp),
+                Err(err) => {
+                    // The row stays listed and copyable with no picture,
+                    // and the on-demand service will try the group's
+                    // companions when the strip reaches it.
+                    tracing::warn!(
+                        target: "maple::import::unreadable",
+                        "no preview for {}: {err}",
+                        path.display()
+                    );
+                    None
+                }
+            });
+            (webp, taken, true)
+        }
+    };
+
+    let frame = preview
+        .as_deref()
+        .and_then(|webp| match maple_import::preview::decode(webp) {
+            Ok(frame) => Some(frame),
+            Err(err) => {
+                tracing::warn!("Import scan: unreadable preview for {}: {err}", path.display());
+                None
+            }
+        });
+
+    let sharpness = frame
+        .as_ref()
+        .map(|f| maple_import::laplacian_variance(f.as_raw(), f.width(), f.height()));
+
+    // Each `send` blocks once its stage is a queue-depth behind, which is
+    // the throttle keeping every queue bounded — and the reason the
+    // embedder slows the whole scan down while the signature stage, at
+    // ~0.2 ms a photo, never catches up enough to matter. The frame is
+    // cloned only when *both* want it, i.e. only when someone turned the
+    // embedder on; the default path moves it.
+    if let Some(frame) = frame {
+        match (sig_tx, embed_tx) {
+            (Some(sig_tx), Some(embed_tx)) => {
+                let _ = sig_tx.send(SignatureJob { index, frame: frame.clone(), taken });
+                let _ = embed_tx.send(EmbedJob { index, hash, frame });
+            }
+            (Some(sig_tx), None) => {
+                let _ = sig_tx.send(SignatureJob { index, frame, taken });
+            }
+            (None, Some(embed_tx)) => {
+                let _ = embed_tx.send(EmbedJob { index, hash, frame });
+            }
+            (None, None) => {}
+        }
+    }
+
+    // Give the medium its copy — but only for a photo actually read this
+    // run (a cached one is already there) and actually hashed: the
+    // all-zero placeholder is not an identity, and storing it would let
+    // the next scan serve one unreadable photo's preview for another.
+    if let (true, Some(key), Some(webp), Some(cache_tx)) =
+        (fresh, key, preview.as_ref(), cache_tx)
+    {
+        if hash != [0u8; 32] {
+            let _ = cache_tx.send(CacheJob {
+                key,
+                preview: maple_import::CachedPreview {
+                    content_hash: hash,
+                    taken,
+                    webp: webp.clone(),
+                },
+            });
         }
     }
 
@@ -932,7 +1275,79 @@ fn decode_one(
         skipped_before,
         readable,
         sharpness,
+        taken,
+        preview,
     }));
+}
+
+/// Serial half of the scan: turn canonical previews into session
+/// signatures.
+///
+/// Owns the one `&mut dyn SessionEngine`, which is what makes it serial.
+/// That is not merely a borrow-checker artefact: [`TimeGapEngine`] anchors
+/// its epoch on the first frame it sees (capture times near 1.8e9 quantise
+/// to ~128-second steps in an `f32`, so it stores time relative to an
+/// origin), and one engine per decode thread would hand each its own
+/// origin and make their signatures incomparable.
+///
+/// Frames arrive in *decode-completion* order, not scan order, which is
+/// fine — a signature describes one photo and nothing else. Order is
+/// restored on the UI thread, where each lands in its own entry.
+///
+/// A photo the engine refuses simply produces no signature.
+/// `segment_with_holes` then makes it its own session rather than
+/// asserting a continuity nobody measured.
+fn signature_stage(
+    engine: &mut dyn maple_import::SessionEngine,
+    jobs: mpsc::Receiver<SignatureJob>,
+    tx: &mpsc::Sender<ScanMsg>,
+) {
+    for job in jobs {
+        match engine.signature(&maple_import::Frame::new(&job.frame, job.taken)) {
+            Ok(signature) => {
+                let _ = tx.send(ScanMsg::Signature { index: job.index, signature });
+            }
+            Err(err) => {
+                tracing::warn!("Import scan: signature failed for photo {}: {err}", job.index);
+            }
+        }
+    }
+}
+
+/// Serial half of the scan: write canonical previews back to the medium.
+///
+/// One thread for the same reason there is one reader — a card is one bus,
+/// and several decoders appending to it independently would contend with
+/// the reads the scan is still doing. Writes go out in batches of
+/// [`PREVIEW_CACHE_FLUSH_EVERY`]; the file is append-only, so a batch costs
+/// only the photos new since the last one.
+///
+/// The lock is held across each flush, which briefly stalls the reader's
+/// own lookups. That is the right way round: a scan that is *writing* the
+/// cache is one whose lookups are missing anyway.
+fn preview_cache_stage(cache: &Mutex<maple_import::PreviewCache>, jobs: mpsc::Receiver<CacheJob>) {
+    let mut since_flush = 0usize;
+    for job in jobs {
+        let Ok(mut cache) = cache.lock() else { return };
+        cache.insert(job.key, job.preview);
+        since_flush += 1;
+        if since_flush >= PREVIEW_CACHE_FLUSH_EVERY {
+            flush_preview_cache(&mut cache);
+            since_flush = 0;
+        }
+    }
+    if let Ok(mut cache) = cache.lock() {
+        flush_preview_cache(&mut cache);
+    }
+}
+
+/// Best-effort by nature: a write-protected or full card must cost the user
+/// a slower next scan and nothing else.
+fn flush_preview_cache(cache: &mut maple_import::PreviewCache) {
+    let pending = cache.pending();
+    if let Err(err) = cache.flush() {
+        tracing::warn!("Import scan: failed to write {pending} previews to the medium: {err}");
+    }
 }
 
 /// Serial half of the scan: turn rendered photos into DINOv2 embeddings.
@@ -967,8 +1382,7 @@ fn embed_stage(
         let embedding = match cache.get(&job.hash) {
             Some(cached) => Some(cached.to_vec()),
             None => embedder.as_mut().and_then(|embedder| {
-                let img = RgbImage::from_raw(job.width, job.height, job.rgb)?;
-                match embedder.embed(&DynamicImage::ImageRgb8(img)) {
+                match embedder.embed(&DynamicImage::ImageRgb8(job.frame)) {
                     Ok(v) => {
                         cache.insert(job.hash, v.clone());
                         unflushed += 1;
@@ -1026,7 +1440,9 @@ fn apply_scan_listing(w: &ImportWindow, ctx: &ImportCtx, photos: Vec<PhotoRef>) 
                 readable: Readable::Yes,
                 thumb: None,
                 webp: None,
+                signature: None,
                 embedding: None,
+                taken: None,
                 sharpness: None,
             });
         }
@@ -1056,8 +1472,9 @@ fn start_preview_drain(ctx: &ImportCtx, rx: mpsc::Receiver<PreviewMsg>) {
     let timer = Timer::default();
     timer.start(TimerMode::Repeated, Duration::from_millis(30), move || {
         let Some(w) = drain_ctx.window.upgrade() else { return };
-        // A handful per tick: each one encodes a WebP, and starving the
-        // event loop is exactly what this whole change is avoiding.
+        // A handful per tick: each one decodes a WebP into a frame, and
+        // starving the event loop is exactly what this whole change is
+        // avoiding. The *encode* happens on a worker, not here.
         for _ in 0..6 {
             match rx.try_recv() {
                 Ok(msg) => apply_preview(&w, &drain_ctx, msg),
@@ -1072,24 +1489,17 @@ fn start_preview_drain(ctx: &ImportCtx, rx: mpsc::Receiver<PreviewMsg>) {
 /// One decoded preview arrived (or failed to).
 fn apply_preview(w: &ImportWindow, ctx: &ImportCtx, msg: PreviewMsg) {
     let index = match msg {
-        PreviewMsg::Ready { index, rgb, width, height, from_companion } => {
-            let buf =
-                slint::SharedPixelBuffer::<slint::Rgb8Pixel>::clone_from_slice(&rgb, width, height);
-            // Keep a WebP alongside the pixels. It is ~15 KB against the
-            // frame's ~196 KB, and it is what eviction falls back to, so
-            // scrolling back never returns to the card.
-            let webp = crate::thumbnail::encode_webp_rgb(&rgb, width, height, 80);
+        PreviewMsg::Ready { index, webp, from_companion } => {
             if let Some(e) = ctx.entries.borrow_mut().get_mut(index) {
-                e.thumb = Some(slint::Image::from_rgb8(buf));
                 e.webp = Some(webp);
                 if from_companion {
                     e.readable = Readable::FromCompanion;
                 }
             }
-            let dropped = ctx.retained.borrow_mut().insert(index);
-            for index in dropped {
-                evict_preview(ctx, index);
-            }
+            // Inflating goes through the same path an evicted preview comes
+            // back through: one place turns the kept representation into
+            // pixels, and it already handles retention and the redraw.
+            restore_preview(ctx, index);
             index
         }
         PreviewMsg::Failed { index } => {
@@ -1145,7 +1555,7 @@ fn redraw(ctx: &ImportCtx, index: usize) {
         &ctx.model,
         &ctx.entries.borrow(),
         &ctx.selected.borrow(),
-        &ctx.groups.borrow(),
+        &ctx.sessions.borrow(),
         &ctx.visible.borrow(),
         index,
     );
@@ -1159,6 +1569,19 @@ fn redraw(ctx: &ImportCtx, index: usize) {
 fn set_preview_window(ctx: &ImportCtx, first: usize, last: usize, focus: usize) {
     ctx.preview_window.set((first, last, focus));
     request_previews(ctx);
+}
+
+/// Is the strip showing this entry right now?
+///
+/// The preview window is in model *rows*, not entry indices — "Hide old
+/// images" renumbers one without moving the other — so this has to go
+/// through `visible` rather than compare the index directly.
+fn in_preview_window(ctx: &ImportCtx, index: usize) -> bool {
+    let (first, last, _) = ctx.preview_window.get();
+    ctx.visible
+        .borrow()
+        .row(index)
+        .is_some_and(|row| row >= first && row <= last)
 }
 
 /// Ask the preview service for everything on screen that is not already
@@ -1220,7 +1643,9 @@ fn request_previews(ctx: &ImportCtx) {
 fn apply_scan_thumb(w: &ImportWindow, ctx: &ImportCtx, msg: ScanThumb) {
     let ScanThumb {
         index, path, companions, content_hash, imported, skipped_before, readable, sharpness,
+        taken, preview,
     } = msg;
+    let has_preview = preview.is_some();
     {
         let mut ents = ctx.entries.borrow_mut();
         if let Some(e) = ents.get_mut(index) {
@@ -1234,7 +1659,22 @@ fn apply_scan_thumb(w: &ImportWindow, ctx: &ImportCtx, msg: ScanThumb) {
             e.decided_before = imported || skipped_before;
             e.readable = readable;
             e.sharpness = sharpness;
+            e.taken = taken;
+            // The scan makes a preview for every photo it reads, so the
+            // strip almost never has to go back to the card. A photo the
+            // scan could not decode keeps whatever the on-demand service
+            // recovered for it.
+            if let Some(webp) = preview {
+                e.webp = Some(webp);
+            }
         }
+    }
+    if has_preview && in_preview_window(ctx, index) {
+        // Nothing else would: the preview window is only re-requested when
+        // the viewport *moves*, and a user watching a scan fill in is not
+        // scrolling. Without this the tiles on screen stay blank until the
+        // next scroll even though their pixels are already in memory.
+        restore_preview(ctx, index);
     }
     if imported || skipped_before {
         // Count it now rather than waiting for `refilter`. The *filter* can
@@ -1250,7 +1690,7 @@ fn apply_scan_thumb(w: &ImportWindow, ctx: &ImportCtx, msg: ScanThumb) {
         &ctx.model,
         &ctx.entries.borrow(),
         &ctx.selected.borrow(),
-        &ctx.groups.borrow(),
+        &ctx.sessions.borrow(),
         &ctx.visible.borrow(),
         index,
     );
@@ -1269,40 +1709,31 @@ fn apply_scan_thumb(w: &ImportWindow, ctx: &ImportCtx, msg: ScanThumb) {
     }
 }
 
-/// The scan finished — cluster into burst groups from the embeddings
-/// collected during the scan, then auto-select the sharpest member of each
-/// group.
+/// The scan finished — segment the card into sessions.
+///
+/// Nothing is marked. The importer used to auto-select the sharpest photo
+/// of every session, which is a guess dressed as a decision: sharpness
+/// ranks a crisp badly-framed frame above the one where the subject is
+/// looking at the camera, and once it is marked nobody looks again. The
+/// keeper is chosen in the tournament instead (see
+/// [`crate::import_tournament`]), where the two photos are actually put
+/// side by side.
+///
+/// Segmentation, not clustering: the sequence is walked once and each photo
+/// is asked whether the scene changed *here*. That is why it can run at
+/// the end over signatures gathered in any order, and why a session always
+/// comes out as a contiguous range — which is what makes the `f` grid able
+/// to show one as a band with two ends the user can drag.
 fn finish_scan(w: &ImportWindow, ctx: &ImportCtx) {
     let n = ctx.entries.borrow().len();
 
-    let resolved_groups = {
-        let ents = ctx.entries.borrow();
-        let mut idx_map: Vec<usize> = Vec::new();
-        let mut embeddings: Vec<Vec<f32>> = Vec::new();
-        for (i, e) in ents.iter().enumerate() {
-            if let Some(emb) = &e.embedding {
-                idx_map.push(i);
-                embeddings.push(emb.clone());
-            }
-        }
-        if embeddings.is_empty() {
-            Vec::new()
-        } else {
-            let threshold = maple_state::Settings::load().stacks.threshold;
-            flatten_clusters(maple_db::cluster_embeddings(&embeddings, threshold), &idx_map)
-        }
-    };
+    let sessions = detect_sessions(&ctx.entries.borrow(), &maple_state::Settings::load().sessions);
+    *ctx.sessions.borrow_mut() = sessions;
+    let resolved_groups = groups_from_sessions(&ctx.sessions.borrow());
 
-    if !resolved_groups.is_empty() {
-        let ents = ctx.entries.borrow();
-        let mut sel = ctx.selected.borrow_mut();
-        for group in &resolved_groups {
-            sel.insert(sharpest_in_group(group, &ents));
-        }
-        drop(sel);
-        w.set_selected_count(ctx.selected.borrow().len() as i32);
-    }
     *ctx.groups.borrow_mut() = resolved_groups;
+    // A fresh segmentation is a fresh set of comparisons.
+    rebuild_tournament(w, ctx);
 
     w.set_scanning(false);
     let quality = report_scan_quality(&ctx.entries.borrow());
@@ -1314,33 +1745,123 @@ fn finish_scan(w: &ImportWindow, ctx: &ImportCtx) {
     refilter(w, ctx);
 }
 
-/// Translate clusters over the embedded-only subset back into flat `entries`
-/// indices via `idx_map`, each group sorted ascending.
-fn flatten_clusters(clusters: Vec<Vec<usize>>, idx_map: &[usize]) -> Vec<Vec<usize>> {
-    clusters
-        .into_iter()
-        .map(|members| {
-            let mut flat: Vec<usize> = members.iter().map(|&m| idx_map[m]).collect();
-            flat.sort_unstable();
-            flat
-        })
+/// Segment the scanned photos into sessions.
+///
+/// Returns sessions **tiling the whole sequence**, solo photos included —
+/// the `f` grid needs every photo to belong somewhere so a boundary can be
+/// dragged onto it. [`groups_from_sessions`] is what narrows that to the
+/// real groups.
+///
+/// Empty when session detection is off, when the engine spec names nothing
+/// real, or when not one photo produced a signature (a card of files that
+/// would not decode). Never an error the user has to clear: grouping is
+/// enrichment on top of a scan that already worked.
+fn detect_sessions(
+    entries: &[Entry],
+    settings: &maple_state::SessionSettings,
+) -> Vec<maple_import::Session> {
+    if !settings.enabled || entries.is_empty() {
+        return Vec::new();
+    }
+    let signatures: Vec<Option<Signature>> = entries.iter().map(|e| e.signature.clone()).collect();
+    if signatures.iter().all(Option::is_none) {
+        return Vec::new();
+    }
+    let Ok(engine) = maple_import::session::engine_from_spec(&settings.engine) else {
+        // The scan worker already logged why; saying it twice adds nothing.
+        return Vec::new();
+    };
+    let times: Vec<Option<f64>> = entries.iter().map(|e| e.taken).collect();
+    let params = segment_params(engine.as_ref(), settings);
+    maple_import::session::segment_with_holes(engine.as_ref(), &signatures, &times, &params)
+        .sessions
+}
+
+/// Turn the settings into [`SegmentParams`], leaving anything the user did
+/// not set at what the engine itself considers right.
+///
+/// `cut` is the one that must not be copied blindly: engine distances are
+/// not comparable to each other, so `0` means "ask the engine" rather than
+/// "no threshold".
+fn segment_params(
+    engine: &dyn maple_import::SessionEngine,
+    settings: &maple_state::SessionSettings,
+) -> maple_import::SegmentParams {
+    let mut params = maple_import::SegmentParams::for_spec(engine, &settings.engine);
+    if settings.cut > 0.0 {
+        params.cut = settings.cut;
+    }
+    params.hard_gap_secs = settings.hard_gap_secs;
+    params.max_outliers = settings.max_outliers;
+    params.anchor_factor = settings.anchor_factor;
+    params
+}
+
+/// The sessions worth calling groups: two photos or more.
+///
+/// A one-photo session is a real answer — "nothing else belongs with this"
+/// — but it is not a group, and auto-picking a keeper out of a group of one
+/// would mark the whole card.
+fn groups_from_sessions(sessions: &[maple_import::Session]) -> Vec<Vec<usize>> {
+    sessions
+        .iter()
+        .filter(|s| s.len() >= 2)
+        .map(|s| (s.start..s.end).collect())
         .collect()
 }
 
-/// Index of the sharpest entry in `group` — the shot auto-selected out of a
-/// burst. Entries with no sharpness score count as 0, and the first member
-/// wins a tie.
-fn sharpest_in_group(group: &[usize], entries: &[Entry]) -> usize {
-    let mut best = group[0];
-    let mut best_sharpness = entries[best].sharpness.unwrap_or(0.0);
-    for &idx in &group[1..] {
-        let s = entries[idx].sharpness.unwrap_or(0.0);
-        if s > best_sharpness {
-            best = idx;
-            best_sharpness = s;
+/// Toggle the session boundary immediately before photo `at`.
+///
+/// The whole edit vocabulary, because a boundary is the only thing a
+/// session *is*: sessions tile the sequence, so inserting a boundary splits
+/// one in two and removing it merges two into one. "Set the start here" and
+/// "set the stop here" are the same operation one photo apart, which is why
+/// the `f` grid needs no separate merge key and no drag state.
+///
+/// `at == 0` and `at >= len` are no-ops: the sequence already begins and
+/// ends there, and a boundary outside it would describe nothing.
+fn toggle_boundary(sessions: &mut Vec<maple_import::Session>, at: usize) {
+    let Some(last) = sessions.last().map(|s| s.end) else { return };
+    if at == 0 || at >= last {
+        return;
+    }
+    match sessions.iter().position(|s| s.start == at) {
+        // Already a boundary: merge this session into the one before it.
+        Some(i) if i > 0 => {
+            sessions[i - 1].end = sessions[i].end;
+            sessions.remove(i);
+        }
+        Some(_) => {}
+        // No boundary yet: split whichever session spans this photo.
+        None => {
+            if let Some(i) = sessions.iter().position(|s| s.contains(at)) {
+                let end = sessions[i].end;
+                sessions[i].end = at;
+                sessions.insert(i + 1, maple_import::Session { start: at, end });
+            }
         }
     }
-    best
+}
+
+/// Put a session boundary immediately before photo `at`, if there is not
+/// one already.
+///
+/// The click vocabulary, as against [`toggle_boundary`]'s key vocabulary.
+/// A click that says "the session starts here" about a photo that already
+/// starts one has got what it asked for; toggling would remove the
+/// boundary, which is the opposite of what was asked. Returns whether
+/// anything actually moved, so a click that changes nothing costs no
+/// rebuild.
+fn ensure_boundary(sessions: &mut Vec<maple_import::Session>, at: usize) -> bool {
+    let Some(last) = sessions.last().map(|s| s.end) else { return false };
+    if at == 0 || at >= last || sessions.iter().any(|s| s.start == at) {
+        return false;
+    }
+    let Some(i) = sessions.iter().position(|s| s.contains(at)) else { return false };
+    let end = sessions[i].end;
+    sessions[i].end = at;
+    sessions.insert(i + 1, maple_import::Session { start: at, end });
+    true
 }
 
 /// How many photos in a finished scan needed help, or never rendered.
@@ -1447,7 +1968,7 @@ fn wire_browse(window: &ImportWindow, ctx: &ImportCtx) {
             // A click only ever changes this one row's selection state —
             // update it in place rather than rebuilding the whole model.
             update_row(&ctx.model, &ctx.entries.borrow(), &ctx.selected.borrow(),
-                       &ctx.groups.borrow(), &ctx.visible.borrow(), idx);
+                       &ctx.sessions.borrow(), &ctx.visible.borrow(), idx);
 
             // Clicking the already-open photo just toggles its selection —
             // don't re-decode and re-render the big preview for no reason.
@@ -1512,6 +2033,113 @@ fn wire_browse(window: &ImportWindow, ctx: &ImportCtx) {
 
     window.on_nav_prev(make_nav(-1));
     window.on_nav_next(make_nav(1));
+
+    // ── The `f` grid: see the sessions, and correct them ──────────
+    window.on_toggle_grid({
+        let ctx = ctx.clone();
+        move || {
+            let Some(w) = ctx.window.upgrade() else { return };
+            let open = !ctx.grid_open.get();
+            ctx.grid_open.set(open);
+            w.set_grid_open(open);
+            // An edit half-made does not survive leaving the view it was
+            // made in: the second click has nowhere to land.
+            ctx.pending_cut.set(None);
+            w.set_pending_session_start(-1);
+            if open {
+                // Opening it *during* a scan lands on the scan's own
+                // frontier rather than wherever the cursor was left. The
+                // reason to open the grid mid-scan is to watch the card
+                // come in, and that happens at the far end of what has
+                // been read, not at photo 0.
+                let n = ctx.entries.borrow().len();
+                if w.get_scanning() && n > 0 {
+                    let frontier = ctx.scanned_count.get().saturating_sub(1).min(n - 1);
+                    ctx.current.set(frontier);
+                }
+            }
+            // The filter is suspended while the grid is up, so the visible
+            // set really does change — this is a `refilter`, not a repaint.
+            // It re-parks the current photo, which is what scrolls the grid
+            // to it.
+            refilter(&w, &ctx);
+        }
+    });
+
+    // "Set the start here" and "set the stop here" are one operation a
+    // photo apart: a boundary before `at`, or before the one after it.
+    let cut_at = {
+        let ctx = ctx.clone();
+        move |at: usize, ensure: bool| {
+            let Some(w) = ctx.window.upgrade() else { return };
+            {
+                let mut sessions = ctx.sessions.borrow_mut();
+                if ensure {
+                    ensure_boundary(&mut sessions, at);
+                } else {
+                    toggle_boundary(&mut sessions, at);
+                }
+            }
+            *ctx.groups.borrow_mut() = groups_from_sessions(&ctx.sessions.borrow());
+            // A boundary has a session on each side, so moving one changes
+            // two ranges and every comparison drawn from them. The pass is
+            // rebuilt rather than patched — and because it is rebuilt from
+            // what is still *undecided*, correcting the grouping re-asks
+            // about nothing the user has already settled.
+            rebuild_tournament(&w, &ctx);
+            w.set_selected_count(ctx.selected.borrow().len() as i32);
+            // Every tile from here on carries a different session id, and
+            // the marks moved — cheaper to think about than to patch row
+            // by row, and it only happens on a keypress.
+            refilter(&w, &ctx);
+        }
+    };
+    window.on_cut_before({
+        let cut_at = cut_at.clone();
+        move |at| cut_at(at.max(0) as usize, false)
+    });
+    window.on_cut_after({
+        let cut_at = cut_at.clone();
+        move |at| cut_at(at.max(0) as usize + 1, false)
+    });
+
+    // A click in the grid draws a session by its two ends: the first opens
+    // one on that photo, the next closes it there. Two clicks are the same
+    // pair of boundaries `[` and `]` set, which is the point — there is
+    // still only one edit vocabulary, and the mouse speaks it too.
+    //
+    // The click also moves the cursor, so opening a session does not cost
+    // the ability to navigate by clicking; it just does both.
+    window.on_grid_clicked({
+        let ctx = ctx.clone();
+        let cut_at = cut_at.clone();
+        move |at| {
+            let Some(w) = ctx.window.upgrade() else { return };
+            let at = at.max(0) as usize;
+            let n = ctx.entries.borrow().len();
+            if at >= n {
+                return;
+            }
+            set_current(&w, &ctx, at);
+            match ctx.pending_cut.get() {
+                // Closing one: the stop goes *after* this photo, which is
+                // a boundary before the next — the same photo-apart
+                // identity `[` and `]` are built on.
+                Some(start) if at >= start => {
+                    ctx.pending_cut.set(None);
+                    w.set_pending_session_start(-1);
+                    cut_at(at + 1, true);
+                }
+                // Clicking back before the open start is a change of mind
+                // about where it begins, not a backwards session.
+                _ => {
+                    ctx.pending_cut.set(Some(at));
+                    w.set_pending_session_start(at as i32);
+                    cut_at(at, true);
+                }
+            }
+        }
+    });
 
     // ── Hide / show photos an earlier session already decided on ──
     window.on_toggle_hide_old({
@@ -1620,6 +2248,599 @@ fn show_preview(w: &ImportWindow, entries: &Rc<RefCell<Vec<Entry>>>, idx: usize)
             });
         });
     }
+}
+
+// ── The tournament ────────────────────────────────────────────────
+//
+// Nothing on a card is preselected any more. The keeper of a session is
+// chosen by looking at it beside its rival, which is the one thing a
+// sharpness number cannot do — see [`crate::import_tournament`] for why
+// the pass is shaped the way it is. Everything here is the wiring: the
+// verdict keys, the shared zoom, and the renderer that keeps two decodes
+// alive so a crop comes off the original rather than a 256 px preview.
+
+use crate::import_tournament::{self, PaneMsg, PaneRequest, Side, Tournament, Verdict, MAX_ZOOM};
+
+/// The shared view state of the two panes.
+struct PairView {
+    /// Size of one pane in pixels. Rust renders the crop at exactly this
+    /// size rather than letting Slint scale it up — a zoomed pixel that
+    /// had been resampled twice would be a worse picture than the one the
+    /// user is trying to judge.
+    view_w: u32,
+    view_h: u32,
+    /// 1.0 is "the whole photo fits the pane".
+    zoom: f32,
+    /// Wanted centre, in normalised source coordinates. Normalised is what
+    /// lets a portrait and a landscape frame stay paired.
+    cx: f32,
+    cy: f32,
+    /// Bumped on every change; a render carrying an older token is dropped
+    /// rather than painted over a newer one.
+    token: u64,
+    /// Dimensions of the left photo's decode. The pan clamp reads one
+    /// image, not both — reconciling two would let the shorter frame's
+    /// edge drag the other off whatever was being compared.
+    left_src: (u32, u32),
+    /// Which photo each pane is currently showing.
+    ///
+    /// Only so a pane whose photo did *not* change is left alone. `1` —
+    /// the most common keystroke — keeps the left contestant, and dropping
+    /// it back to its blurry placeholder only to redraw the same crop a
+    /// moment later would make the one thing being compared flicker on
+    /// every press.
+    shown: (Option<usize>, Option<usize>),
+}
+
+impl Default for PairView {
+    fn default() -> Self {
+        PairView {
+            view_w: 0,
+            view_h: 0,
+            zoom: 1.0,
+            cx: 0.5,
+            cy: 0.5,
+            token: 0,
+            left_src: (0, 0),
+            shown: (None, None),
+        }
+    }
+}
+
+impl PairView {
+    /// Back to showing both photos whole. Called whenever the pair changes:
+    /// a zoom is a question about *these* two frames, and carrying it to
+    /// the next pair would open on a corner of something the user has not
+    /// seen yet.
+    fn fit(&mut self) {
+        self.zoom = 1.0;
+        self.cx = 0.5;
+        self.cy = 0.5;
+    }
+}
+
+fn wire_tournament(window: &ImportWindow, ctx: &ImportCtx) {
+    window.on_toggle_tournament({
+        let ctx = ctx.clone();
+        move || {
+            let Some(w) = ctx.window.upgrade() else { return };
+            let on = !w.get_tourney_on();
+            w.set_tourney_on(on);
+            if on {
+                start_pair_renderer(&ctx);
+                rebuild_tournament(&w, &ctx);
+            } else {
+                stop_pair_renderer(&ctx);
+                // Verdicts landed on rows the strip was not showing, and
+                // some of those photos are now marked or passed over.
+                refilter(&w, &ctx);
+            }
+        }
+    });
+
+    window.on_tourney_verdict({
+        let ctx = ctx.clone();
+        move |key| {
+            let Some(w) = ctx.window.upgrade() else { return };
+            let Some(v) = Verdict::from_key(key) else { return };
+            apply_verdict(&w, &ctx, v);
+        }
+    });
+
+    window.on_tourney_undo({
+        let ctx = ctx.clone();
+        move || {
+            let Some(w) = ctx.window.upgrade() else { return };
+            undo_verdict(&w, &ctx);
+        }
+    });
+
+    // The pane's size changed — a window resize, or the panes appearing
+    // for the first time. Everything on screen is rendered *to* that size,
+    // so nothing can be drawn before it is known.
+    window.on_tourney_view({
+        let ctx = ctx.clone();
+        move |pw, ph| {
+            let (pw, ph) = (pw.max(0) as u32, ph.max(0) as u32);
+            {
+                let mut v = ctx.pair_view.borrow_mut();
+                if (v.view_w, v.view_h) == (pw, ph) || pw == 0 || ph == 0 {
+                    return;
+                }
+                v.view_w = pw;
+                v.view_h = ph;
+            }
+            request_pair(&ctx);
+        }
+    });
+
+    window.on_tourney_pan({
+        let ctx = ctx.clone();
+        move |dx, dy| {
+            {
+                let mut v = ctx.pair_view.borrow_mut();
+                let (sw, sh) = v.left_src;
+                // At fit there is nothing to pan, and no photo means no
+                // scale to convert pane pixels into source pixels with.
+                if v.zoom <= 1.0 || sw == 0 || sh == 0 || v.view_w == 0 {
+                    return;
+                }
+                let fit = (v.view_w as f32 / sw as f32).min(v.view_h as f32 / sh as f32);
+                let scale = fit * v.zoom;
+                // Dragging right moves the picture right, so the window
+                // into it moves left.
+                let (cx, cy) = (v.cx - dx / (scale * sw as f32), v.cy - dy / (scale * sh as f32));
+                let (cx, cy) = import_tournament::clamp_center(
+                    sw, sh, v.view_w, v.view_h, v.zoom, cx, cy,
+                );
+                if (cx, cy) == (v.cx, v.cy) {
+                    return;
+                }
+                v.cx = cx;
+                v.cy = cy;
+            }
+            request_pair(&ctx);
+        }
+    });
+
+    window.on_tourney_zoom({
+        let ctx = ctx.clone();
+        move |delta, fx, fy| {
+            {
+                let mut v = ctx.pair_view.borrow_mut();
+                // A trackpad reports many small deltas and a wheel a few
+                // large ones; clamping the notch count is what stops one
+                // flick of a wheel jumping from fit to maximum.
+                let notches = (delta / 50.0).clamp(-1.5, 1.5);
+                let next = (v.zoom * 1.35f32.powf(notches)).clamp(1.0, MAX_ZOOM);
+                if (next - v.zoom).abs() < 0.001 {
+                    return;
+                }
+                let (sw, sh) = v.left_src;
+                let (cx, cy) = if sw == 0 || sh == 0 || v.view_w == 0 {
+                    (0.5, 0.5)
+                } else {
+                    import_tournament::zoom_at(
+                        sw, sh, v.view_w, v.view_h, v.zoom, v.cx, v.cy, next, fx, fy,
+                    )
+                };
+                v.zoom = next;
+                v.cx = cx;
+                v.cy = cy;
+            }
+            publish_zoom(&ctx);
+            request_pair(&ctx);
+        }
+    });
+
+    window.on_tourney_reset_zoom({
+        let ctx = ctx.clone();
+        move || {
+            if ctx.pair_view.borrow().zoom <= 1.0 {
+                return;
+            }
+            ctx.pair_view.borrow_mut().fit();
+            publish_zoom(&ctx);
+            request_pair(&ctx);
+        }
+    });
+}
+
+fn publish_zoom(ctx: &ImportCtx) {
+    if let Some(w) = ctx.window.upgrade() {
+        w.set_tourney_zoom_level(ctx.pair_view.borrow().zoom);
+    }
+}
+
+/// Start the pane renderer and the timer that drains it.
+///
+/// Both live only while the tournament is on: the renderer holds two full
+/// decodes, which is tens of megabytes to keep alive for a mode nobody is
+/// in.
+fn start_pair_renderer(ctx: &ImportCtx) {
+    let (tx, rx) = mpsc::channel::<PaneMsg>();
+    *ctx.pair_renderer.borrow_mut() = Some(import_tournament::PairRenderer::spawn(tx));
+    ctx.pair_view.borrow_mut().fit();
+
+    let ctx2 = ctx.clone();
+    let timer = Timer::default();
+    timer.start(TimerMode::Repeated, Duration::from_millis(16), move || {
+        let Some(w) = ctx2.window.upgrade() else { return };
+        while let Ok(msg) = rx.try_recv() {
+            apply_pane(&w, &ctx2, msg);
+        }
+    });
+    *ctx.pair_timer.borrow_mut() = Some(timer);
+}
+
+fn stop_pair_renderer(ctx: &ImportCtx) {
+    ctx.pair_renderer.borrow_mut().take();
+    ctx.pair_timer.borrow_mut().take();
+}
+
+fn apply_pane(w: &ImportWindow, ctx: &ImportCtx, msg: PaneMsg) {
+    match msg {
+        PaneMsg::Ready { side, token, rgb, w: pw, h: ph, src_w, src_h } => {
+            // A render of a viewport the user has already scrolled past
+            // must not land on top of a newer one.
+            if token != ctx.pair_view.borrow().token {
+                return;
+            }
+            let buf = slint::SharedPixelBuffer::<slint::Rgb8Pixel>::clone_from_slice(&rgb, pw, ph);
+            let img = slint::Image::from_rgb8(buf);
+            match side {
+                Side::Left => {
+                    ctx.pair_view.borrow_mut().left_src = (src_w, src_h);
+                    w.set_tourney_left(img);
+                    w.set_tourney_left_shown(true);
+                }
+                Side::Right => {
+                    w.set_tourney_right(img);
+                    w.set_tourney_right_shown(true);
+                }
+            }
+        }
+        // The card's copy of this photo would not decode. The pane keeps
+        // whatever the canonical preview gave it — which is the whole
+        // reason that placeholder is put up first.
+        PaneMsg::Failed { side, token } => {
+            tracing::warn!(target: "maple::import::tournament", "pane {side:?} token {token} failed");
+        }
+    }
+}
+
+/// Build the pass over the groups as they now stand.
+///
+/// Called when the tournament is switched on, when a scan finishes, and
+/// when a session boundary moves. Photos already settled are skipped, so a
+/// rebuild never re-asks a question the user has answered.
+fn rebuild_tournament(w: &ImportWindow, ctx: &ImportCtx) {
+    // A rebuild can put a different photo in a pane without the index
+    // changing hands, so nothing may be assumed still on screen.
+    ctx.pair_view.borrow_mut().shown = (None, None);
+    let has_groups = ctx.groups.borrow().iter().any(|g| g.len() >= 2);
+    // Stays offered once the pass is over — hiding the switch would take
+    // away the only way back out of the mode.
+    w.set_tourney_available(has_groups);
+
+    // Every verdict already given rides across the rebuild, so correcting
+    // a boundary re-groups what is *left* and re-asks nothing.
+    let carried = ctx.tournament.borrow().as_ref().map(Tournament::carry).unwrap_or_default();
+    let t = {
+        let entries = ctx.entries.borrow();
+        let groups = ctx.groups.borrow();
+        Tournament::build(&groups, carried, |i| {
+            // A photo already in the library cannot be the answer to
+            // "which of these do I import", and one that never decoded
+            // cannot be judged at all — both stay out of the pass and
+            // remain for the ordinary triage.
+            entries.get(i).is_none_or(|e| e.is_imported || !e.readable.ok())
+        })
+    };
+    *ctx.tournament.borrow_mut() = Some(t);
+    ctx.pair_view.borrow_mut().fit();
+    publish_zoom(ctx);
+    publish_tournament(w, ctx);
+}
+
+/// Push the current comparison into the window, and ask for its pixels.
+fn publish_tournament(w: &ImportWindow, ctx: &ImportCtx) {
+    let (pair, done, total, round, rounds, note) = {
+        let guard = ctx.tournament.borrow();
+        let Some(t) = guard.as_ref() else { return };
+        let (done, total) = t.progress();
+        let (round, rounds) = t.round();
+        w.set_tourney_can_undo(t.can_undo());
+        // "No pair on screen" and "the pass is over" are the same state
+        // here, but only one of them says why.
+        w.set_tourney_idle(t.finished());
+        (t.pair(), done, total, round, rounds, tournament_note(t))
+    };
+    w.set_tourney_done(done as i32);
+    w.set_tourney_total(total as i32);
+    w.set_tourney_round(round as i32);
+    w.set_tourney_rounds(rounds as i32);
+
+    let Some((left, right)) = pair else {
+        w.set_tourney_note(note.into());
+        return;
+    };
+
+    // The canonical preview goes up immediately and the crop off the
+    // original replaces it. Clearing the panes instead would flash an
+    // empty frame on every verdict; leaving the *previous* photo up would
+    // be worse still — for a moment the user would be comparing the wrong
+    // pair.
+    {
+        let ents = ctx.entries.borrow();
+        let was = ctx.pair_view.borrow().shown;
+        for (side, idx, before) in [(Side::Left, left, was.0), (Side::Right, right, was.1)] {
+            let Some(e) = ents.get(idx) else { continue };
+            let name: SharedString = e
+                .path
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default()
+                .into();
+            let meta: SharedString = pane_meta(e, idx).into();
+            // A pane still showing the same photo keeps the crop it has.
+            let fresh = before != Some(idx);
+            let placeholder = fresh.then(|| pane_placeholder(e)).flatten();
+            match side {
+                Side::Left => {
+                    w.set_tourney_left_name(name);
+                    w.set_tourney_left_meta(meta);
+                    if fresh {
+                        w.set_tourney_left_shown(placeholder.is_some());
+                        w.set_tourney_left(placeholder.unwrap_or_default());
+                    }
+                }
+                Side::Right => {
+                    w.set_tourney_right_name(name);
+                    w.set_tourney_right_meta(meta);
+                    if fresh {
+                        w.set_tourney_right_shown(placeholder.is_some());
+                        w.set_tourney_right(placeholder.unwrap_or_default());
+                    }
+                }
+            }
+        }
+        ctx.pair_view.borrow_mut().shown = (Some(left), Some(right));
+    }
+    request_pair(ctx);
+}
+
+/// What to say when there is no comparison on screen.
+///
+/// "Nothing to run" and "nothing left to run" are different answers, and
+/// only one of them means the user is finished.
+fn tournament_note(t: &Tournament) -> String {
+    let (kept, passed) = t.tally();
+    if t.is_empty() && kept + passed == 0 {
+        return "No session has two photos to compare — nothing to run a tournament on.".into();
+    }
+    format!("Tournament complete — {kept} kept, {passed} passed over.")
+}
+
+/// The pixel size to render one pane at.
+///
+/// The pane reports its own size and that is the number that is actually
+/// right. But everything on screen is rendered *to* that number, so a
+/// report that never arrives leaves both panes blank forever — and a Slint
+/// `changed` handler that quietly does not fire is a trap this file has
+/// already been caught by twice (`changed items` against `set_vec`, and a
+/// freshly-created grid never firing `changed current-grid-row`). So when
+/// nothing has been reported yet the size is derived from the window
+/// instead: half its width, less the header and the two caption bars. That
+/// is wrong by a few pixels and costs a slightly soft render until the
+/// real number lands, which is a better failure than a feature that does
+/// not draw.
+fn pane_size(window: (u32, u32), reported_w: u32, reported_h: u32) -> (u32, u32) {
+    if reported_w > 0 && reported_h > 0 {
+        return (reported_w, reported_h);
+    }
+    const CHROME_H: u32 = 46 + 30;
+    ((window.0 / 2).max(1), window.1.saturating_sub(CHROME_H).max(1))
+}
+
+/// Something to look at while the crop off the original is being made.
+///
+/// The high-resolution render needs a decode — up to half a second for a
+/// raw — and putting an empty frame up for that long on every verdict
+/// would make the pass feel broken. The canonical preview is ~15 KB and
+/// already in memory for every photo the scan read, so inflating it here
+/// costs a millisecond and shows the right photo immediately, at the wrong
+/// resolution, which is the correct order to be wrong in.
+fn pane_placeholder(e: &Entry) -> Option<slint::Image> {
+    if let Some(thumb) = &e.thumb {
+        return Some(thumb.clone());
+    }
+    let frame = maple_import::preview::decode(e.webp.as_deref()?).ok()?;
+    let buf = slint::SharedPixelBuffer::<slint::Rgb8Pixel>::clone_from_slice(
+        frame.as_raw(),
+        frame.width(),
+        frame.height(),
+    );
+    Some(slint::Image::from_rgb8(buf))
+}
+
+/// The line under a contestant: where it sits on the card, and the number
+/// that used to decide this on the user's behalf.
+///
+/// The sharpness score is shown rather than hidden. It is still measured
+/// (from the canonical preview, like everything else), the user is being
+/// asked to judge exactly the thing it measures, and withholding a number
+/// the system already has would be arbitrary. It is a hint at the bottom
+/// of the frame, not a verdict — which is the whole difference from what
+/// it used to be.
+fn pane_meta(e: &Entry, idx: usize) -> String {
+    match e.sharpness {
+        Some(s) => format!("#{}  ·  sharpness {s:.0}", idx + 1),
+        None => format!("#{}", idx + 1),
+    }
+}
+
+/// Ask the renderer for both panes at the current view state.
+///
+/// Both sides every time, even when only the challenger changed: the
+/// incumbent's decode is still cached, so re-rendering it is a resize
+/// rather than a read, and one code path is worth more than the saving.
+fn request_pair(ctx: &ImportCtx) {
+    let Some((left, right)) = ctx.tournament.borrow().as_ref().and_then(Tournament::pair) else {
+        return;
+    };
+    let paths = {
+        let ents = ctx.entries.borrow();
+        match (ents.get(left), ents.get(right)) {
+            (Some(l), Some(r)) => (l.path.clone(), r.path.clone()),
+            _ => return,
+        }
+    };
+    let Some(w) = ctx.window.upgrade() else { return };
+    let size = w.window().size();
+    let scale = w.window().scale_factor().max(0.1);
+    let logical = (
+        (size.width as f32 / scale) as u32,
+        (size.height as f32 / scale) as u32,
+    );
+    let (token, view_w, view_h, zoom, cx, cy) = {
+        let mut v = ctx.pair_view.borrow_mut();
+        let (view_w, view_h) = pane_size(logical, v.view_w, v.view_h);
+        v.token += 1;
+        (v.token, view_w, view_h, v.zoom, v.cx, v.cy)
+    };
+    let guard = ctx.pair_renderer.borrow();
+    let Some(renderer) = guard.as_ref() else { return };
+    for (side, path) in [(Side::Left, paths.0), (Side::Right, paths.1)] {
+        renderer.request(PaneRequest { side, token, path, view_w, view_h, zoom, cx, cy });
+    }
+}
+
+/// Record one verdict: the photos it settled, the marks they carry, and
+/// the next comparison.
+fn apply_verdict(w: &ImportWindow, ctx: &ImportCtx, v: Verdict) {
+    let (settled, was) = {
+        let mut guard = ctx.tournament.borrow_mut();
+        let Some(t) = guard.as_mut() else { return };
+        let was = t.round();
+        (t.decide(v), was)
+    };
+    if settled.is_empty() {
+        return;
+    }
+    settle_marks(
+        &mut ctx.entries.borrow_mut(),
+        &mut ctx.selected.borrow_mut(),
+        &mut ctx.brushed.borrow_mut(),
+        &ctx.brush.borrow(),
+        &settled,
+    );
+    finish_verdict(w, ctx, was, settled.iter().map(|&(i, _)| i));
+}
+
+/// Take back the last verdict, withdrawing every mark it made.
+fn undo_verdict(w: &ImportWindow, ctx: &ImportCtx) {
+    let (undone, was) = {
+        let mut guard = ctx.tournament.borrow_mut();
+        let Some(t) = guard.as_mut() else { return };
+        let was = t.round();
+        (t.undo(), was)
+    };
+    if undone.is_empty() {
+        return;
+    }
+    withdraw_marks(
+        &mut ctx.entries.borrow_mut(),
+        &mut ctx.selected.borrow_mut(),
+        &mut ctx.brushed.borrow_mut(),
+        &undone,
+    );
+    finish_verdict(w, ctx, was, undone.into_iter());
+}
+
+/// Turn one verdict's settlements into marks.
+///
+/// A photo that wins is marked for import; a photo that loses is
+/// `passed` — the same decision the red ✗ records when the user steps past
+/// one by hand, and the same one `commit_skips` writes to the medium so a
+/// re-scan does not offer it again. Losing a comparison is not "no answer
+/// yet", and recording it as one would hand the whole card back next time.
+fn settle_marks(
+    entries: &mut [Entry],
+    selected: &mut HashSet<usize>,
+    brushed: &mut HashMap<usize, Vec<i64>>,
+    brush: &[Tag],
+    settled: &[(usize, bool)],
+) {
+    for &(idx, kept) in settled {
+        if kept {
+            selected.insert(idx);
+        } else {
+            selected.remove(&idx);
+        }
+        // Same rule as marking by hand: the brush is read at the moment
+        // the photo is marked, so changing tags half way through a pass
+        // tags the two halves differently.
+        record_brush(brushed, idx, kept, brush);
+        if let Some(e) = entries.get_mut(idx) {
+            e.passed = !kept;
+        }
+    }
+}
+
+/// Put the photos an undone verdict decided back to undecided.
+fn withdraw_marks(
+    entries: &mut [Entry],
+    selected: &mut HashSet<usize>,
+    brushed: &mut HashMap<usize, Vec<i64>>,
+    undone: &[usize],
+) {
+    for &idx in undone {
+        selected.remove(&idx);
+        record_brush(brushed, idx, false, &[]);
+        if let Some(e) = entries.get_mut(idx) {
+            // `decided_before` is deliberately untouched: that is an
+            // *earlier* session's verdict, not this pass's to withdraw.
+            e.passed = false;
+        }
+    }
+}
+
+/// The half both a verdict and its undo share: repaint the rows that
+/// moved, then show the next comparison.
+///
+/// `was` is the round the pass was on beforehand, which is what decides
+/// whether the zoom survives — see below.
+fn finish_verdict(
+    w: &ImportWindow,
+    ctx: &ImportCtx,
+    was: (usize, usize),
+    touched: impl Iterator<Item = usize>,
+) {
+    w.set_copy_done(false);
+    w.set_selected_count(ctx.selected.borrow().len() as i32);
+    for idx in touched {
+        update_row(
+            &ctx.model,
+            &ctx.entries.borrow(),
+            &ctx.selected.borrow(),
+            &ctx.sessions.borrow(),
+            &ctx.visible.borrow(),
+            idx,
+        );
+    }
+    // The zoom survives inside a session and is dropped between them.
+    // Twenty frames of one child in one room are framed alike, so having
+    // to re-zoom onto the eyes nineteen times is exactly the tedium this
+    // is meant to remove; the next *session* is a different scene, and
+    // opening it on a corner of something the user has not seen yet would
+    // be disorienting.
+    let now = ctx.tournament.borrow().as_ref().map(Tournament::round).unwrap_or(was);
+    if now.0 != was.0 {
+        ctx.pair_view.borrow_mut().fit();
+    }
+    publish_zoom(ctx);
+    publish_tournament(w, ctx);
 }
 
 // ── Import tags ───────────────────────────────────────────────────
@@ -2138,10 +3359,10 @@ fn finish_copy(
     {
         let ents = ctx.entries.borrow();
         let sel = ctx.selected.borrow();
-        let grp = ctx.groups.borrow();
+        let ses = ctx.sessions.borrow();
         let vis = ctx.visible.borrow();
         for &i in &run.sel_indices {
-            update_row(&ctx.model, &ents, &sel, &grp, &vis, i);
+            update_row(&ctx.model, &ents, &sel, &ses, &vis, i);
         }
     }
 
@@ -2267,14 +3488,19 @@ fn apply_rotation(
     );
     w.set_preview_photo(slint::Image::from_rgb8(buf));
     update_row(&ctx.model, &ctx.entries.borrow(), &ctx.selected.borrow(),
-               &ctx.groups.borrow(), &ctx.visible.borrow(), idx);
+               &ctx.sessions.borrow(), &ctx.visible.borrow(), idx);
     w.set_rotating(false);
 }
 
 // ── Model rows ────────────────────────────────────────────────────
 
 /// Build the [`ImportItem`] for a single entry.
-fn make_item(entries: &[Entry], selected: &HashSet<usize>, groups: &[Vec<usize>], i: usize) -> ImportItem {
+fn make_item(
+    entries: &[Entry],
+    selected: &HashSet<usize>,
+    sessions: &[maple_import::Session],
+    i: usize,
+) -> ImportItem {
     let e = &entries[i];
     let display_is_raw = maple_import::is_raw_format(&e.path);
     let has_jpg =
@@ -2282,6 +3508,8 @@ fn make_item(entries: &[Entry], selected: &HashSet<usize>, groups: &[Vec<usize>]
     let has_raw =
         display_is_raw || e.companions.iter().any(|c| maple_import::is_raw_format(c));
     let is_selected = selected.contains(&i);
+    let ordinal = sessions.iter().position(|s| s.contains(i));
+    let session = ordinal.map(|n| &sessions[n]);
     ImportItem {
         index: i as i32,
         filename: e
@@ -2305,7 +3533,15 @@ fn make_item(entries: &[Entry], selected: &HashSet<usize>, groups: &[Vec<usize>]
         // not — worth a mark the user can notice while triaging.
         from_companion: e.readable == Readable::FromCompanion,
         is_old: e.decided_before,
-        stack_size: find_group(groups, i).map(|g| g.len() as i32).unwrap_or(0),
+        // A session of one is a real answer but not a group, and a tile
+        // that said "1" would be noise on most of a card.
+        stack_size: session.filter(|s| s.len() >= 2).map(|s| s.len() as i32).unwrap_or(0),
+        // Where this photo sits in its session. Both true at once is a
+        // session of one; the grid uses them to close the band on itself.
+        session_start: session.is_some_and(|s| s.start == i),
+        session_end: session.is_some_and(|s| s.end == i + 1),
+        // Identity for the highlight, parity for the alternating tint.
+        session_id: ordinal.map(|n| n as i32).unwrap_or(-1),
         has_jpg,
         has_raw,
     }
@@ -2319,13 +3555,13 @@ fn make_item(entries: &[Entry], selected: &HashSet<usize>, groups: &[Vec<usize>]
 fn build_items(
     entries: &[Entry],
     selected: &HashSet<usize>,
-    groups: &[Vec<usize>],
+    sessions: &[maple_import::Session],
     visible: &Visible,
 ) -> Vec<ImportItem> {
     visible
         .rows
         .iter()
-        .map(|&i| make_item(entries, selected, groups, i))
+        .map(|&i| make_item(entries, selected, sessions, i))
         .collect()
 }
 
@@ -2339,9 +3575,19 @@ fn refilter(w: &ImportWindow, ctx: &ImportCtx) {
     let items = {
         let entries = ctx.entries.borrow();
         let mut visible = ctx.visible.borrow_mut();
-        visible.rebuild(&entries, ctx.hide_old.get());
+        // The `f` grid suspends the filter rather than working around it:
+        // one model serves both views, and a session band drawn over a
+        // sequence with photos missing from the middle would lie.
+        visible.rebuild(&entries, ctx.hide_old.get() && !ctx.grid_open.get());
         w.set_old_count(entries.iter().filter(|e| e.decided_before).count() as i32);
-        build_items(&entries, &ctx.selected.borrow(), &ctx.groups.borrow(), &visible)
+        w.set_session_count(ctx.sessions.borrow().len() as i32);
+        // The number that means something. Half the sessions on a real card
+        // are solo — 954 photos segment into 329 sessions but only 165
+        // groups — so the raw count alone reads as noise.
+        w.set_group_count(
+            ctx.sessions.borrow().iter().filter(|s| s.len() >= 2).count() as i32,
+        );
+        build_items(&entries, &ctx.selected.borrow(), &ctx.sessions.borrow(), &visible)
     };
     ctx.model.set_vec(items);
 
@@ -2417,6 +3663,17 @@ fn set_current(w: &ImportWindow, ctx: &ImportCtx, idx: usize) {
     ctx.current.set(idx);
     w.set_current_index(idx as i32);
     w.set_current_row(strip_row(&ctx.visible.borrow(), idx));
+    // Which band the `f` grid should light up. Follows the cursor, so
+    // walking the card walks the highlight, and `[`/`]` always act on the
+    // session the user is looking at.
+    w.set_current_session(
+        ctx.sessions
+            .borrow()
+            .iter()
+            .position(|s| s.contains(idx))
+            .map(|n| n as i32)
+            .unwrap_or(-1),
+    );
 }
 
 /// Mirror the current photo's verdict into the preview bar's chip, so the
@@ -2458,7 +3715,7 @@ fn leave(ctx: &ImportCtx, idx: usize) {
             &ctx.model,
             &ctx.entries.borrow(),
             &ctx.selected.borrow(),
-            &ctx.groups.borrow(),
+            &ctx.sessions.borrow(),
             &ctx.visible.borrow(),
             idx,
         );
@@ -2472,7 +3729,7 @@ fn update_row(
     model: &VecModel<ImportItem>,
     entries: &[Entry],
     selected: &HashSet<usize>,
-    groups: &[Vec<usize>],
+    sessions: &[maple_import::Session],
     visible: &Visible,
     i: usize,
 ) {
@@ -2480,7 +3737,7 @@ fn update_row(
         return;
     }
     if let Some(row) = visible.row(i) {
-        model.set_row_data(row, make_item(entries, selected, groups, i));
+        model.set_row_data(row, make_item(entries, selected, sessions, i));
     }
 }
 
@@ -2499,7 +3756,9 @@ mod tests {
             readable: Readable::Yes,
             thumb: None,
             webp: None,
+            signature: None,
             embedding: None,
+            taken: None,
             sharpness,
         }
     }
@@ -2550,29 +3809,215 @@ mod tests {
 
     // ── Burst resolution ──────────────────────────────────────────
 
-    #[test]
-    fn flatten_clusters_maps_back_to_entry_indices_and_sorts() {
-        // Only entries 2, 5 and 9 produced embeddings.
-        let idx_map = vec![2, 5, 9];
-        let clusters = vec![vec![2, 0], vec![1]];
-        assert_eq!(flatten_clusters(clusters, &idx_map), vec![vec![2, 9], vec![5]]);
+
+    // ── Session boundary editing (the `f` grid) ───────────────────
+
+    fn sess(spans: &[(usize, usize)]) -> Vec<maple_import::Session> {
+        spans.iter().map(|&(start, end)| maple_import::Session { start, end }).collect()
+    }
+
+    fn spans(s: &[maple_import::Session]) -> Vec<(usize, usize)> {
+        s.iter().map(|s| (s.start, s.end)).collect()
     }
 
     #[test]
-    fn sharpest_in_group_picks_the_highest_score() {
-        let entries = vec![
-            entry("a.jpg", Some(10.0)),
-            entry("b.jpg", Some(42.0)),
-            entry("c.jpg", Some(30.0)),
-        ];
-        assert_eq!(sharpest_in_group(&[0, 1, 2], &entries), 1);
+    fn a_boundary_splits_the_session_that_spans_it() {
+        let mut s = sess(&[(0, 10)]);
+        toggle_boundary(&mut s, 4);
+        assert_eq!(spans(&s), vec![(0, 4), (4, 10)]);
     }
 
     #[test]
-    fn sharpest_in_group_treats_a_missing_score_as_zero_and_keeps_the_first_on_a_tie() {
-        let entries = vec![entry("a.jpg", None), entry("b.jpg", Some(0.0))];
-        assert_eq!(sharpest_in_group(&[0, 1], &entries), 0);
-        assert_eq!(sharpest_in_group(&[1], &entries), 1);
+    fn toggling_the_same_boundary_again_merges_it_back() {
+        // Split and merge are one operation, which is why the grid needs no
+        // separate merge key.
+        let mut s = sess(&[(0, 10)]);
+        toggle_boundary(&mut s, 4);
+        toggle_boundary(&mut s, 4);
+        assert_eq!(spans(&s), vec![(0, 10)]);
+    }
+
+    #[test]
+    fn sessions_still_tile_the_sequence_after_any_edit() {
+        // The invariant everything else leans on: every photo belongs to
+        // exactly one session, so the grid can always draw a band under it
+        // and `session_of` never returns None.
+        let mut s = sess(&[(0, 12)]);
+        for at in [7, 3, 9, 3, 11, 1, 9] {
+            toggle_boundary(&mut s, at);
+            let mut expect = 0;
+            for session in &s {
+                assert_eq!(session.start, expect, "gap or overlap: {:?}", spans(&s));
+                assert!(session.end > session.start, "empty session: {:?}", spans(&s));
+                expect = session.end;
+            }
+            assert_eq!(expect, 12, "sessions must cover everything: {:?}", spans(&s));
+        }
+    }
+
+    #[test]
+    fn the_two_ends_of_the_sequence_are_not_boundaries() {
+        // Photo 0 already starts a session and the last already ends one;
+        // a boundary there would describe nothing and must not invent an
+        // empty session.
+        let mut s = sess(&[(0, 5)]);
+        toggle_boundary(&mut s, 0);
+        toggle_boundary(&mut s, 5);
+        toggle_boundary(&mut s, 99);
+        assert_eq!(spans(&s), vec![(0, 5)]);
+        let mut empty: Vec<maple_import::Session> = Vec::new();
+        toggle_boundary(&mut empty, 3);
+        assert!(empty.is_empty());
+    }
+
+    // ── The tournament ────────────────────────────────────────────
+
+    use crate::import_tournament::{Tournament, Verdict};
+
+    /// Run a whole pass and report `(marked, passed over)`.
+    fn run_pass(
+        entries: &mut [Entry],
+        groups: &[Vec<usize>],
+        script: &[Verdict],
+    ) -> (HashSet<usize>, Vec<usize>) {
+        let mut t = Tournament::build(groups, Vec::new(), |_| false);
+        let mut selected = HashSet::new();
+        let mut brushed = HashMap::new();
+        for v in script {
+            let settled = t.decide(*v);
+            settle_marks(entries, &mut selected, &mut brushed, &[], &settled);
+        }
+        let passed = entries
+            .iter()
+            .enumerate()
+            .filter(|(_, e)| e.passed)
+            .map(|(i, _)| i)
+            .collect();
+        (selected, passed)
+    }
+
+    fn six() -> Vec<Entry> {
+        (0..6).map(|i| entry(&format!("{i}.jpg"), Some(i as f32))).collect()
+    }
+
+    /// The property the whole pass exists to guarantee: nothing it covers
+    /// is left undecided, and nothing is both kept and passed over. A
+    /// photo left in neither state would be silently dropped from the
+    /// import *and* offered again on the next scan.
+    #[test]
+    fn a_finished_pass_leaves_every_photo_marked_or_passed_and_never_both() {
+        let mut entries = six();
+        let groups = vec![vec![0, 1, 2], vec![3, 4, 5]];
+        let script = [Verdict::Right, Verdict::Both, Verdict::Left, Verdict::Both];
+        let (selected, passed) = run_pass(&mut entries, &groups, &script);
+
+        for i in 0..6 {
+            assert!(
+                selected.contains(&i) != passed.contains(&i),
+                "photo {i}: selected={} passed={}",
+                selected.contains(&i),
+                passed.contains(&i)
+            );
+        }
+    }
+
+    #[test]
+    fn holding_the_incumbent_all_the_way_keeps_one_photo_from_the_session() {
+        let mut entries = six();
+        let groups = vec![vec![0, 1, 2, 3, 4, 5]];
+        let (selected, passed) = run_pass(&mut entries, &groups, &[Verdict::Left; 5]);
+        assert_eq!(selected, HashSet::from([0]));
+        assert_eq!(passed, vec![1, 2, 3, 4, 5]);
+    }
+
+    #[test]
+    fn taking_both_every_time_keeps_the_whole_session() {
+        let mut entries = six();
+        let groups = vec![vec![0, 1, 2, 3, 4, 5]];
+        let (selected, passed) = run_pass(&mut entries, &groups, &[Verdict::Both; 5]);
+        assert_eq!(selected.len(), 6);
+        assert!(passed.is_empty());
+    }
+
+    /// A loss is a *skip*, not an absence — which is what puts it in the
+    /// Skipped record on the medium so a re-scan does not offer it again.
+    #[test]
+    fn the_loser_of_a_comparison_is_recorded_as_passed_over() {
+        let mut entries = six();
+        let groups = vec![vec![0, 1]];
+        let (selected, passed) = run_pass(&mut entries, &groups, &[Verdict::Right]);
+        assert_eq!(selected, HashSet::from([1]));
+        assert_eq!(passed, vec![0]);
+        assert!(!entries[1].passed, "the winner must not be marked as skipped");
+    }
+
+    #[test]
+    fn undo_puts_a_photo_back_to_undecided() {
+        let mut entries = six();
+        let groups = vec![vec![0, 1, 2]];
+        let mut t = Tournament::build(&groups, Vec::new(), |_| false);
+        let mut selected = HashSet::new();
+        let mut brushed: HashMap<usize, Vec<i64>> = HashMap::new();
+
+        let settled = t.decide(Verdict::Right);
+        settle_marks(&mut entries, &mut selected, &mut brushed, &[], &settled);
+        assert!(entries[0].passed);
+
+        let undone = t.undo();
+        withdraw_marks(&mut entries, &mut selected, &mut brushed, &undone);
+        assert!(!entries[0].passed, "an undone loss is not a skip");
+        assert!(selected.is_empty());
+        assert!(brushed.is_empty());
+        assert_eq!(t.pair(), Some((0, 1)), "and the question comes back");
+    }
+
+    /// The brush is read when the photo is marked, exactly as it is for a
+    /// mark made by hand — so a tag added half way through a pass tags the
+    /// second half and not the first.
+    #[test]
+    fn a_kept_photo_carries_the_brush_it_was_kept_under() {
+        let mut entries = six();
+        let groups = vec![vec![0, 1], vec![2, 3]];
+        let mut t = Tournament::build(&groups, Vec::new(), |_| false);
+        let mut selected = HashSet::new();
+        let mut brushed = HashMap::new();
+
+        let first = t.decide(Verdict::Left);
+        settle_marks(&mut entries, &mut selected, &mut brushed, &[], &first);
+
+        let holiday = vec![Tag { id: 7, name: "Holiday".into(), color: "#aabbcc".into() }];
+        let second = t.decide(Verdict::Left);
+        settle_marks(&mut entries, &mut selected, &mut brushed, &holiday, &second);
+
+        assert_eq!(brushed.get(&0), Some(&Vec::new()), "kept before the tag existed");
+        assert_eq!(brushed.get(&2), Some(&vec![7]));
+        // A loser carries no tags at all — there is nothing to tag.
+        assert!(!brushed.contains_key(&1));
+        assert!(!brushed.contains_key(&3));
+    }
+
+    #[test]
+    fn the_note_tells_nothing_to_run_apart_from_nothing_left_to_run() {
+        let nothing = Tournament::build(&[vec![0]], Vec::new(), |_| false);
+        assert!(tournament_note(&nothing).contains("nothing to run"));
+
+        let mut done = Tournament::build(&[vec![0, 1, 2]], Vec::new(), |_| false);
+        done.decide(Verdict::Both);
+        done.decide(Verdict::Left);
+        assert_eq!(tournament_note(&done), "Tournament complete — 2 kept, 1 passed over.");
+    }
+
+    #[test]
+    fn a_pane_falls_back_to_half_the_window_until_it_reports_its_own_size() {
+        // The reported number wins whenever there is one.
+        assert_eq!(pane_size((1600, 1000), 700, 880), (700, 880));
+        // And a pane that has not reported still gets something drawable
+        // rather than nothing at all.
+        let (w, h) = pane_size((1600, 1000), 0, 0);
+        assert_eq!(w, 800);
+        assert!(h > 0 && h < 1000);
+        // Including from a window too small to subtract the chrome from.
+        assert_eq!(pane_size((0, 0), 0, 0), (1, 1));
     }
 
     // ── Status text ───────────────────────────────────────────────
@@ -2697,17 +4142,108 @@ mod tests {
     }
 
     #[test]
-    fn make_item_carries_selection_and_stack_size() {
+    fn make_item_carries_selection_and_session_shape() {
         let entries = vec![entry("/src/a.jpg", None), entry("/src/b.jpg", None)];
         let selected: HashSet<usize> = [1].into_iter().collect();
-        let groups = vec![vec![0, 1]];
+        let sessions = sess(&[(0, 2)]);
 
-        let first = make_item(&entries, &selected, &groups, 0);
+        let first = make_item(&entries, &selected, &sessions, 0);
         assert!(!first.is_selected);
         assert_eq!(first.stack_size, 2);
+        assert_eq!(first.session_id, 0);
+        assert!(first.session_start && !first.session_end);
 
-        let second = make_item(&entries, &selected, &groups, 1);
+        let second = make_item(&entries, &selected, &sessions, 1);
         assert!(second.is_selected);
+        assert!(!second.session_start && second.session_end);
+    }
+
+    // ── Drawing a session with two clicks ────────────────────────
+
+    /// A click says "the session starts here". Saying it about a photo that
+    /// already starts one must leave it starting one — `toggle_boundary`
+    /// would merge it backwards, which is the opposite instruction.
+    #[test]
+    fn clicking_an_existing_start_leaves_it_alone_where_a_key_would_toggle_it() {
+        let mut sessions = sess(&[(0, 4), (4, 8)]);
+
+        assert!(!ensure_boundary(&mut sessions, 4), "nothing to do, and it says so");
+        assert_eq!(sessions, sess(&[(0, 4), (4, 8)]));
+
+        // The key vocabulary, for contrast: the same call merges.
+        let mut keyed = sess(&[(0, 4), (4, 8)]);
+        toggle_boundary(&mut keyed, 4);
+        assert_eq!(keyed, sess(&[(0, 8)]), "`[` toggles, a click does not");
+    }
+
+    /// Two clicks are the two boundaries `[` and `]` set — one photo apart,
+    /// which is the identity the whole edit vocabulary rests on.
+    #[test]
+    fn two_clicks_carve_out_exactly_the_photos_between_them() {
+        let mut sessions = sess(&[(0, 10)]);
+
+        // Click on 3: the session starts here.
+        assert!(ensure_boundary(&mut sessions, 3));
+        // Click on 6: the session stops here — a boundary before 7.
+        assert!(ensure_boundary(&mut sessions, 7));
+
+        assert_eq!(sessions, sess(&[(0, 3), (3, 7), (7, 10)]));
+        let carved = sessions.iter().find(|s| s.start == 3).unwrap();
+        assert_eq!(carved.len(), 4, "photos 3,4,5,6 — both clicks included");
+    }
+
+    #[test]
+    fn clicking_the_same_photo_twice_makes_a_session_of_one() {
+        let mut sessions = sess(&[(0, 6)]);
+        ensure_boundary(&mut sessions, 2);
+        ensure_boundary(&mut sessions, 3);
+        assert_eq!(sessions, sess(&[(0, 2), (2, 3), (3, 6)]));
+    }
+
+    #[test]
+    fn a_click_outside_the_sequence_changes_nothing() {
+        let mut sessions = sess(&[(0, 4)]);
+        assert!(!ensure_boundary(&mut sessions, 0), "the sequence already begins there");
+        assert!(!ensure_boundary(&mut sessions, 4), "and already ends there");
+        assert!(!ensure_boundary(&mut sessions, 99));
+        assert_eq!(sessions, sess(&[(0, 4)]));
+
+        let mut empty: Vec<maple_import::Session> = Vec::new();
+        assert!(!ensure_boundary(&mut empty, 1), "nothing scanned yet");
+    }
+
+    /// Sessions must still tile the sequence after any number of clicks —
+    /// the `f` grid needs every photo to belong somewhere so a boundary can
+    /// be dragged onto it.
+    #[test]
+    fn clicking_never_leaves_a_hole_or_an_overlap() {
+        let mut sessions = sess(&[(0, 20)]);
+        for at in [7usize, 3, 15, 8, 3, 19, 1, 15] {
+            ensure_boundary(&mut sessions, at);
+        }
+        assert_eq!(sessions.first().unwrap().start, 0);
+        assert_eq!(sessions.last().unwrap().end, 20);
+        for pair in sessions.windows(2) {
+            assert_eq!(pair[0].end, pair[1].start, "sessions must tile: {sessions:?}");
+        }
+    }
+
+    #[test]
+    fn a_session_of_one_opens_and_closes_on_the_same_tile_and_is_not_a_group() {
+        let entries = vec![entry("/src/a.jpg", None)];
+        let item = make_item(&entries, &HashSet::new(), &sess(&[(0, 1)]), 0);
+        assert!(item.session_start && item.session_end);
+        assert_eq!(item.stack_size, 0, "a session of one must not read as a group");
+    }
+
+    #[test]
+    fn a_photo_in_no_session_reports_minus_one() {
+        // What every tile looks like before the scan finishes, and on a
+        // card where detection found nothing at all.
+        let entries = vec![entry("/src/a.jpg", None)];
+        let item = make_item(&entries, &HashSet::new(), &[], 0);
+        assert_eq!(item.session_id, -1);
+        assert!(!item.session_start && !item.session_end);
     }
 
     // ── Triage verdicts ──────────────────────────────────────────
@@ -3121,13 +4657,15 @@ mod tests {
         let (tx, rx) = mpsc::channel();
         let budget = Duration::from_millis(150);
 
+        let cache = Mutex::new(maple_import::PreviewCache::detached());
         let started = std::time::Instant::now();
         for (index, path) in paths.iter().enumerate() {
             let group = maple_import::ImageGroup {
                 display: maple_import::ImageFile { path: path.clone(), size: 0 },
                 companions: vec![],
             };
-            decode_one(read_one(index, &group, budget, &prior), None, &tx);
+            let job = read_one(index, &group, budget, &prior, dir.path(), &cache);
+            decode_one(job, None, None, None, &tx);
         }
         drop(tx);
 
@@ -3158,6 +4696,157 @@ mod tests {
         );
     }
 
+    /// Run the real scan worker over `dir` and collect what it reported.
+    fn scan(dir: &std::path::Path) -> (Vec<ScanThumb>, Vec<(usize, maple_import::Signature)>) {
+        let (tx, rx) = mpsc::channel();
+        spawn_scan_worker(
+            dir.to_path_buf(),
+            maple_state::StackSettings { enabled: false, ..Default::default() },
+            maple_state::SessionSettings::default(),
+            maple_state::ImportSettings::default(),
+            Arc::new(PriorDecisions {
+                imported: maple_state::SeenSet::new(),
+                skipped: maple_state::SeenSet::new(),
+            }),
+            tx,
+        );
+        let (mut thumbs, mut signatures) = (Vec::new(), Vec::new());
+        loop {
+            match rx.recv_timeout(Duration::from_secs(30)) {
+                Ok(ScanMsg::Thumb(t)) => thumbs.push(t),
+                Ok(ScanMsg::Signature { index, signature }) => signatures.push((index, signature)),
+                Ok(ScanMsg::Done) => break,
+                Ok(ScanMsg::Error(e)) => panic!("scan error: {e}"),
+                Ok(_) => {}
+                Err(e) => panic!("scan stalled: {e}"),
+            }
+        }
+        thumbs.sort_by_key(|t| t.index);
+        signatures.sort_by_key(|(i, _)| *i);
+        (thumbs, signatures)
+    }
+
+    /// Overwrite a file's contents while keeping the size and mtime the
+    /// cache keys on — so a scan that still gets the *original* preview
+    /// back has provably not opened it.
+    fn scribble_over(path: &std::path::Path) {
+        let meta = std::fs::metadata(path).unwrap();
+        let (len, mtime) = (meta.len(), meta.modified().unwrap());
+        std::fs::write(path, vec![0u8; len as usize]).unwrap();
+        let f = std::fs::OpenOptions::new().write(true).open(path).unwrap();
+        f.set_modified(mtime).unwrap();
+        f.sync_all().unwrap();
+        let after = std::fs::metadata(path).unwrap();
+        assert_eq!(after.len(), len);
+        assert_eq!(after.modified().unwrap(), mtime);
+    }
+
+    /// The claim the preview cache is built on: **a second scan of an
+    /// unchanged card does not open the files at all.**
+    ///
+    /// Proved by destroying the contents between the two scans while
+    /// keeping the size and mtime intact. A scan that read anything would
+    /// come back with no preview and a different hash; one that used the
+    /// medium's own record comes back with exactly what it found the first
+    /// time.
+    #[test]
+    fn a_rescan_of_an_unchanged_card_never_opens_the_files() {
+        let dir = tempfile::tempdir().unwrap();
+        for i in 0..6 {
+            write_png(&dir.path().join(format!("p{i}.png")));
+        }
+
+        let (first, _) = scan(dir.path());
+        assert_eq!(first.len(), 6);
+        assert!(first.iter().all(|t| t.preview.is_some()), "the scan must make previews");
+        assert!(
+            dir.path().join(maple_import::PREVIEW_CACHE_FILE).exists(),
+            "and write them back to the medium"
+        );
+
+        for i in 0..6 {
+            scribble_over(&dir.path().join(format!("p{i}.png")));
+        }
+
+        let (second, _) = scan(dir.path());
+        assert_eq!(second.len(), 6);
+        for (a, b) in first.iter().zip(&second) {
+            assert_eq!(a.content_hash, b.content_hash, "the hash comes from the cache too");
+            assert_eq!(a.preview, b.preview, "byte-identical preview, not a re-encode");
+            assert!(b.readable.ok());
+        }
+    }
+
+    /// The other half of that key: a file that actually changed must be
+    /// read again. Serving the stale entry would also serve the stale
+    /// content hash, which is what decides "already imported".
+    #[test]
+    fn a_file_that_changed_is_read_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("a.png");
+        write_png(&path);
+        let (first, _) = scan(dir.path());
+
+        // A different image, so both the size and the mtime move.
+        let img = image::RgbImage::from_pixel(16, 16, image::Rgb([10, 200, 40]));
+        image::DynamicImage::ImageRgb8(img).save(&path).unwrap();
+
+        let (second, _) = scan(dir.path());
+        assert_ne!(first[0].content_hash, second[0].content_hash);
+        assert_ne!(first[0].preview, second[0].preview);
+        assert_eq!(
+            second[0].content_hash,
+            maple_import::content_hash(&path).unwrap(),
+            "the fresh read must produce the file's real hash"
+        );
+    }
+
+    /// The invariant [`maple_import::preview`] exists for: every check runs
+    /// on the frame the *kept* preview decodes to, so recomputing one from
+    /// what the scan stored reproduces the scan's own answer exactly.
+    ///
+    /// If anything ever computes on a pristine decode again, this fails —
+    /// which is the point, because that pixel buffer is not kept anywhere
+    /// and nothing downstream could reproduce a result from it.
+    #[test]
+    fn every_check_is_computed_from_the_preview_that_is_kept() {
+        let dir = tempfile::tempdir().unwrap();
+        for i in 0..4 {
+            let img = image::RgbImage::from_fn(64, 48, |x, y| {
+                image::Rgb([(x * 4) as u8, (y * 5) as u8, (i * 60) as u8])
+            });
+            image::DynamicImage::ImageRgb8(img)
+                .save(dir.path().join(format!("p{i}.png")))
+                .unwrap();
+        }
+
+        let (thumbs, signatures) = scan(dir.path());
+        assert_eq!(signatures.len(), 4, "every photo must reach the session engine");
+
+        let settings = maple_state::SessionSettings::default();
+        let mut engine =
+            maple_import::session::engine_from_spec(&settings.engine).expect("default engine");
+
+        for (thumb, (index, signature)) in thumbs.iter().zip(&signatures) {
+            assert_eq!(thumb.index, *index);
+            let webp = thumb.preview.as_ref().expect("a preview was kept");
+            let frame = maple_import::preview::decode(webp).expect("it decodes");
+
+            assert_eq!(
+                thumb.sharpness.unwrap(),
+                maple_import::laplacian_variance(frame.as_raw(), frame.width(), frame.height()),
+                "sharpness must be reproducible from the kept preview"
+            );
+            let recomputed = engine
+                .signature(&maple_import::Frame::new(&frame, thumb.taken))
+                .expect("signature");
+            assert_eq!(
+                &recomputed, signature,
+                "the signature must be reproducible from the kept preview"
+            );
+        }
+    }
+
     /// Drive the real `spawn_scan_worker` over a real folder and assert the
     /// message stream the UI depends on: the listing, one row per photo,
     /// then `Done`. A deadlock between reader, decoders and embedder shows
@@ -3176,6 +4865,7 @@ mod tests {
         spawn_scan_worker(
             dir.path().to_path_buf(),
             maple_state::StackSettings { enabled: false, ..Default::default() },
+            maple_state::SessionSettings::default(),
             maple_state::ImportSettings::default(),
             Arc::new(PriorDecisions {
                 imported: maple_state::SeenSet::new(),
@@ -3186,6 +4876,7 @@ mod tests {
 
         let mut count = None;
         let mut seen = std::collections::HashSet::new();
+        let mut signed = std::collections::HashSet::new();
         let done;
         loop {
             // Finite: a deadlock must fail the test, not hang it.
@@ -3196,6 +4887,9 @@ mod tests {
                     assert!(seen.insert(t.index), "photo {} arrived twice", t.index);
                 }
                 Ok(ScanMsg::Embedding { .. }) => {}
+                Ok(ScanMsg::Signature { index, .. }) => {
+                    signed.insert(index);
+                }
                 Ok(ScanMsg::Done) => {
                     done = true;
                     break;
@@ -3208,6 +4902,80 @@ mod tests {
         assert_eq!(count, Some(25), "the listing must arrive before anything else");
         assert_eq!(seen.len(), 25, "every photo must reach the UI exactly once");
         assert!(done, "the scan must finish");
+        // Session detection is on by default, so every photo that decoded
+        // must also have been described. A signature arriving for only some
+        // of them is the failure that would silently halve the grouping.
+        assert_eq!(signed.len(), 25, "every photo must reach the session engine");
+    }
+
+    /// Session-detection probe against a real folder, run by hand:
+    /// `MAPLE_PROBE_DIR=/path cargo test -p maple-ui session_probe -- --ignored --nocapture`
+    ///
+    /// Drives the real scan worker and the real `detect_sessions`, so it
+    /// answers the question the lab cannot: does the *importer* group these
+    /// photos, given that it builds its signatures and its segmentation
+    /// engine as two separate instances?
+    #[test]
+    #[ignore = "needs MAPLE_PROBE_DIR; run by hand"]
+    fn session_probe() {
+        let Ok(dir) = std::env::var("MAPLE_PROBE_DIR") else { return };
+        let dir = std::path::PathBuf::from(dir);
+        let settings = maple_state::SessionSettings::default();
+        println!("engine = {:?}", settings.engine);
+
+        let (tx, rx) = mpsc::channel();
+        spawn_scan_worker(
+            dir.clone(),
+            maple_state::StackSettings { enabled: false, ..Default::default() },
+            settings.clone(),
+            maple_state::ImportSettings::default(),
+            Arc::new(PriorDecisions {
+                imported: maple_state::SeenSet::new(),
+                skipped: maple_state::SeenSet::new(),
+            }),
+            tx,
+        );
+
+        let mut entries: Vec<Entry> = Vec::new();
+        let mut listed = 0usize;
+        loop {
+            match rx.recv_timeout(Duration::from_secs(600)) {
+                Ok(ScanMsg::Found(photos)) => {
+                    listed = photos.len();
+                    entries = photos
+                        .iter()
+                        .map(|p| entry(p.display.to_str().unwrap(), None))
+                        .collect();
+                }
+                Ok(ScanMsg::Thumb(t)) => {
+                    if let Some(e) = entries.get_mut(t.index) {
+                        e.taken = t.taken;
+                        e.sharpness = t.sharpness;
+                        e.readable = t.readable;
+                    }
+                }
+                Ok(ScanMsg::Signature { index, signature }) => {
+                    if let Some(e) = entries.get_mut(index) {
+                        e.signature = Some(signature);
+                    }
+                }
+                Ok(ScanMsg::Done) => break,
+                Ok(ScanMsg::Error(e)) => panic!("scan error: {e}"),
+                Ok(_) => {}
+                Err(e) => panic!("scan stalled: {e}"),
+            }
+        }
+
+        let signed = entries.iter().filter(|e| e.signature.is_some()).count();
+        let timed = entries.iter().filter(|e| e.taken.is_some()).count();
+        println!("listed {listed}, signed {signed}, with a capture time {timed}");
+
+        let sessions = detect_sessions(&entries, &settings);
+        let groups = groups_from_sessions(&sessions);
+        println!("sessions {}, groups {}", sessions.len(), groups.len());
+        for s in sessions.iter().take(20) {
+            println!("  [{:>4}..{:<4}] {} photos", s.start, s.end - 1, s.end - s.start);
+        }
     }
 
     /// Timing probe against camera-sized files, run by hand:
@@ -3237,6 +5005,7 @@ mod tests {
         spawn_scan_worker(
             dir.path().to_path_buf(),
             maple_state::StackSettings { enabled: false, ..Default::default() },
+            maple_state::SessionSettings::default(),
             maple_state::ImportSettings::default(),
             Arc::new(PriorDecisions {
                 imported: maple_state::SeenSet::new(),

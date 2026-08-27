@@ -8,6 +8,8 @@ maple-state = { path = "../maple-state" }
 tokio = { workspace = true }
 blake3 = { workspace = true }
 image = { workspace = true }
+fast_image_resize = { workspace = true }
+webp = { workspace = true }
 zune-jpeg = { workspace = true }
 anyhow = { workspace = true }
 tracing = { workspace = true }

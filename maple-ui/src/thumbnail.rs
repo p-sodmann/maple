@@ -1,4 +1,12 @@
-//! Thumbnail generation and codec helpers.
+//! Thumbnail generation for the library, and the codec helpers it shares
+//! with the rest of the app.
+//!
+//! The render and WebP primitives themselves live in
+//! [`maple_import::preview`] — the import scan, the session-detection lab
+//! and these thumbnails must all resample the same way, and one of them
+//! having its own copy is how the lab and the scan drifted apart once
+//! already. This module keeps only what is specific to the library's own
+//! images: the cover crop, and the render-then-encode convenience.
 //!
 //! # Pipeline (cache miss)
 //!
@@ -15,65 +23,9 @@
 
 use std::path::Path;
 
-use fast_image_resize as fir;
-
-// ── Public entry points ───────────────────────────────────────────
-
-/// Decode and resize `path` to at most `max_size`px on the longest edge.
-///
-/// Returns `(rgb_pixels, width, height)` — 24-bit tightly-packed RGB.
-/// EXIF orientation is applied before resizing.
-/// Lanczos3 filter is used for the final downsample step.
-pub fn render_to_rgb(path: &Path, max_size: u32) -> anyhow::Result<(Vec<u8>, u32, u32)> {
-    render_decoded(maple_import::decode_image(path)?, max_size)
-}
-
-/// Decode and resize bytes already in memory.
-///
-/// The import scan reads each file once on a single thread — a card is one
-/// serial bus, and twelve readers on it are slower than one — then hands the
-/// bytes here to be decoded on whichever core is free. `bytes` is the file
-/// itself for an ordinary image, or a raw's embedded preview.
-pub fn render_bytes_to_rgb(bytes: &[u8], max_size: u32) -> anyhow::Result<(Vec<u8>, u32, u32)> {
-    render_decoded(maple_import::decode_image_bytes(bytes)?, max_size)
-}
-
-fn render_decoded(img: image::DynamicImage, max_size: u32) -> anyhow::Result<(Vec<u8>, u32, u32)> {
-    let rgb_img = img.into_rgb8();
-    let (src_w, src_h) = rgb_img.dimensions();
-    let (dst_w, dst_h) = fit_dims(src_w, src_h, max_size);
-
-    let src_img = fir::images::ImageRef::new(src_w, src_h, rgb_img.as_raw(), fir::PixelType::U8x3)
-        .map_err(|e| anyhow::anyhow!("fir src: {e}"))?;
-    let mut dst_img = fir::images::Image::new(dst_w, dst_h, fir::PixelType::U8x3);
-    fir::Resizer::new()
-        .resize(
-            &src_img,
-            &mut dst_img,
-            &fir::ResizeOptions::new()
-                .resize_alg(fir::ResizeAlg::Convolution(fir::FilterType::Lanczos3)),
-        )
-        .map_err(|e| anyhow::anyhow!("fir resize: {e}"))?;
-
-    Ok((dst_img.into_vec(), dst_w, dst_h))
-}
-
-/// Encode `rgb` pixels as lossy WebP at the given quality (0–100).
-pub fn encode_webp_rgb(rgb: &[u8], width: u32, height: u32, quality: u8) -> Vec<u8> {
-    webp::Encoder::from_rgb(rgb, width, height)
-        .encode(quality as f32)
-        .to_vec()
-}
-
-/// Decode cached WebP bytes back to tight RGB pixels.
-///
-/// Returns `(rgb_pixels, width, height)`.
-pub fn decode_webp_rgb(webp: &[u8]) -> anyhow::Result<(Vec<u8>, u32, u32)> {
-    let img = image::load_from_memory(webp)?;
-    let rgb = img.into_rgb8();
-    let (w, h) = rgb.dimensions();
-    Ok((rgb.into_raw(), w, h))
-}
+pub use maple_import::preview::{
+    decode_webp_rgb, encode_webp_rgb, render_bytes_to_rgb, render_to_rgb,
+};
 
 /// Convenience: render + encode WebP in one call.
 ///
@@ -99,23 +51,6 @@ pub fn center_square_crop(path: &Path, out_px: u32) -> anyhow::Result<Vec<u8>> {
     let cropped = image::imageops::crop_imm(&rgb, x, y, side, side).to_image();
     let resized = image::imageops::resize(&cropped, out_px, out_px, image::imageops::FilterType::Lanczos3);
     Ok(resized.into_raw())
-}
-
-// ── Internals ─────────────────────────────────────────────────────
-
-/// Compute output dimensions preserving aspect ratio.
-fn fit_dims(w: u32, h: u32, max: u32) -> (u32, u32) {
-    if w == 0 || h == 0 {
-        return (max, max);
-    }
-    if w <= max && h <= max {
-        return (w, h);
-    }
-    if w >= h {
-        (max, ((h as u64 * max as u64) / w as u64).max(1) as u32)
-    } else {
-        (((w as u64 * max as u64) / h as u64).max(1) as u32, max)
-    }
 }
 
 #[cfg(test)]
@@ -206,20 +141,5 @@ mod tests {
         let img = image::DynamicImage::ImageRgb8(image::RgbImage::new(4, 2));
         assert_eq!(apply_orientation(img.clone(), 1).dimensions(), (4, 2));
         assert_eq!(apply_orientation(img, 2).dimensions(), (4, 2));
-    }
-
-    #[test]
-    fn fit_dims_landscape() {
-        assert_eq!(fit_dims(800, 400, 200), (200, 100));
-    }
-
-    #[test]
-    fn fit_dims_portrait() {
-        assert_eq!(fit_dims(400, 800, 200), (100, 200));
-    }
-
-    #[test]
-    fn fit_dims_small_image_unchanged() {
-        assert_eq!(fit_dims(100, 80, 200), (100, 80));
     }
 }

@@ -55,9 +55,19 @@ export struct ImportItem {
     // Decided in an *earlier* session (imported then, or skipped then).
     // What "Hide old images" filters on.
     is-old: bool,
-    stack-size: int,     // >=2 when this photo belongs to a detected burst group
+    stack-size: int,     // >=2 when this photo belongs to a detected session
     has-jpg: bool,        // group has a non-raw (JPG/PNG) file
     has-raw: bool,        // group has a raw companion (or the display itself is raw)
+    // Where this photo sits in its session. Both true at once is a session
+    // of one. The `f` grid draws a band that opens at the start and closes
+    // at the end, which is what makes a boundary visible as a *gap* rather
+    // than as a line the eye has to hunt for.
+    session-start: bool,
+    session-end: bool,
+    // Which session, counting from 0 in scan order; -1 when the scan
+    // detected none. Identity, so the grid can highlight the one under the
+    // cursor, and parity, so two sessions that meet are still two bands.
+    session-id: int,
 }
 
 // ── Thumbnail grid (mirrors LibraryGridView) ──────────────────────
@@ -83,8 +93,13 @@ component ImportGridView {
     property <length> tile-h: root.cell-size + root.label-h;
     property <length> pitch-x: root.cell-size + root.gap;
     property <length> pitch-y: root.tile-h + root.gap;
-    // Single column — one thumbnail per row.
-    property <float> columns: 1;
+    // 1 for the filmstrip down the side; the `f` grid sets it wider.
+    in property <float> columns: 1;
+    // Draw session bands and their boundaries. Off for the strip, where a
+    // one-column list of bands would just be stripes.
+    in property <bool> show-sessions: false;
+    // The session under the cursor — the one a boundary edit acts on.
+    in property <int> current-session: -1;
     property <float> row-count: Math.ceil(root.items.length / root.columns);
 
     // A margin either side of the viewport so a preview is usually already
@@ -124,13 +139,32 @@ component ImportGridView {
     // Both ends fall out of the clamp rather than needing a case: the first
     // photo has nothing to trail behind it, and near the end the strip is
     // already at the bottom, so the current photo simply walks down it.
-    changed current-row => {
-        if (root.current-row >= 0) {
+    //
+    // The row that is *scrolled to* is the grid row, not the strip row:
+    // with `columns` tiles abreast, strip row 500 sits on grid row
+    // 500/columns, and scrolling to 500 would overshoot by exactly that
+    // factor — in practice straight to the bottom of the card. For the
+    // one-column strip the two are the same number, which is why this went
+    // unnoticed until the `f` grid asked for more than one column.
+    property <int> current-grid-row:
+        root.current-row >= 0 ? Math.floor(root.current-row / root.columns) : -1;
+
+    function park() {
+        if (root.current-grid-row >= 0) {
             sv.viewport-y = -Math.min(
-                Math.max(root.pad + (root.current-row - root.trail) * root.pitch-y, 0px),
+                Math.max(root.pad + (root.current-grid-row - root.trail) * root.pitch-y, 0px),
                 root.max-scroll);
         }
     }
+
+    changed current-grid-row => { root.park(); }
+    // `changed` does not fire for a value an element was *born* with, and
+    // the `f` grid is created fresh every time it opens — so without this
+    // it would open at the top however far down the card the cursor is.
+    // Harmless if layout has not happened yet: `columns` is still 1 then,
+    // and settles to its real value a moment later, which fires `changed`
+    // and parks properly.
+    init => { root.park(); }
 
     sv := ScrollView {
         viewport-width: sv.visible-width;
@@ -147,6 +181,30 @@ component ImportGridView {
             y: root.pad + grid-row * root.pitch-y;
             width: root.cell-size;
             height: root.tile-h;
+            // The session this photo belongs to, as a tinted plate behind
+            // it. It runs into the gutter on the sides the session
+            // continues through and stops short on the sides it ends,
+            // which is what turns a boundary into a visible gap.
+            property <bool> in-current-session:
+                root.show-sessions && item.session-id >= 0
+                && item.session-id == root.current-session;
+
+            if root.show-sessions: Rectangle {
+                x: item.session-start ? 0px : -root.gap / 2;
+                width: root.cell-size
+                    + (item.session-start ? 0px : root.gap / 2)
+                    + (item.session-end ? 0px : root.gap / 2);
+                y: -root.gap / 2;
+                height: parent.height + root.gap;
+                border-radius: 6px;
+                background: parent.in-current-session
+                    ? Theme.accent.with-alpha(0.20)
+                    : (Math.mod(item.session-id, 2) == 0
+                        ? Theme.fg.with-alpha(0.05)
+                        : Theme.fg.with-alpha(0.11));
+                border-width: parent.in-current-session ? 1px : 0px;
+                border-color: Theme.accent;
+            }
 
             VerticalLayout {
                 spacing: 2px;
@@ -422,6 +480,179 @@ component CopyModeDropdown inherits Rectangle {
 
 // ── Main import window ────────────────────────────────────────────
 
+// A mode switch for the header.
+//
+// Deliberately not another pill beside "Hide old images": that one filters
+// what you are looking at, while this one changes what the window *is* —
+// the strip and the big preview go away and the whole content area becomes
+// a comparison. A control that reads as a different kind of thing is worth
+// the twenty lines.
+component ToggleSwitch inherits Rectangle {
+    in property <bool> checked;
+    in property <string> text;
+    callback toggled();
+
+    height: 24px;
+    width: 38px + lbl.preferred-width;
+
+    Rectangle {
+        x: 0;
+        y: (parent.height - self.height) / 2;
+        width: 30px;
+        height: 17px;
+        border-radius: 8px;
+        background: root.checked ? Theme.accent : Theme.placeholder-bg;
+        animate background { duration: 120ms; }
+
+        Rectangle {
+            y: 2px;
+            x: root.checked ? parent.width - self.width - 2px : 2px;
+            width: 13px;
+            height: 13px;
+            border-radius: 6px;
+            background: root.checked ? Theme.accent-fg : Theme.dim-fg;
+            animate x { duration: 120ms; easing: ease-out; }
+        }
+    }
+
+    lbl := Text {
+        x: 38px;
+        height: 100%;
+        text: root.text;
+        color: root.checked ? Theme.accent-text : Theme.dim-fg;
+        font-size: 12px;
+        font-weight: root.checked ? 700 : 500;
+        vertical-alignment: center;
+    }
+
+    TouchArea {
+        clicked => { root.toggled(); }
+    }
+}
+
+// One contestant in the tournament.
+//
+// Pan and zoom are reported *up* rather than applied here, which is the
+// whole of what makes the zoom paired: there is one zoom level and one
+// centre, they live in Rust, and both panes are drawn from them. A pane
+// that kept its own would have to be told to follow the other one, and the
+// two would drift the first time a render was dropped.
+component TourneyPane inherits Rectangle {
+    in property <image> photo;
+    in property <string> name;
+    in property <string> meta;
+    in property <string> hint;
+    in property <bool> has-photo: true;
+
+    // Drag by this many pane pixels; scroll by this many notches at this
+    // point of the pane (0..1 on each axis).
+    callback pan(length, length);
+    callback zoom-at(float, float, float);
+    // The pane's size in pixels. Reported through derived `int` properties
+    // rather than `changed width` for the same reason `ImportGridView`
+    // watches `row-count`: a `changed` handler is only as reliable as the
+    // property it is hung on, and this one decides whether anything is
+    // drawn at all.
+    callback resized(int, int);
+
+    property <int> px-w: self.width / 1px;
+    property <int> px-h: self.height / 1px;
+    changed px-w => { root.resized(root.px-w, root.px-h); }
+    changed px-h => { root.resized(root.px-w, root.px-h); }
+
+    background: Theme.photo-surface;
+    clip: true;
+
+    VerticalLayout {
+        Rectangle {
+            vertical-stretch: 1;
+            clip: true;
+
+            if root.has-photo: Image {
+                source: root.photo;
+                image-fit: contain;
+                width: 100%;
+                height: 100%;
+            }
+            if !root.has-photo: Text {
+                text: "no preview";
+                color: Theme.dim-fg;
+                font-size: 13px;
+                horizontal-alignment: center;
+                vertical-alignment: center;
+            }
+        }
+
+        Rectangle {
+            height: 30px;
+            background: Theme.sidebar-bg;
+            HorizontalLayout {
+                padding-left: 10px;
+                padding-right: 10px;
+                spacing: 8px;
+
+                Rectangle {
+                    y: (parent.height - self.height) / 2;
+                    width: 20px;
+                    height: 20px;
+                    border-radius: 5px;
+                    background: Theme.accent-tint;
+                    Text {
+                        text: root.hint;
+                        color: Theme.accent-text;
+                        font-size: 12px;
+                        font-weight: 700;
+                        horizontal-alignment: center;
+                        vertical-alignment: center;
+                    }
+                }
+                Text {
+                    text: root.name;
+                    color: Theme.fg;
+                    font-size: 12px;
+                    vertical-alignment: center;
+                    horizontal-stretch: 1;
+                    overflow: elide;
+                }
+                Text {
+                    text: root.meta;
+                    color: Theme.dim-fg;
+                    font-size: 11px;
+                    vertical-alignment: center;
+                }
+            }
+        }
+    }
+
+    ta := TouchArea {
+        // Where the pointer was when the drag last reported, so `moved`
+        // can hand up a delta. `pressed-x` would give the distance from
+        // the press instead, which double-counts once the centre moves.
+        property <length> last-x;
+        property <length> last-y;
+        mouse-cursor: MouseCursor.grab;
+
+        pointer-event(e) => {
+            if (e.kind == PointerEventKind.down) {
+                self.last-x = self.mouse-x;
+                self.last-y = self.mouse-y;
+            }
+        }
+        moved => {
+            root.pan(self.mouse-x - self.last-x, self.mouse-y - self.last-y);
+            self.last-x = self.mouse-x;
+            self.last-y = self.mouse-y;
+        }
+        scroll-event(e) => {
+            root.zoom-at(
+                e.delta-y / 1px,
+                self.mouse-x / Math.max(1px, self.width),
+                self.mouse-y / Math.max(1px, self.height));
+            return accept;
+        }
+    }
+}
+
 export component ImportWindow inherits Window {
     title: "Maple — Import";
     preferred-width: 960px;
@@ -455,6 +686,55 @@ export component ImportWindow inherits Window {
     // hide.
     in property <int> old-count: 0;
     in-out property <bool> hide-old: true;
+    // The `f` grid: every photo at once, with session bands. While it is
+    // open "Hide old images" stands down — Rust suspends the filter rather
+    // than the grid working around it, because a band drawn over a sequence
+    // with photos missing from the middle would lie about what it holds.
+    in-out property <bool> grid-open: false;
+    // The photo a grid click opened a session on, waiting for the click
+    // that closes it. -1 when no edit is half-finished.
+    in property <int> pending-session-start: -1;
+    // Sessions worth the name — two photos or more. Half the sessions on a
+    // real card are solo, so the raw count alone reads as noise.
+    in property <int> group-count: 0;
+    // ── The tournament ────────────────────────────────────────────
+    //
+    // A vs B, and the user says which survives. Nothing is preselected any
+    // more, so this is where a session's keeper is actually chosen.
+    in-out property <bool> tourney-on: false;
+    // Only offered once there is something to compare — a scan that found
+    // no group of two has no tournament to run.
+    in property <bool> tourney-available: false;
+    in property <image> tourney-left;
+    in property <image> tourney-right;
+    in property <bool> tourney-left-shown: false;
+    in property <bool> tourney-right-shown: false;
+    in property <string> tourney-left-name: "";
+    in property <string> tourney-right-name: "";
+    in property <string> tourney-left-meta: "";
+    in property <string> tourney-right-meta: "";
+    // Photos decided out of photos covered, and which session of how many.
+    in property <int> tourney-done: 0;
+    in property <int> tourney-total: 0;
+    in property <int> tourney-round: 0;
+    in property <int> tourney-rounds: 0;
+    // 1.0 is "fits the pane"; above that the panes are showing a crop of
+    // the original decode, not a magnified preview.
+    in property <float> tourney-zoom-level: 1.0;
+    // Nothing left to compare: either the pass is done or it never had a
+    // pair. `tourney-note` says which.
+    in property <bool> tourney-idle: true;
+    // Whether the last verdict can still be taken back. Every keystroke
+    // here decides a photo for good and `1` and `2` are one key apart, so
+    // the way out has to be visible rather than folklore.
+    in property <bool> tourney-can-undo: false;
+    in property <string> tourney-note: "";
+
+    // Which session the current photo sits in, so the grid can pick it out
+    // of the bands. -1 when nothing was detected.
+    in property <int> current-session: -1;
+    // How many sessions the scan found, for the grid's own status line.
+    in property <int> session-count: 0;
     // The brush: the tags every photo marked from here on will carry. Shown
     // in the floating panel so it is legible while triaging, because it
     // changes *within* a pass rather than being set once per import.
@@ -489,6 +769,31 @@ export component ImportWindow inherits Window {
     // Rows on screen (inclusive) and the row at its centre.
     callback preview-window(int, int, int);
     callback toggle-hide-old();
+    // Show or hide the `f` grid.
+    callback toggle-grid();
+    // Toggle the session boundary immediately before / after this photo.
+    // One operation: where there is no boundary it splits, where there is
+    // one it merges, so "set the start here" and "set the stop here" are
+    // the same key one photo apart.
+    callback cut-before(int);
+    callback cut-after(int);
+    // A click inside the `f` grid: the first opens a session on that photo,
+    // the next closes it there.
+    callback grid-clicked(int);
+    // Turn the A-vs-B pass on or off. Off keeps every verdict already
+    // given — turning it back on resumes rather than restarting.
+    callback toggle-tournament();
+    // 1 = keep left, 2 = keep right, 3 = keep both.
+    callback tourney-verdict(int);
+    callback tourney-undo();
+    // The pane's size in pixels — Rust renders the crop at exactly this
+    // size, so it has to be told when the window changes shape.
+    callback tourney-view(int, int);
+    callback tourney-pan(length, length);
+    // Scroll notches, and where in the pane (0..1) they happened, so the
+    // zoom goes towards what the pointer is over.
+    callback tourney-zoom(float, float, float);
+    callback tourney-reset-zoom();
     callback copy-selected;
     callback nav-prev;
     callback nav-next;
@@ -523,6 +828,20 @@ export component ImportWindow inherits Window {
                     root.close-tag-picker();
                     return accept;
                 }
+                // Innermost first: the grid is a mode the user is in, and
+                // closing the whole window out from under it would be the
+                // wrong reading of "get me out of this".
+                if root.grid-open {
+                    root.toggle-grid();
+                    return accept;
+                }
+                // Same reading one level out: the tournament is a mode,
+                // and "get me out of this" means the mode, not the whole
+                // window with the triage pass inside it.
+                if root.tourney-on {
+                    root.toggle-tournament();
+                    return accept;
+                }
                 root.close-requested();
                 return accept;
             }
@@ -530,21 +849,64 @@ export component ImportWindow inherits Window {
             // field, so the triage hotkeys stand down rather than firing
             // behind it.
             if root.in-browser && !root.tag-picker-open {
+                // The tournament is a mode, and its keys come first: while
+                // it is up there is no filmstrip to step along and no
+                // "current photo" for `x` to mark, so letting those keys
+                // fire behind it would silently mark whatever the strip
+                // had been left on.
+                if root.tourney-on && !root.grid-open {
+                    if event.text == "1" { root.tourney-verdict(1); return accept; }
+                    if event.text == "2" { root.tourney-verdict(2); return accept; }
+                    if event.text == "3" { root.tourney-verdict(3); return accept; }
+                    if event.text == "u" || event.text == "U" {
+                        root.tourney-undo();
+                        return accept;
+                    }
+                    if event.text == "0" { root.tourney-reset-zoom(); return accept; }
+                    if event.text == "+" || event.text == "=" {
+                        root.tourney-zoom(3, 0.5, 0.5);
+                        return accept;
+                    }
+                    if event.text == "-" || event.text == "_" {
+                        root.tourney-zoom(-3, 0.5, 0.5);
+                        return accept;
+                    }
+                }
                 if event.text == Key.LeftArrow || event.text == Key.UpArrow {
+                    if root.tourney-on && !root.grid-open { return accept; }
                     root.nav-prev();
                     return accept;
                 }
                 if event.text == Key.RightArrow || event.text == Key.DownArrow {
+                    if root.tourney-on && !root.grid-open { return accept; }
                     root.nav-next();
                     return accept;
                 }
                 if event.text == "x" || event.text == "X" {
+                    if root.tourney-on && !root.grid-open { return accept; }
                     root.item-clicked(root.current-index);
                     return accept;
                 }
                 if event.text == "s" || event.text == "S" {
                     root.open-tag-picker();
                     return accept;
+                }
+                if event.text == "f" || event.text == "F" {
+                    root.toggle-grid();
+                    return accept;
+                }
+                // Boundary editing only means something where the bands
+                // are drawn, so these stay dead outside the grid rather
+                // than silently regrouping a card the user cannot see.
+                if root.grid-open {
+                    if event.text == "[" {
+                        root.cut-before(root.current-index);
+                        return accept;
+                    }
+                    if event.text == "]" {
+                        root.cut-after(root.current-index);
+                        return accept;
+                    }
                 }
                 if event.text == "c" || event.text == "C" {
                     root.clear-tags();
@@ -608,6 +970,13 @@ export component ImportWindow inherits Window {
                         old-ta := TouchArea {
                             clicked => { root.toggle-hide-old(); }
                         }
+                    }
+
+                    if root.in-browser && root.tourney-available: ToggleSwitch {
+                        y: (parent.height - self.height) / 2;
+                        text: "Tournament";
+                        checked: root.tourney-on;
+                        toggled => { root.toggle-tournament(); }
                     }
 
                     if root.in-browser: Text {
@@ -722,7 +1091,159 @@ export component ImportWindow inherits Window {
                 }
             }
 
-            if root.in-browser: HorizontalLayout {
+            // The `f` grid — every photo at once, sessions drawn as bands.
+            // It takes the whole content area rather than sitting beside
+            // the preview: the thing it is for is seeing where one sitting
+            // of shooting ends and the next begins, and that needs room.
+            if root.in-browser && root.grid-open: VerticalLayout {
+                vertical-stretch: 1;
+
+                grid := ImportGridView {
+                    vertical-stretch: 1;
+                    items: root.items;
+                    current-index: root.current-index;
+                    current-row: root.current-row;
+                    cell-size: 132px;
+                    show-sessions: true;
+                    current-session: root.current-session;
+                    // Whole tiles only — a trailing half-tile would put a
+                    // session boundary half off the edge.
+                    columns: Math.max(1, Math.floor(self.width / 148px));
+                    clicked(i) => { root.grid-clicked(i); }
+                    window-changed(a, b, c) => { root.preview-window(a, b, c); }
+                }
+
+                Rectangle {
+                    height: 30px;
+                    background: Theme.card-bg;
+                    HorizontalLayout {
+                        padding-left: 12px;
+                        padding-right: 12px;
+                        spacing: 16px;
+                        Text {
+                            // Sessions are segmented once, when the scan
+                            // finishes — so mid-scan there are none *yet*,
+                            // which is not the same as none being found.
+                            // Saying "no sessions detected" through the
+                            // whole of a long card is a lie about the one
+                            // thing this view exists to show.
+                            text: root.scanning
+                                ? "scanning — sessions are found when it finishes"
+                                : (root.session-count > 0
+                                    ? "\{root.group-count} groups in \{root.session-count} sessions"
+                                    : "no sessions detected");
+                            color: Theme.dim-fg;
+                            font-size: 12px;
+                            vertical-alignment: center;
+                        }
+                        Text {
+                            text: root.pending-session-start >= 0
+                                ? "session open at #\{root.pending-session-start} — click its last photo to close it"
+                                : "click  open a session, click again to close it      [  ]  start / stop      f  back";
+                            color: Theme.dim-fg;
+                            font-size: 12px;
+                            vertical-alignment: center;
+                            horizontal-stretch: 1;
+                        }
+                    }
+                }
+            }
+
+            // The tournament: two photos, one question.
+            //
+            // It takes the whole content area for the same reason the `f`
+            // grid does — the judgement being asked for is "is this one
+            // sharper", and that needs both frames as big as the window
+            // can make them. There is no filmstrip beside it because there
+            // is nothing to navigate: the pass decides the order.
+            if root.in-browser && !root.grid-open && root.tourney-on: VerticalLayout {
+                vertical-stretch: 1;
+
+                if root.tourney-idle: Rectangle {
+                    vertical-stretch: 1;
+                    background: Theme.photo-surface;
+                    Text {
+                        text: root.tourney-note;
+                        color: Theme.dim-fg;
+                        font-size: 14px;
+                        horizontal-alignment: center;
+                        vertical-alignment: center;
+                    }
+                }
+
+                if !root.tourney-idle: HorizontalLayout {
+                    vertical-stretch: 1;
+                    spacing: 2px;
+
+                    TourneyPane {
+                        horizontal-stretch: 1;
+                        hint: "1";
+                        photo: root.tourney-left;
+                        has-photo: root.tourney-left-shown;
+                        name: root.tourney-left-name;
+                        meta: root.tourney-left-meta;
+                        pan(dx, dy) => { root.tourney-pan(dx, dy); }
+                        zoom-at(d, fx, fy) => { root.tourney-zoom(d, fx, fy); }
+                        // Both panes are the same size, so one of them
+                        // reporting is enough — and Rust renders the crop
+                        // at exactly this size rather than letting Slint
+                        // scale it, or a zoomed pixel would be a resampled
+                        // resample.
+                        resized(pw, ph) => { root.tourney-view(pw, ph); }
+                        init => { root.tourney-view(self.width / 1px, self.height / 1px); }
+                    }
+
+                    TourneyPane {
+                        horizontal-stretch: 1;
+                        hint: "2";
+                        photo: root.tourney-right;
+                        has-photo: root.tourney-right-shown;
+                        name: root.tourney-right-name;
+                        meta: root.tourney-right-meta;
+                        pan(dx, dy) => { root.tourney-pan(dx, dy); }
+                        zoom-at(d, fx, fy) => { root.tourney-zoom(d, fx, fy); }
+                    }
+                }
+
+                Rectangle {
+                    height: 30px;
+                    background: Theme.card-bg;
+                    HorizontalLayout {
+                        padding-left: 12px;
+                        padding-right: 12px;
+                        spacing: 16px;
+
+                        Text {
+                            text: root.tourney-idle
+                                ? "\{root.tourney-done} decided"
+                                : "session \{root.tourney-round} / \{root.tourney-rounds}  ·  \{root.tourney-done} / \{root.tourney-total} decided";
+                            color: Theme.dim-fg;
+                            font-size: 12px;
+                            vertical-alignment: center;
+                        }
+                        Text {
+                            text: root.tourney-can-undo
+                                ? "1  keep left      2  keep right      3  keep both      u  undo      scroll  zoom      drag  pan      0  fit"
+                                : "1  keep left      2  keep right      3  keep both      scroll  zoom      drag  pan      0  fit";
+                            color: Theme.dim-fg;
+                            font-size: 12px;
+                            vertical-alignment: center;
+                            horizontal-stretch: 1;
+                            overflow: elide;
+                        }
+                        Text {
+                            text: root.tourney-zoom-level > 1.01
+                                ? "\{Math.round(root.tourney-zoom-level * 10) / 10}×"
+                                : "fit";
+                            color: Theme.dim-fg;
+                            font-size: 12px;
+                            vertical-alignment: center;
+                        }
+                    }
+                }
+            }
+
+            if root.in-browser && !root.grid-open && !root.tourney-on: HorizontalLayout {
                 vertical-stretch: 1;
                 spacing: 0;
 

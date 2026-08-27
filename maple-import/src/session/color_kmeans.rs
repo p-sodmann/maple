@@ -44,6 +44,10 @@ impl Default for ColorKmeansEngine {
 }
 
 impl ColorKmeansEngine {
+    /// This engine's spec name, as `engine_from_spec` and settings.toml
+    /// spell it.
+    pub const NAME: &'static str = NAME;
+
     pub fn new(k: usize, grid: usize, iterations: usize) -> Self {
         Self { k: k.max(1), grid: grid.max(2), iterations: iterations.max(1) }
     }

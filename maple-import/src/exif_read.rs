@@ -62,7 +62,25 @@ pub fn read(path: &Path) -> ExifContext {
     let Ok(exif) = exif else {
         return ExifContext::default();
     };
+    from_exif(&exif)
+}
 
+/// Read EXIF out of bytes already in memory.
+///
+/// The import scan holds every file's bytes to hash them, and for a raw it
+/// holds the extracted preview — which carries the same EXIF block. Parsing
+/// those instead of reopening the file is what makes capture time free
+/// during a scan: the card is the slowest link in the pipeline, and reading
+/// each photo a second time just for its timestamp would be paying the
+/// whole cost of session detection over again.
+pub fn read_bytes(bytes: &[u8]) -> ExifContext {
+    match exif::Reader::new().read_from_container(&mut std::io::Cursor::new(bytes)) {
+        Ok(exif) => from_exif(&exif),
+        Err(_) => ExifContext::default(),
+    }
+}
+
+fn from_exif(exif: &exif::Exif) -> ExifContext {
     let ascii = |tag: exif::Tag| exif.fields().find(|f| f.tag == tag).and_then(ascii_value);
 
     let camera = match (ascii(exif::Tag::Make), ascii(exif::Tag::Model)) {

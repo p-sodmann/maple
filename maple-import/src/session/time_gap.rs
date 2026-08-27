@@ -60,6 +60,10 @@ impl Default for TimeGapEngine {
 }
 
 impl TimeGapEngine {
+    /// This engine's spec name, as `engine_from_spec` and settings.toml
+    /// spell it.
+    pub const NAME: &'static str = NAME;
+
     pub fn new(mut points: Vec<Point>) -> Self {
         points.retain(|(g, _)| g.is_finite() && *g > 0.0);
         points.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));

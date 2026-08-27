@@ -38,6 +38,10 @@ impl Default for BlockTileEngine {
 }
 
 impl BlockTileEngine {
+    /// This engine's spec name, as `engine_from_spec` and settings.toml
+    /// spell it.
+    pub const NAME: &'static str = NAME;
+
     pub fn new(tile: usize, tolerance: f32) -> Self {
         Self { tile: tile.max(2), tolerance: tolerance.max(0.0) }
     }

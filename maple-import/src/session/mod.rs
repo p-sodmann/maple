@@ -106,7 +106,14 @@ impl Signature {
 /// `&mut self` on [`signature`](SessionEngine::signature) because the
 /// DINOv2 engine owns an ONNX session and `ort` wants `&mut` to run it, and
 /// because [`TimeGapEngine`] latches an epoch off the first frame it sees.
-pub trait SessionEngine {
+///
+/// `Send` because the import scan builds the engine on the scan thread and
+/// runs it on a stage of its own — one engine, moved once. It is
+/// deliberately *not* `Sync`: `signature` takes `&mut self` (`TimeGapEngine`
+/// latches an epoch on the first frame), so the engine is a sequential
+/// thing and sharing one across decode threads would be a bug, not an
+/// optimisation.
+pub trait SessionEngine: Send {
     /// Stable identifier, also stamped into every [`Signature`].
     fn name(&self) -> &'static str;
 
@@ -273,6 +280,24 @@ impl SegmentParams {
     /// Defaults with `cut` taken from the engine.
     pub fn for_engine(engine: &dyn SessionEngine) -> Self {
         Self { cut: engine.default_cut(), ..Self::default() }
+    }
+
+    /// Defaults for an engine built from `spec`, with the threshold shaping
+    /// switched off when the spec already votes on the clock.
+    ///
+    /// Time is a *cost* here — a long gap makes a cut cheaper via
+    /// `tight_hold`/`long_drop` — and [`TimeGapEngine`] is a *vote*. Both at
+    /// once means a long gap cheapens the threshold **and** pushes the
+    /// distance over it, which double-counts the one signal most likely to
+    /// be wrong (a camera whose clock is off, a card holding two days).
+    /// Whichever mechanism the spec chose, it gets used once.
+    pub fn for_spec(engine: &dyn SessionEngine, spec: &str) -> Self {
+        let mut p = Self::for_engine(engine);
+        if spec_has_time(spec) {
+            p.tight_hold = 0.0;
+            p.long_drop = 0.0;
+        }
+        p
     }
 }
 
@@ -489,6 +514,123 @@ pub(crate) fn luma(rgb: [f32; 3]) -> f32 {
     0.299 * rgb[0] + 0.587 * rgb[1] + 0.114 * rgb[2]
 }
 
+/// [`segment`] over a sequence where some photos have no signature.
+///
+/// A photo the card never gave up — a read timeout, a file that will not
+/// decode — has no descriptor, so there is no honest answer to "did the
+/// scene change here". It becomes **its own session** and splits the
+/// sequence, rather than being dropped (which would silently join the
+/// photos either side of it, asserting a continuity nobody measured) or
+/// treated as maximally distant (which would assert a change nobody
+/// measured either). Each surviving run is segmented on its own and the
+/// results are stitched back into whole-sequence indices.
+pub fn segment_with_holes(
+    engine: &dyn SessionEngine,
+    signatures: &[Option<Signature>],
+    times: &[Option<f64>],
+    p: &SegmentParams,
+) -> Segmentation {
+    assert_eq!(signatures.len(), times.len(), "signatures and times must agree in length");
+    let mut sessions = Vec::new();
+    let mut links = Vec::new();
+    let mut outliers = Vec::new();
+    let mut at = 0usize;
+    while at < signatures.len() {
+        if signatures[at].is_none() {
+            sessions.push(Session { start: at, end: at + 1 });
+            at += 1;
+            continue;
+        }
+        let end = signatures[at..]
+            .iter()
+            .position(Option::is_none)
+            .map(|off| at + off)
+            .unwrap_or(signatures.len());
+        let run: Vec<Signature> = signatures[at..end].iter().map(|s| s.clone().unwrap()).collect();
+        let seg = segment(engine, &run, &times[at..end], p);
+        sessions
+            .extend(seg.sessions.iter().map(|s| Session { start: s.start + at, end: s.end + at }));
+        links.extend(seg.links.iter().map(|l| Link { at: l.at + at, from: l.from + at, ..*l }));
+        outliers.extend(seg.outliers.iter().map(|o| o + at));
+        at = end;
+    }
+    outliers.sort_unstable();
+    Segmentation { sessions, links, outliers }
+}
+
+// ── Building an engine from a spec string ────────────────────────
+
+/// Build an engine from a spec: one name, or a weighted ensemble.
+///
+/// `"block-tile"` is that engine at its own default cut.
+/// `"block-tile=2,grid-histogram=1,time-gap=1"` is the weighted vote.
+/// A bare name inside a list weighs 1, so `"block-tile,time-gap"` works.
+///
+/// This is the one place a *string* becomes an engine, so settings.toml,
+/// the lab's `--ensemble` flag and any future UI all resolve a name the
+/// same way. `dino` is deliberately not here: it lives in `maple-db`,
+/// which depends on this crate and not the reverse.
+pub fn engine_from_spec(spec: &str) -> anyhow::Result<Box<dyn SessionEngine>> {
+    let members = parse_spec(spec)?;
+    if members.len() == 1 && members[0].1 == 1.0 {
+        return named_engine(&members[0].0);
+    }
+    let built = members
+        .iter()
+        .map(|(name, weight)| named_engine(name).map(|e| (e, *weight)))
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    Ok(Box::new(EnsembleEngine::new(built)))
+}
+
+/// Whether `spec` already votes on the clock.
+///
+/// Load-bearing: the segmentation *also* shapes its threshold by the gap
+/// (`tight_hold`/`long_drop`), and running both means time counts twice —
+/// a long gap would both cheapen the cut and vote for it. A caller building
+/// [`SegmentParams`] for a spec that contains a time member must zero the
+/// shaping; [`SegmentParams::for_spec`] does it.
+pub fn spec_has_time(spec: &str) -> bool {
+    parse_spec(spec)
+        .map(|m| m.iter().any(|(name, _)| name == TimeGapEngine::NAME))
+        .unwrap_or(false)
+}
+
+fn parse_spec(spec: &str) -> anyhow::Result<Vec<(String, f32)>> {
+    let members: Vec<(String, f32)> = spec
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|part| match part.split_once('=') {
+            None => Ok((part.to_ascii_lowercase(), 1.0)),
+            Some((name, weight)) => weight
+                .trim()
+                .parse::<f32>()
+                .map_err(|_| anyhow::anyhow!("session engine weight `{weight}` is not a number"))
+                .map(|w| (name.trim().to_ascii_lowercase(), w)),
+        })
+        .collect::<anyhow::Result<_>>()?;
+    if members.is_empty() {
+        anyhow::bail!("no session engine named in `{spec}`");
+    }
+    Ok(members)
+}
+
+fn named_engine(name: &str) -> anyhow::Result<Box<dyn SessionEngine>> {
+    Ok(match name {
+        BlockTileEngine::NAME => Box::<BlockTileEngine>::default(),
+        GridHistogramEngine::NAME => Box::<GridHistogramEngine>::default(),
+        ColorKmeansEngine::NAME => Box::<ColorKmeansEngine>::default(),
+        TimeGapEngine::NAME => Box::<TimeGapEngine>::default(),
+        other => anyhow::bail!(
+            "unknown session engine `{other}` (known: {}, {}, {}, {})",
+            BlockTileEngine::NAME,
+            GridHistogramEngine::NAME,
+            ColorKmeansEngine::NAME,
+            TimeGapEngine::NAME,
+        ),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -696,6 +838,59 @@ mod tests {
         let seg = segment(&Scalar, &[sig(0.0)], &[None], &params());
         assert_eq!(spans(&seg), vec![(0, 1)]);
         assert!(seg.links.is_empty());
+    }
+
+    // ── Spec parsing ─────────────────────────────────────────────
+
+    #[test]
+    fn a_bare_name_builds_that_engine_not_an_ensemble() {
+        assert_eq!(engine_from_spec("block-tile").unwrap().name(), BlockTileEngine::NAME);
+        assert_eq!(engine_from_spec("  Time-Gap ").unwrap().name(), TimeGapEngine::NAME);
+    }
+
+    #[test]
+    fn a_weighted_list_builds_an_ensemble() {
+        let e = engine_from_spec("block-tile=2,grid-histogram=1,time-gap=1").unwrap();
+        assert_eq!(e.name(), "ensemble");
+        // Every member reads 0.5 at its own threshold, so the vote does too.
+        assert_eq!(e.default_cut(), 0.5);
+    }
+
+    #[test]
+    fn a_bare_name_inside_a_list_weighs_one() {
+        let a = engine_from_spec("block-tile,time-gap").unwrap().describe();
+        let b = engine_from_spec("block-tile=1,time-gap=1").unwrap().describe();
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn an_unknown_engine_names_the_ones_that_exist() {
+        let err = match engine_from_spec("dino") {
+            Err(e) => e.to_string(),
+            Ok(e) => panic!("built an engine named {}", e.name()),
+        };
+        assert!(err.contains("block-tile"), "unhelpful: {err}");
+        assert!(engine_from_spec("").is_err());
+        assert!(engine_from_spec("block-tile=heavy").is_err());
+    }
+
+    #[test]
+    fn a_spec_with_a_time_member_switches_off_threshold_shaping() {
+        // Time is a cost via tight_hold/long_drop and a vote via the
+        // engine. Both at once double-counts it.
+        let spec = "block-tile=2,time-gap=1";
+        let e = engine_from_spec(spec).unwrap();
+        let p = SegmentParams::for_spec(e.as_ref(), spec);
+        assert_eq!(p.tight_hold, 0.0);
+        assert_eq!(p.long_drop, 0.0);
+
+        // A pixel-only spec keeps the shaping — it is the only way the
+        // clock reaches the decision at all.
+        let spec = "block-tile";
+        let e = engine_from_spec(spec).unwrap();
+        let p = SegmentParams::for_spec(e.as_ref(), spec);
+        assert!(p.tight_hold > 0.0 && p.long_drop > 0.0);
+        assert_eq!(p.cut, BlockTileEngine::default().default_cut());
     }
 
     #[test]

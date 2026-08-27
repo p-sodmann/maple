@@ -10,6 +10,8 @@ mod hash;
 pub mod image_source;
 pub mod loader;
 pub mod path_template;
+pub mod preview;
+mod preview_cache;
 pub mod raw;
 pub mod restructure;
 mod scan;
@@ -24,6 +26,7 @@ pub use hash::{content_hash, hash_bytes};
 pub use image_source::{is_raw_format, loadable_image_bytes, raw_preview_supported};
 pub use loader::{apply_orientation, decode_image, decode_image_bytes};
 pub use path_template::{render_filename_stem, render_folder, TemplateContext};
+pub use preview_cache::{CachedPreview, PreviewCache, PreviewKey, PREVIEW_CACHE_FILE};
 pub use restructure::{execute_moves, plan_moves, MoveResult, PlannedMove, RestructureCandidate, RestructureSummary};
 pub use session::{
     segment, BlockTileEngine, ColorKmeansEngine, CutReason, EnsembleEngine, Frame,

@@ -35,13 +35,17 @@ pub struct PhotoRef {
     pub companions: Vec<PathBuf>,
 }
 
-/// One decoded preview on its way back to the UI thread.
+/// One canonical preview on its way back to the UI thread.
+///
+/// It travels as WebP, not as pixels: that is the representation the entry
+/// keeps and the one every check reads, so encoding it here — on a worker,
+/// beside the decode — rather than on the UI thread is both cheaper and the
+/// only way the service and the scan can be said to produce the same thing.
 pub enum PreviewMsg {
     Ready {
         index: usize,
-        rgb: Vec<u8>,
-        width: u32,
-        height: u32,
+        /// The canonical preview (see [`maple_import::preview`]).
+        webp: Vec<u8>,
         /// The display file would not decode and a companion stood in — a
         /// corrupt JPEG next to an intact raw.
         from_companion: bool,
@@ -51,27 +55,34 @@ pub enum PreviewMsg {
     Failed { index: usize },
 }
 
-/// Decode one photo, falling back to its companions.
+/// Read one photo and encode its canonical preview, falling back to the
+/// group's companions.
 ///
 /// A raw + JPEG pair lists the JPEG as the display file, so one corrupt
 /// JPEG would otherwise lose the preview for a photo whose raw is intact.
 ///
-/// `reader` is held **only across the reads**, never across a decode: the
+/// This is the *recovery* path. The scan already makes a canonical preview
+/// for every photo it reads and the medium's cache holds the ones it made
+/// on an earlier run, so by the time the strip asks for something here it
+/// is a photo the scan has not reached yet, or one whose display file would
+/// not decode.
+///
+/// `reader` is held **only across the reads**, never across the encode: the
 /// medium is the part that must be taken in turn, and holding it through
-/// the decode would collapse the pool back to one worker.
-fn decode_photo(
+/// the encode would collapse the pool back to one worker.
+fn preview_photo(
     photo: &PhotoRef,
     budget: Duration,
     reader: &Mutex<()>,
-) -> Option<(Vec<u8>, u32, u32, bool)> {
+) -> Option<(Vec<u8>, bool)> {
     let read = |path: &PathBuf| {
         let _turn = reader.lock();
         crate::import::read_preview_bytes(path, budget)
     };
 
     if let Some(bytes) = read(&photo.display) {
-        if let Ok((rgb, w, h)) = crate::thumbnail::render_bytes_to_rgb(&bytes, 256) {
-            return Some((rgb, w, h, false));
+        if let Ok(webp) = maple_import::preview::encode(&bytes) {
+            return Some((webp, false));
         }
         tracing::warn!(
             target: "maple::import::unreadable",
@@ -81,14 +92,14 @@ fn decode_photo(
     }
     for companion in &photo.companions {
         let Some(bytes) = read(companion) else { continue };
-        if let Ok((rgb, w, h)) = crate::thumbnail::render_bytes_to_rgb(&bytes, 256) {
+        if let Ok(webp) = maple_import::preview::encode(&bytes) {
             tracing::info!(
                 target: "maple::import::unreadable",
                 "preview recovered from {} because {} would not decode",
                 companion.display(),
                 photo.display.display()
             );
-            return Some((rgb, w, h, true));
+            return Some((webp, true));
         }
     }
     None
@@ -163,16 +174,10 @@ impl PreviewService {
                     }
                     let Some(photo) = photos.get(index) else { continue };
 
-                    let decoded = decode_photo(photo, budget, &reader);
-
-                    let msg = match decoded {
-                        Some((rgb, width, height, from_companion)) => PreviewMsg::Ready {
-                            index,
-                            rgb,
-                            width,
-                            height,
-                            from_companion,
-                        },
+                    let msg = match preview_photo(photo, budget, &reader) {
+                        Some((webp, from_companion)) => {
+                            PreviewMsg::Ready { index, webp, from_companion }
+                        }
                         None => PreviewMsg::Failed { index },
                     };
                     if tx.send(msg).is_err() {
@@ -384,9 +389,15 @@ mod tests {
         std::fs::write(path, b"\xff\xd8\xff\xe0 not actually a jpeg").unwrap();
     }
 
-    fn decode(display: PathBuf, companions: Vec<PathBuf>) -> Option<(Vec<u8>, u32, u32, bool)> {
+    /// Preview one photo and decode the result back, so a test can assert
+    /// on pixels while the service still returns only the canonical WebP.
+    fn preview(display: PathBuf, companions: Vec<PathBuf>) -> Option<(Vec<u8>, u32, u32, bool)> {
         let photo = PhotoRef { display, companions };
-        decode_photo(&photo, Duration::from_secs(5), &Mutex::new(()))
+        let (webp, from_companion) =
+            preview_photo(&photo, Duration::from_secs(5), &Mutex::new(()))?;
+        let frame = maple_import::preview::decode(&webp).expect("canonical preview must decode");
+        let (w, h) = frame.dimensions();
+        Some((frame.into_raw(), w, h, from_companion))
     }
 
     #[test]
@@ -395,7 +406,7 @@ mod tests {
         let png = dir.path().join("a.png");
         write_png(&png);
 
-        let (rgb, w, h, from_companion) = decode(png, vec![]).unwrap();
+        let (rgb, w, h, from_companion) = preview(png, vec![]).unwrap();
         assert!(!rgb.is_empty() && w > 0 && h > 0);
         assert!(!from_companion);
     }
@@ -410,7 +421,7 @@ mod tests {
         let companion = dir.path().join("DSCF0042-raw.png");
         write_png(&companion);
 
-        let (rgb, w, _, from_companion) = decode(jpg, vec![companion]).unwrap();
+        let (rgb, w, _, from_companion) = preview(jpg, vec![companion]).unwrap();
         assert!(from_companion, "the companion should have stood in");
         assert!(w > 0 && !rgb.is_empty());
     }
@@ -425,7 +436,7 @@ mod tests {
         let good = dir.path().join("DSCF0043-raw.png");
         write_png(&good);
 
-        let (_, _, _, from_companion) = decode(jpg, vec![junk, good]).unwrap();
+        let (_, _, _, from_companion) = preview(jpg, vec![junk, good]).unwrap();
         assert!(from_companion);
     }
 
@@ -435,7 +446,7 @@ mod tests {
         let jpg = dir.path().join("DSCF0044.jpg");
         write_corrupt_jpeg(&jpg);
 
-        assert!(decode(jpg, vec![]).is_none());
+        assert!(preview(jpg, vec![]).is_none());
     }
 
     // ── The service end to end ───────────────────────────────────
@@ -458,8 +469,8 @@ mod tests {
         let mut decoded = HashSet::new();
         for _ in 0..3 {
             match rx.recv_timeout(Duration::from_secs(10)).expect("preview") {
-                PreviewMsg::Ready { index, rgb, .. } => {
-                    assert!(!rgb.is_empty());
+                PreviewMsg::Ready { index, webp, .. } => {
+                    assert!(maple_import::preview::decode(&webp).is_ok());
                     decoded.insert(index);
                 }
                 PreviewMsg::Failed { index } => panic!("photo {index} failed to decode"),

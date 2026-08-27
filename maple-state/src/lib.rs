@@ -526,6 +526,92 @@ impl Default for SemanticSettings {
     }
 }
 
+/// Session detection settings — how an import scan decides where one
+/// sitting of photos ends and the next begins.
+///
+/// Stored under `[sessions]` in `settings.toml`.
+///
+/// This is *segmentation*, not clustering: the scan walks the card in
+/// capture order and asks, at each photo, whether the scene changed here.
+/// It replaces the DINOv2 burst grouping in the importer — that cost
+/// 26 ms/photo and throttled the whole scan through its embed queue, where
+/// these engines cost about 0.2 ms and ride along behind the card read.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionSettings {
+    /// Whether the import scan groups photos into sessions at all.
+    #[serde(default = "SessionSettings::default_enabled")]
+    pub enabled: bool,
+    /// Which engine decides "the scene changed": one name, or a weighted
+    /// ensemble like `"block-tile=2,grid-histogram=1,time-gap=1"`.
+    ///
+    /// Known names: `block-tile` (fraction of the frame that held still —
+    /// the one built for a moving subject in a fixed scene), `grid-histogram`
+    /// (colour and its layout), `color-kmeans` (palette only, blind to where
+    /// any of it is), `time-gap` (votes on the clock alone).
+    #[serde(default = "SessionSettings::default_engine")]
+    pub engine: String,
+    /// Distance above which the scene counts as changed. `0` means "use
+    /// whatever this engine considers its own threshold", which is the only
+    /// sane default because **engine distances are not comparable to each
+    /// other** — 0.35 means something different to every one of them.
+    #[serde(default)]
+    pub cut: f32,
+    /// A gap this long always ends a session, whatever the pixels say.
+    /// The one hard rule; everything else about time is a matter of degree.
+    #[serde(default = "SessionSettings::default_hard_gap_secs")]
+    pub hard_gap_secs: f32,
+    /// How many non-matching frames in a row a session may absorb before it
+    /// really has ended.
+    ///
+    /// One shot of the cake in the middle of twenty of the child is bridged
+    /// when the next frame comes back. When patience runs out the cut lands
+    /// *before* the first frame that stopped matching — that is where the
+    /// new scene actually started.
+    #[serde(default = "SessionSettings::default_max_outliers")]
+    pub max_outliers: usize,
+    /// How much further a photo may drift from the frame its session
+    /// *started* on than from its immediate neighbour. The anti-chaining
+    /// rule: without it a slow pan walks a session across a whole room one
+    /// tolerable step at a time.
+    #[serde(default = "SessionSettings::default_anchor_factor")]
+    pub anchor_factor: f32,
+}
+
+impl SessionSettings {
+    fn default_enabled() -> bool {
+        true
+    }
+
+    fn default_engine() -> String {
+        "block-tile=2,grid-histogram=1,time-gap=1".to_owned()
+    }
+
+    fn default_hard_gap_secs() -> f32 {
+        1800.0
+    }
+
+    fn default_max_outliers() -> usize {
+        1
+    }
+
+    fn default_anchor_factor() -> f32 {
+        1.8
+    }
+}
+
+impl Default for SessionSettings {
+    fn default() -> Self {
+        Self {
+            enabled: Self::default_enabled(),
+            engine: Self::default_engine(),
+            cut: 0.0,
+            hard_gap_secs: Self::default_hard_gap_secs(),
+            max_outliers: Self::default_max_outliers(),
+            anchor_factor: Self::default_anchor_factor(),
+        }
+    }
+}
+
 /// Stack detection settings.
 ///
 /// Stored under `[stacks]` in `settings.toml`.
@@ -688,6 +774,9 @@ pub struct Settings {
     /// Stack detection settings.
     #[serde(default)]
     pub stacks: StackSettings,
+    /// Import session detection settings.
+    #[serde(default)]
+    pub sessions: SessionSettings,
     /// Machine-local sync configuration. Role, device name and per-peer mode
     /// deliberately live in the database instead — see [`sync`].
     #[serde(default)]
@@ -781,6 +870,7 @@ impl Default for Settings {
             semantic: SemanticSettings::default(),
             thumbnails: ThumbnailSettings::default(),
             stacks: StackSettings::default(),
+            sessions: SessionSettings::default(),
             sync: SyncSettings::default(),
         }
     }

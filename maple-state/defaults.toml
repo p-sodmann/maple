@@ -136,6 +136,53 @@ quality = 80
 # Changing this clears the thumbnail cache automatically.
 size = 200
 
+# ── Session detection ───────────────────────────────────────────
+# During an import scan, photos are grouped into "sessions" — one sitting of
+# shooting, e.g. twenty pictures of a child in one room over four minutes.
+# This is segmentation, not clustering: the scan walks the card in capture
+# order and asks at each photo whether the scene changed *here*, so a session
+# has two ends and a slow pan cannot chain one into a 200-photo group.
+#
+# Tune these with the lab, which shows what each engine costs and where each
+# one cuts on your own photos:
+#   cargo run --release -p maple-db --bin session-lab -- <dir> --out /tmp/s.html
+
+[sessions]
+# Whether the import scan groups photos into sessions at all.
+enabled = true
+
+# Which engine decides "the scene changed". One name, or a weighted ensemble.
+#   block-tile      fraction of the frame that held still — built for a
+#                   moving subject in a fixed scene. Blind to colour.
+#   grid-histogram  colour and where it sits in the frame.
+#   color-kmeans    the palette only, blind to where any of it is.
+#   time-gap        votes on the clock alone, interpolated in log time.
+# The default weighs the two pixel engines that agree at 0.95 boundary-F1
+# against each other, plus the clock.
+engine = "block-tile=2,grid-histogram=1,time-gap=1"
+
+# Distance above which the scene counts as changed. 0 = use whatever this
+# engine considers its own threshold.
+#
+# Leave this at 0 unless you have tuned against your own photos. Engine
+# distances are NOT comparable to each other — 0.35 means something different
+# to every one of them, so a number carried over from another engine is
+# meaningless rather than merely wrong.
+cut = 0.0
+
+# A gap this long always ends a session, whatever the pixels say (seconds).
+hard_gap_secs = 1800.0
+
+# How many non-matching frames in a row a session may absorb before it really
+# has ended. One shot of the cake in the middle of twenty of the child is
+# bridged when the next frame comes back.
+max_outliers = 1
+
+# How much further a photo may drift from the frame its session *started* on
+# than from its immediate neighbour. The anti-chaining rule: without it a slow
+# pan walks a session across a whole room one tolerable step at a time.
+anchor_factor = 1.8
+
 # ── Stack detection ─────────────────────────────────────────────
 # After each import batch, newly copied images are compared using dense
 # DINOv2 vision embeddings and similar shots are grouped into stacks.  The
