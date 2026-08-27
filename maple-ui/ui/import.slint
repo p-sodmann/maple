@@ -30,6 +30,18 @@ export struct ImportTag {
     chosen: bool,
 }
 
+// One photo of the session the tournament is currently running, for the
+// strip under the two panes. The whole session is drawn, thrown-out
+// photos included — seeing what was rejected is half of why it is there.
+export struct TourneyCard {
+    index: int,
+    thumb: image,
+    has-thumb: bool,
+    filename: string,
+    // 0 still in the running, 1 on screen left, 2 on screen right, 3 out.
+    state: int,
+}
+
 export struct ImportItem {
     index: int,
     filename: string,
@@ -530,6 +542,139 @@ component ToggleSwitch inherits Rectangle {
     }
 }
 
+// The session under the two panes: what has been thrown out, what is
+// still in the running, and which two are on screen.
+//
+// A bracket only ever shows two photos at a time, which leaves the user
+// with no idea how far through a session of twenty they are or what they
+// have already rejected. This is that context, and it costs one strip.
+component TourneyStrip inherits Rectangle {
+    in property <[TourneyCard]> cards;
+
+    property <length> card-w: 74px;
+    property <length> pitch: 80px;
+
+    background: Theme.sidebar-bg;
+
+    ScrollView {
+        viewport-width: Math.max(self.visible-width, root.cards.length * root.pitch + 16px);
+        viewport-height: self.visible-height;
+
+        for c[i] in root.cards: Rectangle {
+            x: 8px + i * root.pitch;
+            y: 6px;
+            width: root.card-w;
+            height: parent.height - 12px;
+            border-radius: 6px;
+            border-width: c.state == 1 || c.state == 2 ? 2px : 1px;
+            border-color: c.state == 1 || c.state == 2
+                ? Theme.accent
+                : (c.state == 3 ? transparent : Theme.separator-color);
+            background: Theme.photo-surface;
+            clip: true;
+
+            if c.has-thumb: Image {
+                source: c.thumb;
+                image-fit: contain;
+                width: 100%;
+                height: 100%;
+                // Out of the running: still shown, plainly not in it.
+                opacity: c.state == 3 ? 0.22 : 1.0;
+            }
+
+            // Which pane this photo is in, said in the same characters as
+            // the keys that decide it.
+            if c.state == 1 || c.state == 2: Rectangle {
+                x: 3px;
+                y: 3px;
+                width: 16px;
+                height: 16px;
+                border-radius: 4px;
+                background: Theme.accent;
+                Text {
+                    text: c.state == 1 ? "L" : "R";
+                    color: Theme.accent-fg;
+                    font-size: 10px;
+                    font-weight: 700;
+                    horizontal-alignment: center;
+                    vertical-alignment: center;
+                }
+            }
+
+            if c.state == 3: Text {
+                text: "✕";
+                color: Theme.rejected;
+                font-size: 20px;
+                font-weight: 700;
+                horizontal-alignment: center;
+                vertical-alignment: center;
+            }
+        }
+    }
+}
+
+// Drags, scrolls and the pixel size of the thing being looked at, all
+// reported *up* rather than acted on here.
+//
+// One surface, two users: a tournament pane and the single-photo preview.
+// They ask the same question — is this frame sharp — at different arity,
+// and the zoom for both lives in Rust, so the only thing either view needs
+// from the pointer is where it went and how big the picture may be drawn.
+//
+// The size goes up through derived `int` properties rather than `changed
+// width` for the same reason `ImportGridView` watches `row-count`: a
+// `changed` handler is only as reliable as the property it is hung on, and
+// this one decides whether anything is drawn at all. `init` reports too,
+// because Slint does not fire `changed` for the value an element was born
+// with.
+component ZoomSurface inherits TouchArea {
+    // Drag by this many pane pixels; scroll by this many notches at this
+    // point of the surface (0..1 on each axis).
+    callback pan(length, length);
+    callback zoom-at(float, float, float);
+    callback resized(int, int);
+
+    // Both users put this over a plain Rectangle and mean "all of it".
+    // Said explicitly rather than left to the default, because the size
+    // reported below is the size everything is rendered to: a surface that
+    // came out 0x0 would not just miss clicks, it would make the view fall
+    // back to guessing its own dimensions from the window.
+    width: 100%;
+    height: 100%;
+
+    property <int> px-w: self.width / 1px;
+    property <int> px-h: self.height / 1px;
+    changed px-w => { root.resized(root.px-w, root.px-h); }
+    changed px-h => { root.resized(root.px-w, root.px-h); }
+    init => { root.resized(root.px-w, root.px-h); }
+
+    // Where the pointer was when the drag last reported, so `moved` can
+    // hand up a delta. `pressed-x` would give the distance from the press
+    // instead, which double-counts once the centre moves.
+    property <length> last-x;
+    property <length> last-y;
+    mouse-cursor: MouseCursor.grab;
+
+    pointer-event(e) => {
+        if (e.kind == PointerEventKind.down) {
+            self.last-x = self.mouse-x;
+            self.last-y = self.mouse-y;
+        }
+    }
+    moved => {
+        root.pan(self.mouse-x - self.last-x, self.mouse-y - self.last-y);
+        self.last-x = self.mouse-x;
+        self.last-y = self.mouse-y;
+    }
+    scroll-event(e) => {
+        root.zoom-at(
+            e.delta-y / 1px,
+            self.mouse-x / Math.max(1px, self.width),
+            self.mouse-y / Math.max(1px, self.height));
+        return accept;
+    }
+}
+
 // One contestant in the tournament.
 //
 // Pan and zoom are reported *up* rather than applied here, which is the
@@ -544,21 +689,11 @@ component TourneyPane inherits Rectangle {
     in property <string> hint;
     in property <bool> has-photo: true;
 
-    // Drag by this many pane pixels; scroll by this many notches at this
-    // point of the pane (0..1 on each axis).
+    // Straight through from the surface below: the pane holds no view
+    // state of its own.
     callback pan(length, length);
     callback zoom-at(float, float, float);
-    // The pane's size in pixels. Reported through derived `int` properties
-    // rather than `changed width` for the same reason `ImportGridView`
-    // watches `row-count`: a `changed` handler is only as reliable as the
-    // property it is hung on, and this one decides whether anything is
-    // drawn at all.
     callback resized(int, int);
-
-    property <int> px-w: self.width / 1px;
-    property <int> px-h: self.height / 1px;
-    changed px-w => { root.resized(root.px-w, root.px-h); }
-    changed px-h => { root.resized(root.px-w, root.px-h); }
 
     background: Theme.photo-surface;
     clip: true;
@@ -624,32 +759,10 @@ component TourneyPane inherits Rectangle {
         }
     }
 
-    ta := TouchArea {
-        // Where the pointer was when the drag last reported, so `moved`
-        // can hand up a delta. `pressed-x` would give the distance from
-        // the press instead, which double-counts once the centre moves.
-        property <length> last-x;
-        property <length> last-y;
-        mouse-cursor: MouseCursor.grab;
-
-        pointer-event(e) => {
-            if (e.kind == PointerEventKind.down) {
-                self.last-x = self.mouse-x;
-                self.last-y = self.mouse-y;
-            }
-        }
-        moved => {
-            root.pan(self.mouse-x - self.last-x, self.mouse-y - self.last-y);
-            self.last-x = self.mouse-x;
-            self.last-y = self.mouse-y;
-        }
-        scroll-event(e) => {
-            root.zoom-at(
-                e.delta-y / 1px,
-                self.mouse-x / Math.max(1px, self.width),
-                self.mouse-y / Math.max(1px, self.height));
-            return accept;
-        }
+    ZoomSurface {
+        pan(dx, dy) => { root.pan(dx, dy); }
+        zoom-at(d, fx, fy) => { root.zoom-at(d, fx, fy); }
+        resized(w, h) => { root.resized(w, h); }
     }
 }
 
@@ -679,6 +792,12 @@ export component ImportWindow inherits Window {
     in property <image> preview-photo;
     in property <bool> preview-loading: false;
     in property <string> preview-filename: "";
+    // How far into the single photo the view is, 1.0 being "fits the
+    // pane". Above that `preview-photo` is a crop off the original decode
+    // rendered to exactly this view's pixel size, not a magnified preview
+    // — the same arrangement the two tournament panes use, because it is
+    // the same judgement being made about one photo instead of two.
+    in property <float> preview-zoom-level: 1.0;
     in property <int> selected-count: 0;
     in property <int> total-count: 0;
     // How many of the scanned photos an earlier session already decided on.
@@ -705,6 +824,11 @@ export component ImportWindow inherits Window {
     // Only offered once there is something to compare — a scan that found
     // no group of two has no tournament to run.
     in property <bool> tourney-available: false;
+    // Whether a comparison is on screen *right now*. Not a mode the user
+    // switches into: it follows the cursor, so a photo in a session gets
+    // the two panes and a photo in none gets the ordinary single view,
+    // along one walk through the card.
+    in property <bool> tourney-active: false;
     in property <image> tourney-left;
     in property <image> tourney-right;
     in property <bool> tourney-left-shown: false;
@@ -713,6 +837,12 @@ export component ImportWindow inherits Window {
     in property <string> tourney-right-name: "";
     in property <string> tourney-left-meta: "";
     in property <string> tourney-right-meta: "";
+    // The session on screen: every photo of it, with what each is doing.
+    in property <[TourneyCard]> tourney-group;
+    // How many of that session are still in the running, and which round
+    // of it is being played.
+    in property <int> tourney-alive: 0;
+    in property <int> tourney-session-round: 0;
     // Photos decided out of photos covered, and which session of how many.
     in property <int> tourney-done: 0;
     in property <int> tourney-total: 0;
@@ -721,14 +851,10 @@ export component ImportWindow inherits Window {
     // 1.0 is "fits the pane"; above that the panes are showing a crop of
     // the original decode, not a magnified preview.
     in property <float> tourney-zoom-level: 1.0;
-    // Nothing left to compare: either the pass is done or it never had a
-    // pair. `tourney-note` says which.
-    in property <bool> tourney-idle: true;
     // Whether the last verdict can still be taken back. Every keystroke
     // here decides a photo for good and `1` and `2` are one key apart, so
     // the way out has to be visible rather than folklore.
     in property <bool> tourney-can-undo: false;
-    in property <string> tourney-note: "";
 
     // Which session the current photo sits in, so the grid can pick it out
     // of the bands. -1 when nothing was detected.
@@ -768,6 +894,14 @@ export component ImportWindow inherits Window {
     callback item-clicked(int);
     // Rows on screen (inclusive) and the row at its centre.
     callback preview-window(int, int, int);
+    // The single-photo view's own pan, zoom and pixel size. Same three
+    // signals as the tournament's, and the same reason they leave the
+    // markup: the crop is cut in Rust at exactly the size reported here,
+    // so a zoomed pixel is never a resampled resample.
+    callback preview-pan(length, length);
+    callback preview-zoom(float, float, float);
+    callback preview-view(int, int);
+    callback preview-reset-zoom();
     callback toggle-hide-old();
     // Show or hide the `f` grid.
     callback toggle-grid();
@@ -786,6 +920,8 @@ export component ImportWindow inherits Window {
     // 1 = keep left, 2 = keep right, 3 = keep both.
     callback tourney-verdict(int);
     callback tourney-undo();
+    // End this session here and keep whoever is still standing.
+    callback tourney-keep-rest();
     // The pane's size in pixels — Rust renders the crop at exactly this
     // size, so it has to be told when the window changes shape.
     callback tourney-view(int, int);
@@ -835,13 +971,6 @@ export component ImportWindow inherits Window {
                     root.toggle-grid();
                     return accept;
                 }
-                // Same reading one level out: the tournament is a mode,
-                // and "get me out of this" means the mode, not the whole
-                // window with the triage pass inside it.
-                if root.tourney-on {
-                    root.toggle-tournament();
-                    return accept;
-                }
                 root.close-requested();
                 return accept;
             }
@@ -854,12 +983,16 @@ export component ImportWindow inherits Window {
                 // "current photo" for `x` to mark, so letting those keys
                 // fire behind it would silently mark whatever the strip
                 // had been left on.
-                if root.tourney-on && !root.grid-open {
+                if root.tourney-active {
                     if event.text == "1" { root.tourney-verdict(1); return accept; }
                     if event.text == "2" { root.tourney-verdict(2); return accept; }
                     if event.text == "3" { root.tourney-verdict(3); return accept; }
                     if event.text == "u" || event.text == "U" {
                         root.tourney-undo();
+                        return accept;
+                    }
+                    if event.text == "k" || event.text == "K" {
+                        root.tourney-keep-rest();
                         return accept;
                     }
                     if event.text == "0" { root.tourney-reset-zoom(); return accept; }
@@ -872,18 +1005,36 @@ export component ImportWindow inherits Window {
                         return accept;
                     }
                 }
+                // The same three keys over one photo. A comparison and a
+                // single photo are the same question at different arity,
+                // so the zoom must not disappear when the cursor walks out
+                // of a session — which is exactly what it did while the
+                // only zoom in the window belonged to the panes.
+                if !root.tourney-active && !root.grid-open {
+                    if event.text == "0" { root.preview-reset-zoom(); return accept; }
+                    if event.text == "+" || event.text == "=" {
+                        root.preview-zoom(3, 0.5, 0.5);
+                        return accept;
+                    }
+                    if event.text == "-" || event.text == "_" {
+                        root.preview-zoom(-3, 0.5, 0.5);
+                        return accept;
+                    }
+                }
+                // Arrows still navigate during a comparison — Rust steps
+                // over the whole session rather than photo by photo inside
+                // it, which is the only way past a session the user does
+                // not want to judge right now.
                 if event.text == Key.LeftArrow || event.text == Key.UpArrow {
-                    if root.tourney-on && !root.grid-open { return accept; }
                     root.nav-prev();
                     return accept;
                 }
                 if event.text == Key.RightArrow || event.text == Key.DownArrow {
-                    if root.tourney-on && !root.grid-open { return accept; }
                     root.nav-next();
                     return accept;
                 }
                 if event.text == "x" || event.text == "X" {
-                    if root.tourney-on && !root.grid-open { return accept; }
+                    if root.tourney-active { return accept; }
                     root.item-clicked(root.current-index);
                     return accept;
                 }
@@ -1156,22 +1307,10 @@ export component ImportWindow inherits Window {
             // sharper", and that needs both frames as big as the window
             // can make them. There is no filmstrip beside it because there
             // is nothing to navigate: the pass decides the order.
-            if root.in-browser && !root.grid-open && root.tourney-on: VerticalLayout {
+            if root.in-browser && !root.grid-open && root.tourney-active: VerticalLayout {
                 vertical-stretch: 1;
 
-                if root.tourney-idle: Rectangle {
-                    vertical-stretch: 1;
-                    background: Theme.photo-surface;
-                    Text {
-                        text: root.tourney-note;
-                        color: Theme.dim-fg;
-                        font-size: 14px;
-                        horizontal-alignment: center;
-                        vertical-alignment: center;
-                    }
-                }
-
-                if !root.tourney-idle: HorizontalLayout {
+                HorizontalLayout {
                     vertical-stretch: 1;
                     spacing: 2px;
 
@@ -1205,6 +1344,11 @@ export component ImportWindow inherits Window {
                     }
                 }
 
+                TourneyStrip {
+                    height: 92px;
+                    cards: root.tourney-group;
+                }
+
                 Rectangle {
                     height: 30px;
                     background: Theme.card-bg;
@@ -1214,17 +1358,15 @@ export component ImportWindow inherits Window {
                         spacing: 16px;
 
                         Text {
-                            text: root.tourney-idle
-                                ? "\{root.tourney-done} decided"
-                                : "session \{root.tourney-round} / \{root.tourney-rounds}  ·  \{root.tourney-done} / \{root.tourney-total} decided";
+                            text: "session \{root.tourney-round} / \{root.tourney-rounds}  ·  round \{root.tourney-session-round}, \{root.tourney-alive} still in  ·  \{root.tourney-done} / \{root.tourney-total} decided";
                             color: Theme.dim-fg;
                             font-size: 12px;
                             vertical-alignment: center;
                         }
                         Text {
                             text: root.tourney-can-undo
-                                ? "1  keep left      2  keep right      3  keep both      u  undo      scroll  zoom      drag  pan      0  fit"
-                                : "1  keep left      2  keep right      3  keep both      scroll  zoom      drag  pan      0  fit";
+                                ? "1  left      2  right      3  both      k  keep the rest      u  undo      → skip session      scroll  zoom      0  fit"
+                                : "1  left      2  right      3  both      k  keep the rest      → skip session      scroll  zoom      0  fit";
                             color: Theme.dim-fg;
                             font-size: 12px;
                             vertical-alignment: center;
@@ -1243,7 +1385,7 @@ export component ImportWindow inherits Window {
                 }
             }
 
-            if root.in-browser && !root.grid-open && !root.tourney-on: HorizontalLayout {
+            if root.in-browser && !root.grid-open && !root.tourney-active: HorizontalLayout {
                 vertical-stretch: 1;
                 spacing: 0;
 
@@ -1268,6 +1410,16 @@ export component ImportWindow inherits Window {
                             image-fit: contain;
                             width: 100%;
                             height: 100%;
+                        }
+
+                        // The same surface the tournament's panes use, on
+                        // the photo area alone rather than the whole
+                        // column: this is the rectangle the crop is cut
+                        // to, so it is the one whose size Rust needs.
+                        ZoomSurface {
+                            pan(dx, dy) => { root.preview-pan(dx, dy); }
+                            zoom-at(d, fx, fy) => { root.preview-zoom(d, fx, fy); }
+                            resized(w, h) => { root.preview-view(w, h); }
                         }
                     }
 
@@ -1331,6 +1483,16 @@ export component ImportWindow inherits Window {
                                 text: "↻";
                                 enabled: !root.rotating;
                                 clicked => { root.rotate(true); }
+                            }
+                            // Said only while there is something to say:
+                            // at fit the photo is simply the photo, and a
+                            // permanent "1×" would be one more thing on
+                            // screen meaning nothing. `0` puts it back.
+                            if root.preview-zoom-level > 1.01: Text {
+                                text: "\{Math.round(root.preview-zoom-level * 10) / 10}×";
+                                color: Theme.dim-fg;
+                                font-size: 12px;
+                                vertical-alignment: center;
                             }
                         }
                     }

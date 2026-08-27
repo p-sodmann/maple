@@ -399,6 +399,20 @@ struct ImportCtx {
     /// it holds two full decodes.
     pair_renderer: Rc<RefCell<Option<crate::import_tournament::PairRenderer>>>,
     pair_timer: Rc<RefCell<Option<Timer>>>,
+    /// The single-photo preview's own zoom and pan — the same feature at
+    /// arity one, and deliberately *not* the same state: a session's twenty
+    /// frames are framed alike so the pair's zoom carries across them,
+    /// while the next photo in the strip is a new question.
+    solo_view: Rc<RefCell<SoloView>>,
+    /// Cuts the single view's crop off the original. Spawned by the first
+    /// scroll notch rather than with the window, because at fit nothing
+    /// here is used and a decode is 34 MB.
+    solo_renderer: Rc<RefCell<Option<crate::import_tournament::PairRenderer>>>,
+    solo_timer: Rc<RefCell<Option<Timer>>>,
+    /// Thumbnails for the session strip, and which session they belong to.
+    /// A verdict repaints the badges, not the pictures.
+    tourney_thumbs: Rc<RefCell<HashMap<usize, slint::Image>>>,
+    tourney_group_of: Rc<Cell<Option<usize>>>,
     /// The tags every photo marked from *now on* will carry.
     ///
     /// A brush, not a batch setting: it survives a copy, changes mid-pass,
@@ -526,6 +540,11 @@ fn build(db: Arc<Mutex<maple_db::Database>>) -> Result<Import, slint::PlatformEr
         pair_view: Rc::new(RefCell::new(PairView::default())),
         pair_renderer: Rc::new(RefCell::new(None)),
         pair_timer: Rc::new(RefCell::new(None)),
+        solo_view: Rc::new(RefCell::new(SoloView::default())),
+        solo_renderer: Rc::new(RefCell::new(None)),
+        solo_timer: Rc::new(RefCell::new(None)),
+        tourney_thumbs: Rc::new(RefCell::new(HashMap::new())),
+        tourney_group_of: Rc::new(Cell::new(None)),
         brush: Rc::new(RefCell::new(Vec::new())),
         brushed: Rc::new(RefCell::new(HashMap::new())),
         scan_timer: Rc::new(RefCell::new(None)),
@@ -541,6 +560,7 @@ fn build(db: Arc<Mutex<maple_db::Database>>) -> Result<Import, slint::PlatformEr
     wire_rotate(&window, &ctx);
     wire_tags(&window, &ctx);
     wire_tournament(&window, &ctx);
+    wire_preview_zoom(&window, &ctx);
 
     Ok(Import { window, ctx })
 }
@@ -646,6 +666,7 @@ fn wire_scan(window: &ImportWindow, ctx: &ImportCtx) {
             w.set_scanning(true);
             w.set_preview_photo(slint::Image::default());
             w.set_preview_filename(SharedString::default());
+            reset_solo(&w, &ctx);
             w.set_status_text("Scanning…".into());
             w.set_in_browser(true);
 
@@ -686,6 +707,8 @@ fn wire_scan(window: &ImportWindow, ctx: &ImportCtx) {
             w.set_tourney_available(false);
             w.set_tourney_on(false);
             stop_pair_renderer(&ctx);
+            ctx.tourney_thumbs.borrow_mut().clear();
+            ctx.tourney_group_of.set(None);
             w.set_old_count(0);
             w.set_preview_state(0);
 
@@ -1705,7 +1728,7 @@ fn apply_scan_thumb(w: &ImportWindow, ctx: &ImportCtx, msg: ScanThumb) {
                 .unwrap_or_default()
                 .into(),
         );
-        show_preview(w, &ctx.entries, 0);
+        show_preview(w, ctx, 0);
     }
 }
 
@@ -1981,11 +2004,7 @@ fn wire_browse(window: &ImportWindow, ctx: &ImportCtx) {
             if let Some(prev) = ctx.preview_shown_idx.get() {
                 leave(&ctx, prev);
             }
-            set_current(&w, &ctx, idx);
-            ctx.preview_shown_idx.set(Some(idx));
-
-            show_preview(&w, &ctx.entries, idx);
-            set_preview_state(&w, &ctx, idx);
+            go_to(&w, &ctx, idx);
         }
     });
 
@@ -2000,6 +2019,23 @@ fn wire_browse(window: &ImportWindow, ctx: &ImportCtx) {
             }
             let cur = ctx.current.get();
 
+            // An arrow during a comparison steps over the whole session,
+            // not photo by photo inside it — the session is the unit the
+            // user is looking at. It is a *deferral*: nothing in it is
+            // marked passed, because moving on from a question is not the
+            // same as answering it, and the session is still waiting if
+            // they come back.
+            if w.get_tourney_active() {
+                let target = skip_group(&ctx, cur, delta, len);
+                if let Some(idx) = target {
+                    if let Some(t) = ctx.tournament.borrow_mut().as_mut() {
+                        t.leave();
+                    }
+                    go_to(&w, &ctx, idx);
+                }
+                return;
+            }
+
             let new_idx = nav_visible_target(
                 &ctx.groups.borrow(),
                 &ctx.visible.borrow(),
@@ -2012,11 +2048,7 @@ fn wire_browse(window: &ImportWindow, ctx: &ImportCtx) {
                 return;
             }
             leave(&ctx, cur);
-            set_current(&w, &ctx, new_idx);
-            ctx.preview_shown_idx.set(Some(new_idx));
-
-            show_preview(&w, &ctx.entries, new_idx);
-            set_preview_state(&w, &ctx, new_idx);
+            go_to(&w, &ctx, new_idx);
         }
     };
     window.on_preview_window({
@@ -2216,8 +2248,12 @@ fn nav_target(groups: &[Vec<usize>], cur: usize, len: usize, delta: i32) -> usiz
 
 /// Show entry `idx` in the big preview: filename and the already-decoded
 /// grid thumb immediately, then a higher-res render from a worker thread.
-fn show_preview(w: &ImportWindow, entries: &Rc<RefCell<Vec<Entry>>>, idx: usize) {
-    let ents = entries.borrow();
+fn show_preview(w: &ImportWindow, ctx: &ImportCtx, idx: usize) {
+    // A different photo is a different question, so the zoom starts over —
+    // and the ordinary fit render below is what will answer it, which is
+    // why this has to happen before anything is put on screen.
+    reset_solo(w, ctx);
+    let ents = ctx.entries.borrow();
     if let Some(e) = ents.get(idx) {
         let filename = e
             .path
@@ -2232,11 +2268,24 @@ fn show_preview(w: &ImportWindow, entries: &Rc<RefCell<Vec<Entry>>>, idx: usize)
         // Kick off a higher-res preview load.
         let path = e.path.clone();
         let w_weak = w.as_weak();
+        let shown = idx as i32;
         w.set_preview_loading(true);
         std::thread::spawn(move || {
             let result = thumbnail::render_to_rgb(&path, 1200);
             let _ = slint::invoke_from_event_loop(move || {
                 let Some(w) = w_weak.upgrade() else { return };
+                // This render describes the whole photo at fit. Two things
+                // can have happened while it was being made, and both mean
+                // painting it now would put the wrong picture up: the user
+                // has stepped to another photo, or zoomed into this one and
+                // is looking at a crop off the original. Neither is
+                // reachable from this thread, so both are read back off the
+                // window rather than from the context, which is `Rc` and
+                // cannot cross.
+                if w.get_current_index() != shown || w.get_preview_zoom_level() > 1.0 {
+                    w.set_preview_loading(false);
+                    return;
+                }
                 if let Ok((rgb, pw, ph)) = result {
                     let buf =
                         slint::SharedPixelBuffer::<slint::Rgb8Pixel>::clone_from_slice(
@@ -2250,6 +2299,309 @@ fn show_preview(w: &ImportWindow, entries: &Rc<RefCell<Vec<Entry>>>, idx: usize)
     }
 }
 
+// ── The single photo's zoom ───────────────────────────────────────
+//
+// A comparison and a single photo ask the same question — is *this* frame
+// sharp — so the zoom cannot be something only the tournament has. It is
+// the same feature at arity one, and it is built out of the same parts:
+// the geometry in [`crate::import_tournament`] (`crop_for`, `zoom_at`,
+// `clamp_center`), the same renderer keeping one decode alive, one side of
+// it used. Sharing the markup too — the `ZoomSurface` both views hang the
+// pointer off — is what keeps a drag meaning the same thing in both.
+//
+// What is deliberately not shared is the *state*. The pair's zoom survives
+// across a session because twenty frames of one child are framed alike, so
+// re-zooming onto the eyes nineteen times is tedium. Stepping along the
+// filmstrip is the opposite move: the next photo is a new question, so the
+// view resets to fit — which is also what stops a walk through a card from
+// holding a 34 MB decode of everything it passed.
+//
+// At fit none of this runs at all: `preview-photo` is the ordinary 1200 px
+// render and no original is decoded. The first scroll notch out of fit
+// spawns the renderer, and from then until the photo changes every frame
+// on screen is a crop cut to the view's exact pixel size.
+
+/// The single view's zoom, pan and pixel size.
+struct SoloView {
+    /// The photo area's size in pixels — the crop is rendered to exactly
+    /// this, never scaled by Slint afterwards.
+    view_w: u32,
+    view_h: u32,
+    /// 1.0 is "the whole photo fits the view".
+    zoom: f32,
+    /// Wanted centre, in normalised source coordinates.
+    cx: f32,
+    cy: f32,
+    /// Bumped on every change; a render carrying an older token is dropped
+    /// rather than painted over a newer one.
+    token: u64,
+    /// The dimensions of *some* copy of the photo on screen: the canonical
+    /// preview's until a crop has come back, the capped decode's after.
+    /// Either will do, because the geometry is all ratios — a scaled copy
+    /// gives the same normalised centre the original would — and having one
+    /// from the start is what lets the very first notch zoom towards the
+    /// pointer instead of guessing the middle.
+    src: (u32, u32),
+}
+
+impl Default for SoloView {
+    fn default() -> Self {
+        SoloView { view_w: 0, view_h: 0, zoom: 1.0, cx: 0.5, cy: 0.5, token: 0, src: (0, 0) }
+    }
+}
+
+impl SoloView {
+    fn fit(&mut self) {
+        self.zoom = 1.0;
+        self.cx = 0.5;
+        self.cy = 0.5;
+        self.src = (0, 0);
+    }
+}
+
+fn wire_preview_zoom(window: &ImportWindow, ctx: &ImportCtx) {
+    // The photo area changed size — a window resize, or the view appearing
+    // for the first time. Everything zoomed is rendered *to* that number.
+    window.on_preview_view({
+        let ctx = ctx.clone();
+        move |pw, ph| {
+            let (pw, ph) = (pw.max(0) as u32, ph.max(0) as u32);
+            {
+                let mut v = ctx.solo_view.borrow_mut();
+                if (v.view_w, v.view_h) == (pw, ph) || pw == 0 || ph == 0 {
+                    return;
+                }
+                v.view_w = pw;
+                v.view_h = ph;
+            }
+            request_solo(&ctx);
+        }
+    });
+
+    window.on_preview_pan({
+        let ctx = ctx.clone();
+        move |dx, dy| {
+            {
+                let mut v = ctx.solo_view.borrow_mut();
+                let (sw, sh) = v.src;
+                // At fit there is nothing to pan, and no photo means no
+                // scale to turn view pixels into source pixels with.
+                if v.zoom <= 1.0 || sw == 0 || sh == 0 || v.view_w == 0 {
+                    return;
+                }
+                let fit = (v.view_w as f32 / sw as f32).min(v.view_h as f32 / sh as f32);
+                let scale = fit * v.zoom;
+                // Dragging right moves the picture right, so the window
+                // into it moves left.
+                let (cx, cy) = (v.cx - dx / (scale * sw as f32), v.cy - dy / (scale * sh as f32));
+                let (cx, cy) =
+                    import_tournament::clamp_center(sw, sh, v.view_w, v.view_h, v.zoom, cx, cy);
+                if (cx, cy) == (v.cx, v.cy) {
+                    return;
+                }
+                v.cx = cx;
+                v.cy = cy;
+            }
+            request_solo(&ctx);
+        }
+    });
+
+    window.on_preview_zoom({
+        let ctx = ctx.clone();
+        move |delta, fx, fy| {
+            let Some(w) = ctx.window.upgrade() else { return };
+            // The canonical preview is on screen and its aspect is the
+            // photo's, so the first notch can honour the pointer — see
+            // `SoloView::src`.
+            let seed = preview_src(ctx.entries.borrow().get(ctx.current.get()));
+            {
+                let mut v = ctx.solo_view.borrow_mut();
+                if v.src == (0, 0) {
+                    v.src = seed;
+                }
+                // Same clamp as the pair: a trackpad reports many small
+                // deltas and a wheel a few large ones, and one flick must
+                // not jump from fit to maximum.
+                let notches = (delta / 50.0).clamp(-1.5, 1.5);
+                let next = (v.zoom * 1.35f32.powf(notches)).clamp(1.0, MAX_ZOOM);
+                if (next - v.zoom).abs() < 0.001 {
+                    return;
+                }
+                let (sw, sh) = v.src;
+                let (cx, cy) = if sw == 0 || sh == 0 || v.view_w == 0 {
+                    (0.5, 0.5)
+                } else {
+                    import_tournament::zoom_at(
+                        sw, sh, v.view_w, v.view_h, v.zoom, v.cx, v.cy, next, fx, fy,
+                    )
+                };
+                v.zoom = next;
+                v.cx = cx;
+                v.cy = cy;
+            }
+            start_solo_renderer(&ctx);
+            publish_solo_zoom(&w, &ctx);
+            request_solo(&ctx);
+        }
+    });
+
+    // Back to the whole photo. The crop comes from the same renderer at
+    // zoom 1 rather than falling back to the 1200 px render: it is the
+    // same picture off a better decode, and one code path either way.
+    window.on_preview_reset_zoom({
+        let ctx = ctx.clone();
+        move || {
+            let Some(w) = ctx.window.upgrade() else { return };
+            if ctx.solo_view.borrow().zoom <= 1.0 {
+                return;
+            }
+            ctx.solo_view.borrow_mut().fit();
+            publish_solo_zoom(&w, &ctx);
+            request_solo(&ctx);
+        }
+    });
+}
+
+/// The dimensions of the canonical preview already on screen for `e`.
+///
+/// Only its *aspect* is used, so the 256 px copy answers as well as the
+/// original would — and it is in memory, which the original is not.
+fn preview_src(e: Option<&Entry>) -> (u32, u32) {
+    let Some(size) = e.and_then(|e| e.thumb.as_ref()).map(|t| t.size()) else {
+        return (0, 0);
+    };
+    if size.width == 0 || size.height == 0 {
+        return (0, 0);
+    }
+    (size.width, size.height)
+}
+
+/// Back to fit, and let go of the photo that was being cut out of.
+///
+/// Called on every navigation, and whenever the photo changes under the
+/// view. Dropping the renderer here is what makes "the renderer is up" mean
+/// exactly "the user is zoomed into the photo in front of them": the 34 MB
+/// decode is freed on the next arrow key rather than riding along the card,
+/// and nothing can serve a crop of a file that has since been rewritten.
+fn reset_solo(w: &ImportWindow, ctx: &ImportCtx) {
+    let was_zoomed = ctx.solo_view.borrow().zoom > 1.0;
+    ctx.solo_view.borrow_mut().fit();
+    stop_solo_renderer(ctx);
+    if was_zoomed {
+        publish_solo_zoom(w, ctx);
+    }
+}
+
+fn publish_solo_zoom(w: &ImportWindow, ctx: &ImportCtx) {
+    w.set_preview_zoom_level(ctx.solo_view.borrow().zoom);
+}
+
+/// Spawn the renderer and the timer that drains it, if they are not up.
+///
+/// Idempotent, and called from the zoom handler rather than when the window
+/// opens: a decode is 34 MB and a card can be triaged end to end without
+/// anyone ever zooming.
+fn start_solo_renderer(ctx: &ImportCtx) {
+    if ctx.solo_renderer.borrow().is_some() {
+        return;
+    }
+    let (tx, rx) = mpsc::channel::<PaneMsg>();
+    *ctx.solo_renderer.borrow_mut() = Some(import_tournament::PairRenderer::spawn(tx));
+
+    let ctx2 = ctx.clone();
+    let timer = Timer::default();
+    timer.start(TimerMode::Repeated, Duration::from_millis(16), move || {
+        let Some(w) = ctx2.window.upgrade() else { return };
+        while let Ok(msg) = rx.try_recv() {
+            apply_solo(&w, &ctx2, msg);
+        }
+    });
+    *ctx.solo_timer.borrow_mut() = Some(timer);
+}
+
+/// Drop the renderer, and with it the decode it is holding.
+fn stop_solo_renderer(ctx: &ImportCtx) {
+    ctx.solo_renderer.borrow_mut().take();
+    ctx.solo_timer.borrow_mut().take();
+}
+
+/// Ask for the current photo at the current zoom.
+///
+/// Silent while no renderer is up, which is the whole of "at fit this
+/// feature costs nothing": no renderer means nobody has zoomed this photo,
+/// the fit picture from `show_preview` is already on screen, and no
+/// original has been opened. After a `0` it does run: the renderer is still
+/// up, so the whole photo is redrawn off the decode already in its cache,
+/// which is a resize and not a second decode.
+fn request_solo(ctx: &ImportCtx) {
+    let path = {
+        let ents = ctx.entries.borrow();
+        match ents.get(ctx.current.get()) {
+            Some(e) => e.path.clone(),
+            None => return,
+        }
+    };
+    let Some(w) = ctx.window.upgrade() else { return };
+    let size = w.window().size();
+    let scale = w.window().scale_factor().max(0.1);
+    let logical = (
+        (size.width as f32 / scale) as u32,
+        (size.height as f32 / scale) as u32,
+    );
+    let (token, view_w, view_h, zoom, cx, cy) = {
+        let mut v = ctx.solo_view.borrow_mut();
+        let (view_w, view_h) = solo_size(logical, v.view_w, v.view_h);
+        v.token += 1;
+        (v.token, view_w, view_h, v.zoom, v.cx, v.cy)
+    };
+    let guard = ctx.solo_renderer.borrow();
+    let Some(renderer) = guard.as_ref() else { return };
+    // One photo, so one side: `Side::Right` is never asked for, and the
+    // cache behind it holds exactly one decode, because the renderer does
+    // not outlive the photo it was started on.
+    renderer.request(PaneRequest { side: Side::Left, token, path, view_w, view_h, zoom, cx, cy });
+}
+
+/// The photo area's size, from the view when it has reported one.
+///
+/// Same fallback as [`pane_size`] and for the same reason: everything is
+/// rendered *to* this number, so a report that never arrived must not leave
+/// the view blank. The single photo gets the window less the 280 px
+/// filmstrip and the header and caption bars.
+fn solo_size(window: (u32, u32), reported_w: u32, reported_h: u32) -> (u32, u32) {
+    if reported_w > 0 && reported_h > 0 {
+        return (reported_w, reported_h);
+    }
+    const STRIP_W: u32 = 281;
+    const CHROME_H: u32 = 46 + 36;
+    (
+        window.0.saturating_sub(STRIP_W).max(1),
+        window.1.saturating_sub(CHROME_H).max(1),
+    )
+}
+
+fn apply_solo(w: &ImportWindow, ctx: &ImportCtx, msg: PaneMsg) {
+    match msg {
+        PaneMsg::Ready { token, rgb, w: pw, h: ph, src_w, src_h, .. } => {
+            // A render of a viewport the user has already left must not
+            // land on top of a newer one.
+            if token != ctx.solo_view.borrow().token {
+                return;
+            }
+            ctx.solo_view.borrow_mut().src = (src_w, src_h);
+            let buf = slint::SharedPixelBuffer::<slint::Rgb8Pixel>::clone_from_slice(&rgb, pw, ph);
+            w.set_preview_photo(slint::Image::from_rgb8(buf));
+            w.set_preview_loading(false);
+        }
+        // The card's copy of this photo would not decode. Whatever is on
+        // screen stays there — at fit that is the right picture, and zoomed
+        // it is the right picture at the wrong scale, which beats a blank.
+        PaneMsg::Failed { token, .. } => {
+            tracing::warn!(target: "maple::import::preview", "solo render token {token} failed");
+        }
+    }
+}
+
 // ── The tournament ────────────────────────────────────────────────
 //
 // Nothing on a card is preselected any more. The keeper of a session is
@@ -2259,7 +2611,9 @@ fn show_preview(w: &ImportWindow, entries: &Rc<RefCell<Vec<Entry>>>, idx: usize)
 // verdict keys, the shared zoom, and the renderer that keeps two decodes
 // alive so a crop comes off the original rather than a 256 px preview.
 
-use crate::import_tournament::{self, PaneMsg, PaneRequest, Side, Tournament, Verdict, MAX_ZOOM};
+use crate::import_tournament::{
+    self, PaneMsg, PaneRequest, Side, Tournament, Verdict, MAX_ZOOM,
+};
 
 /// The shared view state of the two panes.
 struct PairView {
@@ -2331,9 +2685,13 @@ fn wire_tournament(window: &ImportWindow, ctx: &ImportCtx) {
                 rebuild_tournament(&w, &ctx);
             } else {
                 stop_pair_renderer(&ctx);
+                if let Some(t) = ctx.tournament.borrow_mut().as_mut() {
+                    t.leave();
+                }
                 // Verdicts landed on rows the strip was not showing, and
                 // some of those photos are now marked or passed over.
                 refilter(&w, &ctx);
+                go_to(&w, &ctx, ctx.current.get());
             }
         }
     });
@@ -2352,6 +2710,34 @@ fn wire_tournament(window: &ImportWindow, ctx: &ImportCtx) {
         move || {
             let Some(w) = ctx.window.upgrade() else { return };
             undo_verdict(&w, &ctx);
+        }
+    });
+
+    // "These are all fine, move on." Grinding through the remaining rounds
+    // to say that would be theatre — and it is the only thing that bounds
+    // a session answered `3` all the way down, which runs to the complete
+    // graph.
+    window.on_tourney_keep_rest({
+        let ctx = ctx.clone();
+        move || {
+            let Some(w) = ctx.window.upgrade() else { return };
+            let (decision, was) = {
+                let mut guard = ctx.tournament.borrow_mut();
+                let Some(t) = guard.as_mut() else { return };
+                let was = t.round();
+                (t.keep_rest(), was)
+            };
+            if !decision.acted {
+                return;
+            }
+            settle_marks(
+                &mut ctx.entries.borrow_mut(),
+                &mut ctx.selected.borrow_mut(),
+                &mut ctx.brushed.borrow_mut(),
+                &ctx.brush.borrow(),
+                &decision.settled,
+            );
+            finish_verdict(&w, &ctx, was, decision.session_done, decision.settled.iter().map(|&(i, _)| i));
         }
     });
 
@@ -2539,32 +2925,116 @@ fn rebuild_tournament(w: &ImportWindow, ctx: &ImportCtx) {
     };
     *ctx.tournament.borrow_mut() = Some(t);
     ctx.pair_view.borrow_mut().fit();
+    ctx.tourney_thumbs.borrow_mut().clear();
+    ctx.tourney_group_of.set(None);
     publish_zoom(ctx);
-    publish_tournament(w, ctx);
+    follow_cursor(w, ctx);
+}
+
+/// Point the window at entry `idx` and show whatever that photo calls for.
+///
+/// The one way the cursor moves. Which view appears is not the caller's
+/// business — a photo in a live session gets the two panes, anything else
+/// gets the single preview — so every navigation path goes through here and
+/// none of them has to know the tournament exists.
+fn go_to(w: &ImportWindow, ctx: &ImportCtx, idx: usize) {
+    set_current(w, ctx, idx);
+    ctx.preview_shown_idx.set(Some(idx));
+    if !follow_cursor(w, ctx) {
+        show_preview(w, ctx, idx);
+        set_preview_state(w, ctx, idx);
+    }
+}
+
+/// The first visible photo beyond `cur`'s session, in the direction of
+/// `delta`. `None` when there is nothing that way.
+fn skip_group(ctx: &ImportCtx, cur: usize, delta: i32, len: usize) -> Option<usize> {
+    let (first, last) = {
+        let groups = ctx.groups.borrow();
+        match find_group(&groups, cur) {
+            Some(g) => (g.first().copied().unwrap_or(cur), g.last().copied().unwrap_or(cur)),
+            None => (cur, cur),
+        }
+    };
+    let visible = ctx.visible.borrow();
+    if delta > 0 {
+        (last + 1..len).find(|&i| visible.shows(i))
+    } else {
+        (0..first).rev().find(|&i| visible.shows(i))
+    }
+}
+
+/// The first photo after `idx`'s session that the strip is showing.
+///
+/// Where the cursor lands when a session runs out of questions. `None` at
+/// the end of the card, where there is nowhere to go.
+fn after_group(ctx: &ImportCtx, idx: usize) -> Option<usize> {
+    let last = {
+        let groups = ctx.groups.borrow();
+        find_group(&groups, idx).and_then(|g| g.last().copied()).unwrap_or(idx)
+    };
+    let n = ctx.entries.borrow().len();
+    let visible = ctx.visible.borrow();
+    (last + 1..n).find(|&i| visible.shows(i))
+}
+
+/// Show whatever the photo under the cursor calls for.
+///
+/// The single decision this whole feature turns on: a photo in a session
+/// with a question left gets the comparison, anything else gets the
+/// ordinary one-photo view. Called wherever the cursor moves, so the two
+/// interleave along one walk through the card instead of being modes the
+/// user has to switch between — which is what left the photos in no
+/// session, a sixth of a real card, never visited at all.
+fn follow_cursor(w: &ImportWindow, ctx: &ImportCtx) -> bool {
+    let idx = ctx.current.get();
+    let active = w.get_tourney_on()
+        && !ctx.grid_open.get()
+        && ctx.tournament.borrow_mut().as_mut().is_some_and(|t| t.enter(idx));
+    let was = w.get_tourney_active();
+    w.set_tourney_active(active);
+    if active {
+        // The panes are about to hold two decodes of their own, and the
+        // single view's is of a photo that is no longer on screen.
+        reset_solo(w, ctx);
+        publish_tournament(w, ctx);
+    } else if was {
+        // Leaving a comparison behind: the panes hold the last session's
+        // photos and nothing else will clear them.
+        ctx.tourney_thumbs.borrow_mut().clear();
+        ctx.tourney_group_of.set(None);
+        ctx.pair_view.borrow_mut().shown = (None, None);
+    }
+    active
 }
 
 /// Push the current comparison into the window, and ask for its pixels.
 fn publish_tournament(w: &ImportWindow, ctx: &ImportCtx) {
-    let (pair, done, total, round, rounds, note) = {
+    let (pair, done, total, round, rounds) = {
         let guard = ctx.tournament.borrow();
         let Some(t) = guard.as_ref() else { return };
         let (done, total) = t.progress();
         let (round, rounds) = t.round();
         w.set_tourney_can_undo(t.can_undo());
-        // "No pair on screen" and "the pass is over" are the same state
-        // here, but only one of them says why.
-        w.set_tourney_idle(t.finished());
-        (t.pair(), done, total, round, rounds, tournament_note(t))
+        w.set_tourney_session_round(t.session_round() as i32);
+        w.set_tourney_alive(t.group().map(|g| g.alive()).unwrap_or(0) as i32);
+        (t.pair(), done, total, round, rounds)
     };
     w.set_tourney_done(done as i32);
     w.set_tourney_total(total as i32);
     w.set_tourney_round(round as i32);
     w.set_tourney_rounds(rounds as i32);
 
-    let Some((left, right)) = pair else {
-        w.set_tourney_note(note.into());
-        return;
-    };
+    let Some((left, right)) = pair else { return };
+    // The cursor stands on the left contestant for as long as the session
+    // is on screen. Keeping the two in lockstep by construction is what
+    // makes `enter` idempotent, and what lets an undo restore a session the
+    // cursor has already walked past — the pair moves the cursor back
+    // rather than the cursor having to be repaired afterwards.
+    if ctx.current.get() != left {
+        set_current(w, ctx, left);
+        ctx.preview_shown_idx.set(Some(left));
+    }
 
     // The canonical preview goes up immediately and the crop off the
     // original replaces it. Clearing the panes instead would flash an
@@ -2607,19 +3077,60 @@ fn publish_tournament(w: &ImportWindow, ctx: &ImportCtx) {
         }
         ctx.pair_view.borrow_mut().shown = (Some(left), Some(right));
     }
+    publish_group(w, ctx);
     request_pair(ctx);
 }
 
-/// What to say when there is no comparison on screen.
+/// Draw the session under the panes.
 ///
-/// "Nothing to run" and "nothing left to run" are different answers, and
-/// only one of them means the user is finished.
-fn tournament_note(t: &Tournament) -> String {
-    let (kept, passed) = t.tally();
-    if t.is_empty() && kept + passed == 0 {
-        return "No session has two photos to compare — nothing to run a tournament on.".into();
+/// The thumbnails are inflated from the canonical previews and cached for
+/// as long as the session is on screen, because a verdict changes what the
+/// cards *say* but not what they show — re-decoding twenty WebPs on every
+/// keystroke to repaint a badge would be work for nothing.
+fn publish_group(w: &ImportWindow, ctx: &ImportCtx) {
+    let guard = ctx.tournament.borrow();
+    let Some(t) = guard.as_ref() else { return };
+    let Some(group) = t.group() else { return };
+
+    // A new session invalidates every cached thumbnail at once.
+    let ordinal = t.round().0;
+    let mut thumbs = ctx.tourney_thumbs.borrow_mut();
+    if ctx.tourney_group_of.get() != Some(ordinal) {
+        thumbs.clear();
+        ctx.tourney_group_of.set(Some(ordinal));
     }
-    format!("Tournament complete — {kept} kept, {passed} passed over.")
+
+    let entries = ctx.entries.borrow();
+    let cards: Vec<crate::TourneyCard> = group
+        .members()
+        .iter()
+        .filter_map(|&idx| {
+            let e = entries.get(idx)?;
+            let thumb = match thumbs.get(&idx) {
+                Some(img) => Some(img.clone()),
+                None => {
+                    let made = pane_placeholder(e);
+                    if let Some(img) = &made {
+                        thumbs.insert(idx, img.clone());
+                    }
+                    made
+                }
+            };
+            Some(crate::TourneyCard {
+                index: idx as i32,
+                has_thumb: thumb.is_some(),
+                thumb: thumb.unwrap_or_default(),
+                filename: e
+                    .path
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_default()
+                    .into(),
+                state: group.state(idx).code(),
+            })
+        })
+        .collect();
+    w.set_tourney_group(ModelRc::new(VecModel::from(cards)));
 }
 
 /// The pixel size to render one pane at.
@@ -2719,13 +3230,14 @@ fn request_pair(ctx: &ImportCtx) {
 /// Record one verdict: the photos it settled, the marks they carry, and
 /// the next comparison.
 fn apply_verdict(w: &ImportWindow, ctx: &ImportCtx, v: Verdict) {
-    let (settled, was) = {
+    let (decision, was) = {
         let mut guard = ctx.tournament.borrow_mut();
         let Some(t) = guard.as_mut() else { return };
         let was = t.round();
         (t.decide(v), was)
     };
-    if settled.is_empty() {
+    // `acted`, never `settled.is_empty()` — see `Decision`.
+    if !decision.acted {
         return;
     }
     settle_marks(
@@ -2733,29 +3245,31 @@ fn apply_verdict(w: &ImportWindow, ctx: &ImportCtx, v: Verdict) {
         &mut ctx.selected.borrow_mut(),
         &mut ctx.brushed.borrow_mut(),
         &ctx.brush.borrow(),
-        &settled,
+        &decision.settled,
     );
-    finish_verdict(w, ctx, was, settled.iter().map(|&(i, _)| i));
+    finish_verdict(w, ctx, was, decision.session_done, decision.settled.iter().map(|&(i, _)| i));
 }
 
 /// Take back the last verdict, withdrawing every mark it made.
 fn undo_verdict(w: &ImportWindow, ctx: &ImportCtx) {
-    let (undone, was) = {
+    let (rewind, was) = {
         let mut guard = ctx.tournament.borrow_mut();
         let Some(t) = guard.as_mut() else { return };
         let was = t.round();
         (t.undo(), was)
     };
-    if undone.is_empty() {
+    // Same trap as `apply_verdict`: undoing a `3` puts the question back
+    // without withdrawing a single mark.
+    if !rewind.acted {
         return;
     }
     withdraw_marks(
         &mut ctx.entries.borrow_mut(),
         &mut ctx.selected.borrow_mut(),
         &mut ctx.brushed.borrow_mut(),
-        &undone,
+        &rewind.withdrawn,
     );
-    finish_verdict(w, ctx, was, undone.into_iter());
+    finish_verdict(w, ctx, was, false, rewind.withdrawn.into_iter());
 }
 
 /// Turn one verdict's settlements into marks.
@@ -2815,6 +3329,7 @@ fn finish_verdict(
     w: &ImportWindow,
     ctx: &ImportCtx,
     was: (usize, usize),
+    session_done: bool,
     touched: impl Iterator<Item = usize>,
 ) {
     w.set_copy_done(false);
@@ -2840,7 +3355,20 @@ fn finish_verdict(
         ctx.pair_view.borrow_mut().fit();
     }
     publish_zoom(ctx);
-    publish_tournament(w, ctx);
+
+    if session_done {
+        // The session has no question left, so the walk carries on past it
+        // — into the next session's first comparison, or into the ordinary
+        // single view for the photos in between. There is no "next
+        // bracket" to jump to: the cursor decides, and it has just moved.
+        let idx = ctx.current.get();
+        go_to(w, ctx, after_group(ctx, idx).unwrap_or(idx));
+    } else {
+        // Still comparing. `follow_cursor` re-enters the same session,
+        // and after an undo it is `publish_tournament` that walks the
+        // cursor back into the session it restored.
+        follow_cursor(w, ctx);
+    }
 }
 
 // ── Import tags ───────────────────────────────────────────────────
@@ -3482,6 +4010,11 @@ fn apply_rotation(
         );
         e.thumb = Some(slint::Image::from_rgb8(buf));
     }
+    // The file has just been rewritten under the decode the zoom renderer
+    // caches against its path, and the frame has changed shape besides,
+    // which makes the normalised centre point somewhere else. Both are
+    // answered by starting the view over on the picture that just arrived.
+    reset_solo(w, ctx);
     let (rgb, pw, ph) = preview;
     let buf = slint::SharedPixelBuffer::<slint::Rgb8Pixel>::clone_from_slice(
         &rgb, pw, ph,
@@ -3603,16 +4136,15 @@ fn refilter(w: &ImportWindow, ctx: &ImportCtx) {
         }
     };
     if let Some(idx) = landing {
-        set_current(w, ctx, idx);
-        ctx.preview_shown_idx.set(Some(idx));
-        show_preview(w, &ctx.entries, idx);
+        go_to(w, ctx, idx);
     } else {
         // The photo the user is on survived the filter, but the rows around
         // it were renumbered wholesale — re-park it, or the strip would go
         // on showing whatever now happens to sit at the old scroll offset.
         set_current(w, ctx, ctx.current.get());
+        follow_cursor(w, ctx);
+        set_preview_state(w, ctx, ctx.current.get());
     }
-    set_preview_state(w, ctx, ctx.current.get());
     // The rows now mean different entries, so what is worth decoding has
     // changed even though the viewport has not moved.
     {
@@ -3874,7 +4406,13 @@ mod tests {
 
     use crate::import_tournament::{Tournament, Verdict};
 
-    /// Run a whole pass and report `(marked, passed over)`.
+    /// Answer every session of `groups` to completion, cycling `script`,
+    /// and report `(marked, passed over)`.
+    ///
+    /// To completion rather than a fixed number of keystrokes: a bracket's
+    /// length depends on the answers — `1` and `2` eliminate, `3` does not
+    /// — so a test that stopped after *k* presses would be asserting about
+    /// a half-finished session.
     fn run_pass(
         entries: &mut [Entry],
         groups: &[Vec<usize>],
@@ -3883,9 +4421,17 @@ mod tests {
         let mut t = Tournament::build(groups, Vec::new(), |_| false);
         let mut selected = HashSet::new();
         let mut brushed = HashMap::new();
-        for v in script {
-            let settled = t.decide(*v);
-            settle_marks(entries, &mut selected, &mut brushed, &[], &settled);
+        let mut i = 0;
+        // Walk the card the way the user does: stand on each session in
+        // turn, answer until it runs out of questions, move on.
+        for g in groups {
+            t.enter(g[0]);
+            while t.pair().is_some() {
+                let settled = t.decide(script[i % script.len()]);
+                settle_marks(entries, &mut selected, &mut brushed, &[], &settled.settled);
+                i += 1;
+                assert!(i < 1000, "the pass did not terminate");
+            }
         }
         let passed = entries
             .iter()
@@ -3910,6 +4456,7 @@ mod tests {
         let groups = vec![vec![0, 1, 2], vec![3, 4, 5]];
         let script = [Verdict::Right, Verdict::Both, Verdict::Left, Verdict::Both];
         let (selected, passed) = run_pass(&mut entries, &groups, &script);
+        assert!(!selected.is_empty() && !passed.is_empty(), "the script must exercise both");
 
         for i in 0..6 {
             assert!(
@@ -3922,10 +4469,10 @@ mod tests {
     }
 
     #[test]
-    fn holding_the_incumbent_all_the_way_keeps_one_photo_from_the_session() {
+    fn always_taking_the_left_narrows_a_session_to_one_photo() {
         let mut entries = six();
         let groups = vec![vec![0, 1, 2, 3, 4, 5]];
-        let (selected, passed) = run_pass(&mut entries, &groups, &[Verdict::Left; 5]);
+        let (selected, passed) = run_pass(&mut entries, &groups, &[Verdict::Left]);
         assert_eq!(selected, HashSet::from([0]));
         assert_eq!(passed, vec![1, 2, 3, 4, 5]);
     }
@@ -3934,7 +4481,7 @@ mod tests {
     fn taking_both_every_time_keeps_the_whole_session() {
         let mut entries = six();
         let groups = vec![vec![0, 1, 2, 3, 4, 5]];
-        let (selected, passed) = run_pass(&mut entries, &groups, &[Verdict::Both; 5]);
+        let (selected, passed) = run_pass(&mut entries, &groups, &[Verdict::Both]);
         assert_eq!(selected.len(), 6);
         assert!(passed.is_empty());
     }
@@ -3951,20 +4498,42 @@ mod tests {
         assert!(!entries[1].passed, "the winner must not be marked as skipped");
     }
 
+    /// `k` — the way out of a session answered "keep both" all the way
+    /// down, and the way to say "these are all fine" without theatre.
+    #[test]
+    fn keeping_the_rest_marks_everyone_still_standing() {
+        let mut entries = six();
+        let groups = vec![vec![0, 1, 2, 3, 4, 5]];
+        let mut t = Tournament::build(&groups, Vec::new(), |_| false);
+        t.enter(0);
+        let mut selected = HashSet::new();
+        let mut brushed = HashMap::new();
+
+        let first = t.decide(Verdict::Left); // 1 is out
+        settle_marks(&mut entries, &mut selected, &mut brushed, &[], &first.settled);
+        let rest = t.keep_rest();
+        settle_marks(&mut entries, &mut selected, &mut brushed, &[], &rest.settled);
+
+        assert_eq!(selected, HashSet::from([0, 2, 3, 4, 5]));
+        assert!(entries[1].passed, "the one already eliminated stays out");
+        assert!(!entries[5].passed);
+    }
+
     #[test]
     fn undo_puts_a_photo_back_to_undecided() {
         let mut entries = six();
         let groups = vec![vec![0, 1, 2]];
         let mut t = Tournament::build(&groups, Vec::new(), |_| false);
+        t.enter(0);
         let mut selected = HashSet::new();
         let mut brushed: HashMap<usize, Vec<i64>> = HashMap::new();
 
         let settled = t.decide(Verdict::Right);
-        settle_marks(&mut entries, &mut selected, &mut brushed, &[], &settled);
+        settle_marks(&mut entries, &mut selected, &mut brushed, &[], &settled.settled);
         assert!(entries[0].passed);
 
         let undone = t.undo();
-        withdraw_marks(&mut entries, &mut selected, &mut brushed, &undone);
+        withdraw_marks(&mut entries, &mut selected, &mut brushed, &undone.withdrawn);
         assert!(!entries[0].passed, "an undone loss is not a skip");
         assert!(selected.is_empty());
         assert!(brushed.is_empty());
@@ -3979,45 +4548,24 @@ mod tests {
         let mut entries = six();
         let groups = vec![vec![0, 1], vec![2, 3]];
         let mut t = Tournament::build(&groups, Vec::new(), |_| false);
+        t.enter(0);
         let mut selected = HashSet::new();
         let mut brushed = HashMap::new();
 
         let first = t.decide(Verdict::Left);
-        settle_marks(&mut entries, &mut selected, &mut brushed, &[], &first);
+        settle_marks(&mut entries, &mut selected, &mut brushed, &[], &first.settled);
 
         let holiday = vec![Tag { id: 7, name: "Holiday".into(), color: "#aabbcc".into() }];
+        // The first session closed itself; the cursor walks into the next.
+        assert!(t.enter(2), "the second session is waiting");
         let second = t.decide(Verdict::Left);
-        settle_marks(&mut entries, &mut selected, &mut brushed, &holiday, &second);
+        settle_marks(&mut entries, &mut selected, &mut brushed, &holiday, &second.settled);
 
         assert_eq!(brushed.get(&0), Some(&Vec::new()), "kept before the tag existed");
         assert_eq!(brushed.get(&2), Some(&vec![7]));
         // A loser carries no tags at all — there is nothing to tag.
         assert!(!brushed.contains_key(&1));
         assert!(!brushed.contains_key(&3));
-    }
-
-    #[test]
-    fn the_note_tells_nothing_to_run_apart_from_nothing_left_to_run() {
-        let nothing = Tournament::build(&[vec![0]], Vec::new(), |_| false);
-        assert!(tournament_note(&nothing).contains("nothing to run"));
-
-        let mut done = Tournament::build(&[vec![0, 1, 2]], Vec::new(), |_| false);
-        done.decide(Verdict::Both);
-        done.decide(Verdict::Left);
-        assert_eq!(tournament_note(&done), "Tournament complete — 2 kept, 1 passed over.");
-    }
-
-    #[test]
-    fn a_pane_falls_back_to_half_the_window_until_it_reports_its_own_size() {
-        // The reported number wins whenever there is one.
-        assert_eq!(pane_size((1600, 1000), 700, 880), (700, 880));
-        // And a pane that has not reported still gets something drawable
-        // rather than nothing at all.
-        let (w, h) = pane_size((1600, 1000), 0, 0);
-        assert_eq!(w, 800);
-        assert!(h > 0 && h < 1000);
-        // Including from a window too small to subtract the chrome from.
-        assert_eq!(pane_size((0, 0), 0, 0), (1, 1));
     }
 
     // ── Status text ───────────────────────────────────────────────

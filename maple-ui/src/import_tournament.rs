@@ -1,62 +1,88 @@
 //! The import tournament: a photo's fate is decided by looking at it beside
 //! the one it is competing with.
 //!
-//! # Why a pass, not a bracket
+//! # The shape of it
 //!
 //! The importer used to auto-mark the sharpest photo of every detected
 //! session. That is a guess dressed as a decision: variance-of-Laplacian
 //! ranks a badly-framed-but-crisp frame above the one where the child is
 //! actually looking at the camera, and once it is marked nobody re-examines
 //! it. So the marking is gone and the comparison is put in front of the
-//! user instead — but it has to cost about one keystroke per photo, or a
-//! 954-photo card is unusable.
+//! user — `1` keeps the left, `2` the right, `3` keeps both.
 //!
-//! A real bracket does not fit. It needs ⌈log₂ n⌉ rounds, re-shows photos
-//! the user has already judged, and has nowhere to put "keep both" — which
-//! is the answer often enough that leaving it out would be the feature's
-//! biggest flaw. So the tournament is a **single pass with an incumbent**:
+//! Each detected session is its own **bracket**, run to completion before
+//! the next one starts:
 //!
-//! * The incumbent is on the left. The challenger — the next photo in
-//!   capture order — is on the right.
-//! * `1` keeps the left: the challenger is rejected, the incumbent stays.
-//! * `2` keeps the right: the incumbent is rejected, the challenger takes
-//!   its place.
-//! * `3` takes both: the incumbent is **settled as kept** and the
-//!   challenger takes its place.
+//! * **The first round pairs up photos nobody has looked at yet** — (1,2),
+//!   (3,4), (5,6) … so every photo gets its first comparison against a
+//!   peer. Nothing is anyone's "incumbent" and no photo is asked about
+//!   twice before the rest have been asked about once.
+//! * Losing eliminates. `3` advances **both**, which is what makes "keep
+//!   both" mean something: it is not "I cannot decide", it is "these both
+//!   go through".
+//! * Later rounds are **keeper against keeper**, over whoever is still
+//!   standing.
+//! * It ends when there is no pair left to ask about — either one photo is
+//!   standing, or everyone still standing has already met everyone else
+//!   still standing. **Whoever is standing at the end is kept.**
 //!
-//! One invariant makes this coherent and is worth stating on its own:
-//! **only the incumbent's fate is still open.** Everything behind it is
-//! settled and is never asked about again. When a session runs out the
-//! incumbent is settled as kept, so a session of *n* photos costs exactly
-//! *n* − 1 keystrokes and every one of its photos ends up decided.
+//! # The two rules that make it terminate
 //!
-//! The challenger becomes the incumbent on both `2` and `3` — never the
-//! old one — because the scene drifts across a session and the more recent
-//! frame is the more informative thing to compare the next one against.
+//! A pair is only ever put to the user **once** (`Bracket::met`). Building
+//! a round therefore either finds an unasked pair — in which case the
+//! answer eliminates somebody or records a new meeting, both of which are
+//! bounded — or finds none, which ends the bracket. There is no way to
+//! loop, and no way to be asked the same question twice.
 //!
-//! # Why the rounds are rebuilt rather than kept
+//! Cost lands where it should. Answer `1`/`2` throughout and a session of
+//! *n* takes *n* − 1 comparisons, the theoretical minimum for finding a
+//! single best. Say "keep both" often and it costs more, because more
+//! photos are still in the running — which is the user asking for it. The
+//! ceiling is the complete graph, so a session where *every* answer is `3`
+//! would run to n(n−1)/2; `keep_rest` (`k`) is the way out, and is worth
+//! having anyway for "this session is fine, move on".
 //!
-//! [`Tournament::build`] takes the groups and the set of photos already
-//! settled, and skips the latter. That one rule buys three behaviours with
+//! # It is a detour, not a mode
+//!
+//! There is no separate pass over the card and nothing to switch between.
+//! The user walks the card the way they always have, and **the view follows
+//! the cursor**: land on a photo that belongs to a session and its bracket
+//! takes over; land on one that belongs to no session and it is the
+//! ordinary one-photo triage, because there is nothing to compare it
+//! against. When a bracket runs out of questions the cursor steps past the
+//! session and the walk continues.
+//!
+//! That is why [`Tournament::enter`] exists and why there is no "next
+//! bracket": the *cursor* says which bracket is on screen, not a pointer
+//! inside here. Making the tournament a mode of its own meant a card was
+//! either all comparisons or all single photos, so the photos in no session
+//! — a sixth of a real card — were never visited at all.
+//!
+//! # Why brackets are rebuilt rather than resumed
+//!
+//! [`Tournament::build`] takes the groups and the verdicts already given
+//! (`carry`) and skips the latter. That one rule buys three behaviours with
 //! no extra machinery: switching the tournament off and back on resumes
 //! where it stopped; correcting a session boundary in the `f` grid
 //! re-groups what is *left* without re-asking about anything already
 //! decided; and a photo already in the library never enters a comparison
 //! it could not act on the result of.
 
+
+use std::collections::{HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 
 // ── The state machine ─────────────────────────────────────────────
 
-/// Which photo (or both) survives one comparison.
+/// Which photo (or both) goes through one comparison.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Verdict {
-    /// `1` — the incumbent on the left; the challenger is rejected.
+    /// `1` — the left photo; the right is eliminated.
     Left,
-    /// `2` — the challenger on the right; the incumbent is rejected.
+    /// `2` — the right photo; the left is eliminated.
     Right,
-    /// `3` — both are worth keeping.
+    /// `3` — both go through to the next round.
     Both,
 }
 
@@ -72,29 +98,159 @@ impl Verdict {
     }
 }
 
-#[derive(Clone, Copy, Debug)]
-struct Cursor {
+/// What one photo of the current session is doing, for the strip under the
+/// two panes.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum CardState {
+    /// On screen on the left.
+    Left,
+    /// On screen on the right.
+    Right,
+    /// Still in the running, waiting for a later round.
+    In,
+    /// Lost a comparison. Not coming back.
+    Out,
+}
+
+impl CardState {
+    /// The number the UI switches on.
+    pub fn code(self) -> i32 {
+        match self {
+            CardState::In => 0,
+            CardState::Left => 1,
+            CardState::Right => 2,
+            CardState::Out => 3,
+        }
+    }
+}
+
+/// An ordered pair key, so `(a, b)` and `(b, a)` are the same meeting.
+type Met = (usize, usize);
+
+fn met_key(a: usize, b: usize) -> Met {
+    if a <= b {
+        (a, b)
+    } else {
+        (b, a)
+    }
+}
+
+/// One session's bracket.
+#[derive(Clone)]
+struct Bracket {
+    /// Every photo in the session, in capture order. Never changes — it is
+    /// what the strip under the panes draws.
+    members: Vec<usize>,
+    /// Still in the running, in capture order.
+    alive: Vec<usize>,
+    /// Every pair already put to the user. A question is asked once.
+    met: HashSet<Met>,
+    /// This round's remaining comparisons.
+    queue: VecDeque<(usize, usize)>,
+    /// How many rounds have been built, for the status line.
     round: usize,
-    /// Position of the challenger inside `rounds[round]`.
-    next: usize,
-    incumbent: usize,
+}
+
+impl Bracket {
+    fn new(members: Vec<usize>) -> Self {
+        let mut b = Bracket {
+            alive: members.clone(),
+            members,
+            met: HashSet::new(),
+            queue: VecDeque::new(),
+            round: 0,
+        };
+        b.open_round();
+        b
+    }
+
+    /// Pair the survivors up for another round.
+    ///
+    /// Greedy and in capture order, which makes the first round exactly
+    /// (1,2), (3,4), (5,6) …. A photo that cannot be paired — because it
+    /// has already met everyone left unpaired — simply sits the round out;
+    /// it is still alive and can be paired next time. An **empty** round is
+    /// the bracket's end condition: there is no question left to ask.
+    fn open_round(&mut self) {
+        self.queue.clear();
+        let mut taken = vec![false; self.alive.len()];
+        for i in 0..self.alive.len() {
+            if taken[i] {
+                continue;
+            }
+            for j in i + 1..self.alive.len() {
+                if taken[j] || self.met.contains(&met_key(self.alive[i], self.alive[j])) {
+                    continue;
+                }
+                taken[i] = true;
+                taken[j] = true;
+                self.queue.push_back((self.alive[i], self.alive[j]));
+                break;
+            }
+        }
+        if !self.queue.is_empty() {
+            self.round += 1;
+        }
+    }
+
+    fn pair(&self) -> Option<(usize, usize)> {
+        self.queue.front().copied()
+    }
+
+    fn eliminate(&mut self, idx: usize) {
+        self.alive.retain(|&a| a != idx);
+    }
+}
+
+/// What one keystroke did.
+///
+/// `acted` and `settled` are deliberately separate fields, and this is the
+/// whole reason the type exists rather than a bare `Vec`. `3` advances both
+/// photos and eliminates neither, so it settles **nobody** while very much
+/// moving the pass on. A caller that reads an empty `settled` as "nothing
+/// happened" advances the bracket and never repaints — which is exactly how
+/// `3` came to look dead in the middle of a session and alive at the end of
+/// one, where the bracket ends and its survivors settle.
+#[derive(Default, Debug, PartialEq, Eq)]
+pub struct Decision {
+    /// There was a comparison on screen, and it has been answered.
+    pub acted: bool,
+    /// Photos whose fate this settled. **May be empty on a real verdict.**
+    pub settled: Vec<(usize, bool)>,
+    /// This session has no question left — the cursor should step past it.
+    pub session_done: bool,
+}
+
+/// What one undo did. Same two fields for the same reason: undoing a `3`
+/// puts the question back without withdrawing a single mark.
+#[derive(Default, Debug, PartialEq, Eq)]
+pub struct Rewind {
+    pub acted: bool,
+    pub withdrawn: Vec<usize>,
 }
 
 /// One decision's worth of rewind information.
-#[derive(Clone, Copy, Debug)]
+///
+/// A whole-bracket snapshot rather than an incremental rewind: a bracket is
+/// one session — tens of photos — so cloning it is nothing, and a decision
+/// touches `alive`, `met`, `queue` and the round counter at once. Anything
+/// incremental would be four things to keep in step for no measurable
+/// saving.
 struct Step {
-    at: Cursor,
+    at: usize,
+    bracket: Bracket,
     settled_len: usize,
 }
 
-/// A pass over the detected groups, one comparison at a time.
+/// A pass over the detected sessions, one comparison at a time.
 pub struct Tournament {
-    /// Each round is one session's still-undecided photos, in capture
-    /// order. Only rounds of two or more are kept — there is nothing to
-    /// compare a lone photo against.
-    rounds: Vec<Vec<usize>>,
-    /// `None` once every round is finished.
-    at: Option<Cursor>,
+    brackets: Vec<Bracket>,
+    /// Entry index → its bracket, for every photo still in one. What makes
+    /// the cursor able to say which comparison is on screen.
+    of: Vec<(usize, usize)>,
+    /// The bracket on screen. `None` whenever the cursor is not standing in
+    /// a session that still has a question.
+    at: Option<usize>,
     /// Verdicts this card was given before the current pass was built.
     ///
     /// The record has to outlive the pass that made it, or switching the
@@ -103,11 +259,43 @@ pub struct Tournament {
     /// than beside it so there is one copy of it and nothing to keep in
     /// step; [`Tournament::carry`] is how it reaches the next build.
     carried: Vec<(usize, bool)>,
-    /// Entry index → kept, in the order this pass decided them. A `Vec`
-    /// rather than a map because [`Tournament::undo`] rewinds it by
-    /// truncation.
+    /// Entry index → kept, in the order this pass decided them.
     settled: Vec<(usize, bool)>,
     steps: Vec<Step>,
+}
+
+/// The current session, for the strip under the panes.
+pub struct GroupView<'a> {
+    members: &'a [usize],
+    alive: &'a [usize],
+    pair: Option<(usize, usize)>,
+}
+
+impl GroupView<'_> {
+    /// The whole session in capture order — including the photos already
+    /// out, because seeing what was rejected is half of why the strip is
+    /// there.
+    pub fn members(&self) -> &[usize] {
+        self.members
+    }
+
+    pub fn state(&self, idx: usize) -> CardState {
+        match self.pair {
+            Some((l, _)) if l == idx => return CardState::Left,
+            Some((_, r)) if r == idx => return CardState::Right,
+            _ => {}
+        }
+        if self.alive.contains(&idx) {
+            CardState::In
+        } else {
+            CardState::Out
+        }
+    }
+
+    /// How many are still in the running.
+    pub fn alive(&self) -> usize {
+        self.alive.len()
+    }
 }
 
 impl Tournament {
@@ -115,13 +303,15 @@ impl Tournament {
     /// decided and skipping anything `ineligible` rejects outright.
     ///
     /// A group with fewer than two photos left is dropped: "nothing else
-    /// belongs with this" is an answer, but it is not a comparison.
+    /// belongs with this" is an answer, but it is not a comparison, and a
+    /// photo with nothing to compare against belongs in the ordinary
+    /// one-photo triage.
     pub fn build(
         groups: &[Vec<usize>],
         carried: Vec<(usize, bool)>,
         ineligible: impl Fn(usize) -> bool,
     ) -> Self {
-        let rounds: Vec<Vec<usize>> = groups
+        let brackets: Vec<Bracket> = groups
             .iter()
             .map(|g| {
                 g.iter()
@@ -130,9 +320,54 @@ impl Tournament {
                     .collect::<Vec<_>>()
             })
             .filter(|g: &Vec<usize>| g.len() >= 2)
+            .map(Bracket::new)
             .collect();
-        let at = Self::open(&rounds, 0);
-        Tournament { rounds, at, carried, settled: Vec::new(), steps: Vec::new() }
+        // Every photo of a bracket points at it, decided ones included —
+        // the cursor lands on *photos*, and a photo that has already lost
+        // still belongs to the session whose bracket is running.
+        let mut of: Vec<(usize, usize)> = brackets
+            .iter()
+            .enumerate()
+            .flat_map(|(b, br)| br.members.iter().map(move |&m| (m, b)))
+            .collect();
+        of.sort_unstable();
+        Tournament { brackets, of, at: None, carried, settled: Vec::new(), steps: Vec::new() }
+    }
+
+    /// Put the bracket containing `entry` on screen, if there is one with a
+    /// question left.
+    ///
+    /// The one entry point: the cursor moved, so what should be shown?
+    /// Returns whether a comparison is now on screen — `false` means the
+    /// caller should show the ordinary one-photo view, either because this
+    /// photo is in no session or because its session is already settled.
+    pub fn enter(&mut self, entry: usize) -> bool {
+        self.at = self
+            .of
+            .binary_search_by_key(&entry, |(e, _)| *e)
+            .ok()
+            .map(|i| self.of[i].1)
+            .filter(|&b| self.brackets[b].pair().is_some());
+        self.at.is_some()
+    }
+
+    /// Stop showing a comparison — the cursor has left, or the feature was
+    /// switched off.
+    pub fn leave(&mut self) {
+        self.at = None;
+    }
+
+    /// Settle whoever is standing in the bracket on screen and take it off.
+    fn close(&mut self) -> bool {
+        let Some(at) = self.at else { return false };
+        if self.brackets[at].pair().is_some() {
+            return false;
+        }
+        for &idx in &self.brackets[at].alive.clone() {
+            self.settled.push((idx, true));
+        }
+        self.at = None;
+        true
     }
 
     /// Every verdict this card has been given, for the next [`build`].
@@ -144,45 +379,32 @@ impl Tournament {
         all
     }
 
-    /// `(kept, passed over)` across the whole card, this pass and every
-    /// earlier one — which is what the finished panel is reporting on.
-    pub fn tally(&self) -> (usize, usize) {
-        let kept = self.carried.iter().chain(&self.settled).filter(|(_, k)| *k).count();
-        (kept, self.carried.len() + self.settled.len() - kept)
-    }
-
-    fn open(rounds: &[Vec<usize>], from: usize) -> Option<Cursor> {
-        rounds
-            .get(from)
-            .map(|r| Cursor { round: from, next: 1, incumbent: r[0] })
-    }
-
     /// The comparison on screen: `(left, right)` as entry indices, or
-    /// `None` when the pass is over.
+    /// `None` when the cursor is not in a live session.
     pub fn pair(&self) -> Option<(usize, usize)> {
-        let c = self.at?;
-        Some((c.incumbent, self.rounds[c.round][c.next]))
+        self.brackets.get(self.at?)?.pair()
     }
 
-    pub fn finished(&self) -> bool {
-        self.at.is_none()
-    }
-
-    /// Whether there was ever anything to compare.
-    pub fn is_empty(&self) -> bool {
-        self.rounds.is_empty()
+    /// The session on screen, for the strip under the panes.
+    pub fn group(&self) -> Option<GroupView<'_>> {
+        let b = self.brackets.get(self.at?)?;
+        Some(GroupView { members: &b.members, alive: &b.alive, pair: b.pair() })
     }
 
     /// How many photos this pass has decided, out of how many it covers.
     pub fn progress(&self) -> (usize, usize) {
-        (self.settled.len(), self.rounds.iter().map(Vec::len).sum())
+        (self.settled.len(), self.brackets.iter().map(|b| b.members.len()).sum())
     }
 
-    /// Which round is on screen, out of how many. 1-based for display;
-    /// `(rounds, rounds)` once finished.
+    /// Which session is on screen, out of how many. 1-based for display;
+    /// `(0, n)` when the cursor is not in one.
     pub fn round(&self) -> (usize, usize) {
-        let n = self.rounds.len();
-        (self.at.map(|c| c.round + 1).unwrap_or(n), n)
+        (self.at.map(|a| a + 1).unwrap_or(0), self.brackets.len())
+    }
+
+    /// Which round of the session on screen, 1-based. 0 when not in one.
+    pub fn session_round(&self) -> usize {
+        self.at.and_then(|a| self.brackets.get(a)).map(|b| b.round).unwrap_or(0)
     }
 
     /// Whether an [`undo`](Self::undo) would do anything.
@@ -190,55 +412,78 @@ impl Tournament {
         !self.steps.is_empty()
     }
 
+    fn snapshot(&mut self) -> bool {
+        let Some(at) = self.at else { return false };
+        let Some(bracket) = self.brackets.get(at).cloned() else { return false };
+        self.steps.push(Step { at, bracket, settled_len: self.settled.len() });
+        true
+    }
+
     /// Record one comparison's verdict and advance.
     ///
     /// Returns the photos whose fate this settled, so the caller can move
-    /// exactly those marks rather than re-deriving the whole selection.
-    /// Empty when the pass is already over.
-    pub fn decide(&mut self, v: Verdict) -> Vec<(usize, bool)> {
-        let Some(c) = self.at else { return Vec::new() };
-        self.steps.push(Step { at: c, settled_len: self.settled.len() });
+    /// exactly those marks rather than re-deriving the whole selection. A
+    /// loser is settled at once and is not coming back; a survivor is only
+    /// settled when its bracket runs out of questions, because until then
+    /// it can still lose one. Empty when the pass is already over.
+    pub fn decide(&mut self, v: Verdict) -> Decision {
+        if !self.snapshot() {
+            return Decision::default();
+        }
         let from = self.settled.len();
-
-        let challenger = self.rounds[c.round][c.next];
-        let incumbent = match v {
+        let at = self.at.expect("snapshot only succeeds inside a bracket");
+        let b = &mut self.brackets[at];
+        let Some((left, right)) = b.queue.pop_front() else { return Decision::default() };
+        b.met.insert(met_key(left, right));
+        match v {
             Verdict::Left => {
-                self.settled.push((challenger, false));
-                c.incumbent
+                b.eliminate(right);
+                self.settled.push((right, false));
             }
             Verdict::Right => {
-                self.settled.push((c.incumbent, false));
-                challenger
+                b.eliminate(left);
+                self.settled.push((left, false));
             }
-            Verdict::Both => {
-                self.settled.push((c.incumbent, true));
-                challenger
-            }
-        };
+            Verdict::Both => {}
+        }
+        if self.brackets[at].queue.is_empty() {
+            self.brackets[at].open_round();
+        }
+        let session_done = self.close();
+        Decision { acted: true, settled: self.settled[from..].to_vec(), session_done }
+    }
 
-        let next = c.next + 1;
-        self.at = if next < self.rounds[c.round].len() {
-            Some(Cursor { round: c.round, next, incumbent })
-        } else {
-            // The last one standing has nothing left to lose to.
-            self.settled.push((incumbent, true));
-            Self::open(&self.rounds, c.round + 1)
-        };
-        self.settled[from..].to_vec()
+    /// End the current session here, keeping everyone still standing.
+    ///
+    /// The pressure valve for the one case the termination rule cannot
+    /// bound on its own: answer `3` to everything and a session runs to the
+    /// complete graph. It is also just the right thing to have — "these are
+    /// all fine, move on" is a real answer, and grinding through the
+    /// remaining rounds to say it would be theatre.
+    pub fn keep_rest(&mut self) -> Decision {
+        if !self.snapshot() {
+            return Decision::default();
+        }
+        let from = self.settled.len();
+        let at = self.at.expect("snapshot only succeeds inside a bracket");
+        self.brackets[at].queue.clear();
+        let session_done = self.close();
+        Decision { acted: true, settled: self.settled[from..].to_vec(), session_done }
     }
 
     /// Take back the last verdict.
     ///
-    /// Not a nicety: every keystroke here permanently decides a photo, and
-    /// `1` and `2` are one key apart. Without this, a mis-hit silently
+    /// Not a nicety: every keystroke here permanently eliminates a photo,
+    /// and `1` and `2` are one key apart. Without this, a mis-hit silently
     /// costs a photo and there is nothing on screen that would ever show
     /// it. Returns the entries whose marks must be withdrawn.
-    pub fn undo(&mut self) -> Vec<usize> {
-        let Some(step) = self.steps.pop() else { return Vec::new() };
-        let undone: Vec<usize> =
+    pub fn undo(&mut self) -> Rewind {
+        let Some(step) = self.steps.pop() else { return Rewind::default() };
+        let withdrawn: Vec<usize> =
             self.settled.drain(step.settled_len..).map(|(i, _)| i).collect();
+        self.brackets[step.at] = step.bracket;
         self.at = Some(step.at);
-        undone
+        Rewind { acted: true, withdrawn }
     }
 }
 
@@ -520,164 +765,386 @@ mod tests {
         gs.iter().map(|g| g.to_vec()).collect()
     }
 
+    /// Build a pass and stand the cursor on the first session, which is
+    /// what the UI does the moment the user walks into one.
+    fn build(gs: &[&[usize]]) -> Tournament {
+        let mut t = Tournament::build(&groups(gs), Vec::new(), |_| false);
+        t.enter(gs[0][0]);
+        t
+    }
+
     fn kept(t: &Tournament) -> Vec<usize> {
-        t.carry().iter().filter(|(_, k)| *k).map(|(i, _)| *i).collect()
+        let mut v: Vec<usize> =
+            t.carry().iter().filter(|(_, k)| *k).map(|(i, _)| *i).collect();
+        v.sort_unstable();
+        v
     }
 
-    fn rejected(t: &Tournament) -> Vec<usize> {
-        t.carry().iter().filter(|(_, k)| !*k).map(|(i, _)| *i).collect()
+    fn out(t: &Tournament) -> Vec<usize> {
+        let mut v: Vec<usize> =
+            t.carry().iter().filter(|(_, k)| !*k).map(|(i, _)| *i).collect();
+        v.sort_unstable();
+        v
+    }
+
+    /// Walk the card the way the user does: stand on each session in turn,
+    /// answer until it runs out of questions, move on.
+    fn walk(
+        t: &mut Tournament,
+        gs: &[&[usize]],
+        mut f: impl FnMut(usize, usize) -> Verdict,
+    ) -> usize {
+        let mut asked = 0;
+        for g in gs {
+            t.enter(g[0]);
+            while let Some((l, r)) = t.pair() {
+                t.decide(f(l, r));
+                asked += 1;
+                assert!(asked < 5000, "the bracket did not terminate");
+            }
+        }
+        asked
+    }
+
+    // ── The cursor decides what is on screen ──────────────────────
+
+    /// The whole shape of the feature: it is a detour, not a mode. Land on
+    /// a photo in a session and there is a comparison; land on one in no
+    /// session and there is not, so the caller shows the single view.
+    #[test]
+    fn a_photo_in_no_session_has_no_comparison() {
+        let mut t = Tournament::build(&groups(&[&[3, 4, 5]]), Vec::new(), |_| false);
+        assert!(!t.enter(0), "photo 0 is in no session");
+        assert_eq!(t.pair(), None);
+        assert!(t.enter(4), "photo 4 is");
+        assert_eq!(t.pair(), Some((3, 4)));
+    }
+
+    /// Any member, not just the first — the user arrives wherever the
+    /// arrow keys or a filmstrip click put them.
+    #[test]
+    fn entering_on_any_member_puts_that_session_on_screen() {
+        let gs = groups(&[&[0, 1, 2], &[7, 8, 9]]);
+        for &entry in &[7usize, 8, 9] {
+            let mut t = Tournament::build(&gs, Vec::new(), |_| false);
+            assert!(t.enter(entry));
+            assert_eq!(t.pair(), Some((7, 8)), "entered on {entry}");
+        }
+    }
+
+    /// A session whose photos are all already decided is not a detour any
+    /// more — walking back over it gives the ordinary single view.
+    #[test]
+    fn a_session_with_nothing_left_to_ask_is_not_entered() {
+        let mut t = build(&[&[0, 1]]);
+        t.decide(Verdict::Left);
+        assert_eq!(t.pair(), None, "the session closed itself");
+        assert!(!t.enter(0));
+        assert!(!t.enter(1));
+        assert!(t.group().is_none());
     }
 
     #[test]
-    fn a_session_of_n_costs_n_minus_one_keystrokes_and_decides_all_n() {
-        let mut t = Tournament::build(&groups(&[&[0, 1, 2, 3, 4]]), Vec::new(), |_| false);
-        let mut presses = 0;
-        while t.pair().is_some() {
-            t.decide(Verdict::Left);
-            presses += 1;
-        }
-        assert_eq!(presses, 4);
-        assert_eq!(t.progress(), (5, 5));
-        // Holding the incumbent every time keeps the first photo only.
+    fn leaving_takes_the_comparison_off_screen_without_deciding_anything() {
+        let mut t = build(&[&[0, 1, 2]]);
+        assert!(t.pair().is_some());
+        t.leave();
+        assert_eq!(t.pair(), None);
+        assert!(t.carry().is_empty(), "skipping a session decides nothing");
+        // …and it is still waiting when the user comes back.
+        assert!(t.enter(1));
+        assert_eq!(t.pair(), Some((0, 1)));
+    }
+
+    // ── The bracket ───────────────────────────────────────────────
+
+    /// Round one pairs photos that have not been looked at yet, so every
+    /// photo gets its first comparison against a peer instead of photo 0
+    /// appearing in every question.
+    #[test]
+    fn the_first_round_pairs_photos_nobody_has_seen_yet() {
+        let mut t = build(&[&[0, 1, 2, 3, 4, 5]]);
+        assert_eq!(t.pair(), Some((0, 1)));
+        t.decide(Verdict::Left);
+        assert_eq!(t.pair(), Some((2, 3)));
+        t.decide(Verdict::Left);
+        assert_eq!(t.pair(), Some((4, 5)));
+    }
+
+    /// Answer `1`/`2` throughout and it costs the theoretical minimum for
+    /// finding a single best: one comparison per elimination.
+    #[test]
+    fn eliminating_every_time_costs_n_minus_one_and_leaves_one_photo() {
+        let gs: &[&[usize]] = &[&[0, 1, 2, 3, 4, 5, 6, 7]];
+        let mut t = Tournament::build(&groups(gs), Vec::new(), |_| false);
+        let asked = walk(&mut t, gs, |_, _| Verdict::Left);
+        assert_eq!(asked, 7);
         assert_eq!(kept(&t), vec![0]);
-        assert_eq!(rejected(&t), vec![1, 2, 3, 4]);
+        assert_eq!(out(&t), vec![1, 2, 3, 4, 5, 6, 7]);
     }
 
+    /// The keeper-against-keeper part: a photo that wins its first round
+    /// meets another winner, not the photo it already beat.
     #[test]
-    fn the_right_hand_photo_takes_over_as_incumbent() {
-        let mut t = Tournament::build(&groups(&[&[0, 1, 2]]), Vec::new(), |_| false);
-        assert_eq!(t.pair(), Some((0, 1)));
-        t.decide(Verdict::Right);
-        // 0 is out and 1 is now the one being defended.
+    fn later_rounds_are_keeper_against_keeper() {
+        let mut t = build(&[&[0, 1, 2, 3]]);
+        t.decide(Verdict::Right); // 1 beats 0
+        assert_eq!(t.session_round(), 1);
+        t.decide(Verdict::Right); // 3 beats 2
+        assert_eq!(t.pair(), Some((1, 3)));
+        assert_eq!(t.session_round(), 2);
+        t.decide(Verdict::Left);
+        assert_eq!(t.pair(), None);
+        assert_eq!(kept(&t), vec![1]);
+    }
+
+    /// "Keep both" advances both — it is not "I cannot decide". A photo it
+    /// saves is still in the running and can still lose later.
+    #[test]
+    fn keeping_both_advances_both_and_they_can_still_lose() {
+        let mut t = build(&[&[0, 1, 2, 3]]);
+        t.decide(Verdict::Both); // 0 and 1 both go through
+        t.decide(Verdict::Left); // 2 beats 3
+        assert_eq!(t.pair(), Some((0, 2)));
+        t.decide(Verdict::Right); // 2 beats 0 — 0 is out despite the "both"
         assert_eq!(t.pair(), Some((1, 2)));
-        t.decide(Verdict::Right);
-        assert_eq!(kept(&t), vec![2]);
-        assert_eq!(rejected(&t), vec![0, 1]);
+        t.decide(Verdict::Left);
+        assert_eq!(kept(&t), vec![1]);
+        assert_eq!(out(&t), vec![0, 2, 3]);
     }
 
+    /// The trap that made `3` look dead in the middle of a session: a
+    /// verdict that settles nobody is **not** a verdict that did nothing.
+    /// Anything gating a repaint on the settled list being non-empty
+    /// advances the bracket behind the user's back.
     #[test]
-    fn taking_both_banks_the_incumbent_and_moves_on() {
-        let mut t = Tournament::build(&groups(&[&[0, 1, 2]]), Vec::new(), |_| false);
-        t.decide(Verdict::Both);
-        assert_eq!(t.pair(), Some((1, 2)));
-        t.decide(Verdict::Both);
-        assert_eq!(kept(&t), vec![0, 1, 2]);
-        assert!(rejected(&t).is_empty());
+    fn keeping_both_settles_nobody_but_still_moves_the_question_on() {
+        let mut t = build(&[&[0, 1, 2, 3]]);
+        let before = t.pair();
+        let d = t.decide(Verdict::Both);
+        assert!(d.acted, "a `3` is a real verdict");
+        assert!(d.settled.is_empty(), "nobody is out yet");
+        assert!(!d.session_done);
+        assert_ne!(t.pair(), before, "but the comparison must still advance");
     }
 
-    /// The invariant the whole design rests on: nothing behind the
-    /// incumbent is ever asked about twice, and nothing is left undecided.
+    /// And the same on the way back: undoing a `3` withdraws no marks
+    /// while very much putting the question back.
     #[test]
-    fn every_photo_in_a_round_ends_up_decided_exactly_once() {
-        let script = [Verdict::Both, Verdict::Left, Verdict::Right, Verdict::Both];
-        let mut t = Tournament::build(&groups(&[&[10, 11, 12, 13, 14]]), Vec::new(), |_| false);
-        for v in script {
-            t.decide(v);
+    fn undoing_a_keep_both_restores_the_question_it_withdraws_no_marks_for() {
+        let mut t = build(&[&[0, 1, 2, 3]]);
+        let before = t.pair();
+        t.decide(Verdict::Both);
+        let r = t.undo();
+        assert!(r.acted, "the undo really happened");
+        assert!(r.withdrawn.is_empty(), "a `3` marked nobody, so there is nobody to unmark");
+        assert_eq!(t.pair(), before, "but the question has to come back");
+        assert!(!t.can_undo());
+    }
+
+    /// The end condition, stated as the user did: everyone still standing
+    /// has met everyone else still standing, so there is nothing left to
+    /// ask and they are all kept.
+    #[test]
+    fn a_session_where_every_answer_is_keep_both_keeps_everything() {
+        let gs: &[&[usize]] = &[&[0, 1, 2, 3]];
+        let mut t = Tournament::build(&groups(gs), Vec::new(), |_| false);
+        let asked = walk(&mut t, gs, |_, _| Verdict::Both);
+        // The documented ceiling: the complete graph, once each.
+        assert_eq!(asked, 4 * 3 / 2);
+        assert_eq!(kept(&t), vec![0, 1, 2, 3]);
+        assert!(out(&t).is_empty());
+    }
+
+    /// The rule the whole thing rests on. A repeated question would be
+    /// both an insult and a way to loop forever.
+    #[test]
+    fn no_pair_is_ever_put_to_the_user_twice() {
+        for script in [
+            [Verdict::Both, Verdict::Left, Verdict::Both, Verdict::Right],
+            [Verdict::Left, Verdict::Both, Verdict::Right, Verdict::Both],
+            [Verdict::Both, Verdict::Both, Verdict::Both, Verdict::Both],
+        ] {
+            let mut t = build(&[&[0, 1, 2, 3, 4, 5]]);
+            let mut seen: HashSet<Met> = HashSet::new();
+            let mut i = 0;
+            while let Some((l, r)) = t.pair() {
+                assert!(seen.insert(met_key(l, r)), "asked ({l},{r}) twice");
+                t.decide(script[i % script.len()]);
+                i += 1;
+                assert!(i < 200, "did not terminate");
+            }
         }
-        let mut seen: Vec<usize> = t.carry().iter().map(|(i, _)| *i).collect();
-        seen.sort_unstable();
-        assert_eq!(seen, vec![10, 11, 12, 13, 14]);
-        assert!(t.finished());
     }
 
     #[test]
-    fn rounds_run_one_after_another() {
-        let mut t = Tournament::build(&groups(&[&[0, 1], &[5, 6]]), Vec::new(), |_| false);
-        assert_eq!(t.round(), (1, 2));
-        assert_eq!(t.pair(), Some((0, 1)));
-        t.decide(Verdict::Left);
-        assert_eq!(t.round(), (2, 2));
-        assert_eq!(t.pair(), Some((5, 6)));
-        t.decide(Verdict::Left);
-        assert!(t.finished());
+    fn every_photo_of_a_session_ends_up_kept_or_out_and_never_both() {
+        let gs: &[&[usize]] = &[&[0, 1, 2, 3, 4], &[10, 11, 12]];
+        let mut t = Tournament::build(&groups(gs), Vec::new(), |_| false);
+        let script = [Verdict::Both, Verdict::Left, Verdict::Right];
+        let mut i = 0;
+        walk(&mut t, gs, |_, _| {
+            i += 1;
+            script[i % script.len()]
+        });
+        let mut all = kept(&t);
+        all.extend(out(&t));
+        all.sort_unstable();
+        assert_eq!(all, vec![0, 1, 2, 3, 4, 10, 11, 12]);
+    }
+
+    /// A verdict that empties a session says so, because that is the
+    /// caller's cue to walk the cursor past it.
+    #[test]
+    fn the_verdict_that_empties_a_session_says_so() {
+        let mut t = build(&[&[0, 1, 2]]);
+        assert!(!t.decide(Verdict::Left).session_done);
+        let last = t.decide(Verdict::Left);
+        assert!(last.session_done);
         assert_eq!(t.pair(), None);
     }
 
     #[test]
-    fn a_group_left_with_fewer_than_two_undecided_photos_is_not_a_round() {
-        // Verdicts carried in from an earlier pass leave this group with
-        // one photo — nothing to compare it against.
-        let carried = vec![(0usize, true), (1usize, false)];
-        let t = Tournament::build(&groups(&[&[0, 1, 2], &[7, 8]]), carried, |_| false);
-        assert_eq!(t.pair(), Some((7, 8)));
-        // Progress is about *this* pass; the tally is about the card.
-        assert_eq!(t.progress(), (0, 2));
-        assert_eq!(t.tally(), (1, 1));
+    fn keep_rest_ends_the_session_and_keeps_whoever_is_standing() {
+        let mut t = build(&[&[0, 1, 2, 3], &[8, 9]]);
+        t.decide(Verdict::Left); // 1 is out
+        let d = t.keep_rest();
+        assert!(d.session_done);
+        assert_eq!(d.settled, vec![(0, true), (2, true), (3, true)]);
+        assert_eq!(out(&t), vec![1]);
+        // …and the next session is there when the cursor reaches it.
+        assert!(t.enter(8));
+        assert_eq!(t.pair(), Some((8, 9)));
     }
 
-    /// The rule that makes rebuilding cheap: a rebuild carries the
-    /// verdicts and re-asks nothing. Switching the mode off and on, or
-    /// correcting one boundary, must not cost the pass its progress.
     #[test]
-    fn rebuilding_resumes_rather_than_restarting() {
-        let gs = groups(&[&[0, 1, 2, 3]]);
-        let mut t = Tournament::build(&gs, Vec::new(), |_| false);
-        t.decide(Verdict::Left);
-        assert_eq!(t.pair(), Some((0, 2)));
+    fn a_group_left_with_fewer_than_two_undecided_photos_is_not_a_bracket() {
+        let carried = vec![(0usize, true), (1usize, false)];
+        let mut t = Tournament::build(&groups(&[&[0, 1, 2], &[7, 8]]), carried, |_| false);
+        assert!(!t.enter(2), "one photo left is not a comparison");
+        assert!(t.enter(7));
+        assert_eq!(t.pair(), Some((7, 8)));
+        // Progress is about *this* pass, not the verdicts carried in.
+        assert_eq!(t.progress(), (0, 2));
+    }
 
-        let again = Tournament::build(&gs, t.carry(), |_| false);
-        // 1 is decided and stays decided; the pass picks up at 2.
-        assert_eq!(again.pair(), Some((0, 2)));
-        assert_eq!(again.progress(), (0, 3));
-        assert_eq!(again.tally(), (0, 1));
+    #[test]
+    fn a_pass_with_nothing_to_compare_never_enters_anything() {
+        let mut t = Tournament::build(&groups(&[&[0, 1]]), Vec::new(), |_| true);
+        assert!(!t.enter(0));
+        assert_eq!(t.pair(), None);
     }
 
     #[test]
     fn an_ineligible_photo_never_enters_a_comparison() {
         // Already in the library, or it never decoded — either way there
         // is no answer the user could act on.
-        let t = Tournament::build(&groups(&[&[0, 1, 2]]), Vec::new(), |i| i == 1);
+        let mut t = Tournament::build(&groups(&[&[0, 1, 2]]), Vec::new(), |i| i == 1);
+        assert!(t.enter(0));
         assert_eq!(t.pair(), Some((0, 2)));
         assert_eq!(t.progress(), (0, 2));
     }
 
     #[test]
-    fn a_pass_with_nothing_to_compare_is_finished_from_the_start() {
-        let t = Tournament::build(&groups(&[&[0, 1]]), Vec::new(), |_| true);
-        assert!(t.is_empty());
-        assert!(t.finished());
-        assert_eq!(t.pair(), None);
-    }
-
-    #[test]
-    fn deciding_after_the_end_does_nothing() {
-        let mut t = Tournament::build(&groups(&[&[0, 1]]), Vec::new(), |_| false);
+    fn deciding_outside_a_session_does_nothing() {
+        let mut t = build(&[&[0, 1]]);
         t.decide(Verdict::Left);
         let before = t.carry();
-        assert!(t.decide(Verdict::Right).is_empty());
+        // Past the end, `acted` is what says nothing happened.
+        assert!(!t.decide(Verdict::Right).acted);
+        assert!(!t.keep_rest().acted);
         assert_eq!(t.carry(), before);
     }
 
+    /// The rule that makes rebuilding cheap: a rebuild carries the
+    /// verdicts and re-asks nothing.
     #[test]
-    fn undo_puts_back_exactly_the_photos_the_last_verdict_settled() {
-        let mut t = Tournament::build(&groups(&[&[0, 1, 2]]), Vec::new(), |_| false);
-        t.decide(Verdict::Both);
-        // The second verdict ends the round, so it settles *two* photos —
-        // the challenger and the last one standing. Undo must return both.
+    fn rebuilding_resumes_rather_than_restarting() {
+        let gs = groups(&[&[0, 1, 2, 3]]);
+        let mut t = Tournament::build(&gs, Vec::new(), |_| false);
+        t.enter(0);
+        t.decide(Verdict::Left); // 1 is out for good
+
+        let mut again = Tournament::build(&gs, t.carry(), |_| false);
+        assert!(again.enter(0));
+        // 1 is decided and stays decided; the bracket re-forms around the
+        // three photos still in question.
+        assert_eq!(again.pair(), Some((0, 2)));
+        assert_eq!(again.progress(), (0, 3));
+    }
+
+    // ── Undo ──────────────────────────────────────────────────────
+
+    #[test]
+    fn undo_puts_back_exactly_what_the_last_verdict_settled() {
+        let mut t = build(&[&[0, 1, 2]]);
+        t.decide(Verdict::Left); // 1 out
+        assert_eq!(t.pair(), Some((0, 2)));
+
+        // The verdict that ends the session settles the survivor too.
         let ended = t.decide(Verdict::Left);
-        assert_eq!(ended.len(), 2);
-        assert!(t.finished());
+        assert_eq!(ended.settled, vec![(2, false), (0, true)]);
+        assert_eq!(t.pair(), None);
 
         let back = t.undo();
-        assert_eq!(back.len(), 2);
-        assert!(!t.finished());
-        assert_eq!(t.pair(), Some((1, 2)));
-        assert_eq!(kept(&t), vec![0]);
+        assert_eq!(back.withdrawn, vec![2, 0]);
+        assert_eq!(t.pair(), Some((0, 2)), "and the question comes back");
+        assert_eq!(out(&t), vec![1]);
+    }
+
+    /// Undo has to be able to reach back into a session the cursor has
+    /// already walked past, which is why it restores `at` itself rather
+    /// than leaving the caller to find its way back.
+    #[test]
+    fn undo_reopens_a_session_the_cursor_has_left() {
+        let mut t = build(&[&[0, 1]]);
+        t.decide(Verdict::Left);
+        assert_eq!(t.pair(), None);
+        t.undo();
+        assert_eq!(t.pair(), Some((0, 1)), "without anyone calling `enter`");
     }
 
     #[test]
     fn undo_walks_all_the_way_back_to_the_start() {
-        let mut t = Tournament::build(&groups(&[&[0, 1, 2], &[8, 9]]), Vec::new(), |_| false);
-        for v in [Verdict::Right, Verdict::Both, Verdict::Left] {
-            t.decide(v);
-        }
-        assert!(t.finished());
+        let gs: &[&[usize]] = &[&[0, 1, 2], &[8, 9]];
+        let mut t = Tournament::build(&groups(gs), Vec::new(), |_| false);
+        walk(&mut t, gs, |_, _| Verdict::Left);
         while t.can_undo() {
             t.undo();
         }
         assert_eq!(t.pair(), Some((0, 1)));
         assert!(t.carry().is_empty());
         assert_eq!(t.progress(), (0, 5));
+    }
+
+    #[test]
+    fn undo_restores_a_session_that_keep_rest_ended() {
+        let mut t = build(&[&[0, 1, 2, 3]]);
+        t.decide(Verdict::Both);
+        t.decide(Verdict::Both);
+        let before = t.pair();
+        t.keep_rest();
+        assert_eq!(t.pair(), None);
+        t.undo();
+        assert_eq!(t.pair(), before);
+        assert!(t.carry().is_empty());
+    }
+
+    // ── The strip under the panes ─────────────────────────────────
+
+    /// The strip shows the whole session, including what has been thrown
+    /// out — seeing what was rejected is half of why it is there.
+    #[test]
+    fn the_group_view_marks_left_right_still_in_and_out() {
+        let mut t = build(&[&[0, 1, 2, 3]]);
+        t.decide(Verdict::Left); // 1 is out
+        let g = t.group().unwrap();
+        assert_eq!(g.members(), &[0, 1, 2, 3]);
+        assert_eq!(g.state(2), CardState::Left);
+        assert_eq!(g.state(3), CardState::Right);
+        assert_eq!(g.state(0), CardState::In, "a winner waiting for round two");
+        assert_eq!(g.state(1), CardState::Out);
+        assert_eq!(g.alive(), 3);
     }
 
     // ── The renderer, end to end ──────────────────────────────────

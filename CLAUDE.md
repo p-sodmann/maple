@@ -413,27 +413,67 @@ single binary; the backend is fixed at compile time.
   Laplacian ranks a crisp badly-framed frame above the one where the child is looking at
   the camera, and once it is marked nobody looks again. So the marking is gone and the
   comparison is put in front of the user: two photos side by side, `1` keeps the left,
-  `2` the right, `3` both. It is a switch in the header beside "Hide old images", so
-  the ordinary one-photo triage is still there for anyone who wants it.
-  A real bracket does not fit: ⌈log₂ n⌉ rounds re-show photos already judged and there
-  is nowhere in one to put "keep both", which is the answer often enough that leaving it
-  out would be the feature's worst flaw. So it is a **single pass with an incumbent** —
-  left is whatever is still being defended, right is the next photo in capture order,
-  and the challenger takes over on both `2` and `3` because the scene drifts across a
-  session and the more recent frame is the better thing to compare the next one against.
-  One invariant carries the whole design: **only the incumbent's fate is still open.**
-  Everything behind it is settled and never asked about twice, the last one standing is
-  kept when a session runs out, and a session of *n* costs exactly *n* − 1 keystrokes
-  with every one of its photos decided. Losing is a **skip**, not an absence — it sets
-  `passed`, so `commit_skips` writes it to the medium's Skipped record and a re-scan
-  does not offer it again; recording it as "no answer yet" would hand the whole card
-  back next time. `u` undoes, and that is not a nicety: `1` and `2` are one key apart
-  and every press decides a photo for good.
-  The rounds are **rebuilt, never resumed**, from the groups and the verdicts carried
+  `2` the right, `3` both.
+  **It is a detour, not a mode.** The switch in the header only *enables* it; there is
+  nothing to flip between, because the view follows the cursor. Land on a photo that
+  belongs to a session and its bracket takes over; land on one in no session and it is
+  the ordinary single-photo triage, because there is nothing to compare it against.
+  `Tournament::enter` is the whole of that decision and `go_to` is the only way the
+  cursor moves, so every navigation path gets the right view without knowing the
+  tournament exists. This replaced a design where the tournament *was* a mode, which
+  meant a card was either all comparisons or all single photos — and the photos in no
+  session, a sixth of a real card, were never visited at all.
+  Each session is a **bracket**. **The first round pairs up photos nobody has looked at
+  yet** — (1,2), (3,4), (5,6) — so every photo gets its first comparison against a peer
+  and nothing is anyone's incumbent; later rounds are keeper against keeper over whoever
+  is still standing. Losing eliminates. `3` advances **both**, which is what makes "keep
+  both" mean something: not "I cannot decide" but "these both go through" — and a photo
+  it saves is still in the running and can still lose later. **Whoever is standing when
+  the session runs out of questions is kept**, and the cursor walks on past it.
+  Two rules make it terminate, and they are the whole correctness argument. A pair is
+  put to the user **once** (`Bracket::met`), so building a round either finds an unasked
+  pair — whose answer eliminates somebody or records a new meeting, both bounded — or
+  finds none, which ends the session. There is no way to loop and no way to be asked the
+  same question twice. Cost lands where it should: answer `1`/`2` throughout and a
+  session of *n* takes *n* − 1 comparisons, the theoretical minimum for finding a single
+  best; say "keep both" often and it costs more because more photos are still in the
+  running, which is the user asking for it. The ceiling is the complete graph, so `k`
+  (`keep_rest`) ends a session keeping whoever is standing — the bound on a session
+  answered `3` all the way down, and worth having anyway for "these are all fine". An
+  arrow steps over the whole session, and that is a **deferral**: nothing in it is
+  marked passed, because moving on from a question is not answering it.
+  A bracket shows two photos at a time, which leaves no sense of how far through a
+  session of twenty you are or what you already threw out — so **the whole session is
+  drawn as a strip under the panes** (`TourneyStrip`, `GroupView`), the two contestants
+  badged `L` and `R`, the eliminated dimmed and crossed. Its thumbnails are cached per
+  session because a verdict changes what the cards *say*, not what they show.
+  The cursor **stands on the left contestant** for as long as a session is on screen
+  (`publish_tournament` moves it). Keeping the two in lockstep by construction is what
+  makes `enter` idempotent and what lets an undo reopen a session the cursor has already
+  walked past — the restored pair pulls the cursor back rather than the cursor having to
+  be repaired afterwards.
+  One trap the bracket sprang, and the reason `decide` returns a `Decision` rather than
+  a bare `Vec`: **a verdict that settles nobody is not a verdict that did nothing.** `3`
+  advances both photos and eliminates neither, so mid-session it settles no one — and
+  the UI gated its repaint on the settled list being non-empty (true while the pass
+  still had an incumbent, where every verdict settled someone). So `3` advanced the
+  bracket behind the user's back and never repainted: dead in the middle of a session,
+  working at the end of one, where the session closes and its survivors settle. `acted`
+  and `settled` are separate fields so the mistake is hard to write again. It is worth
+  knowing that no test covers this: the bug lives in `apply_verdict`, which needs a live
+  `ImportWindow`, so the type is the guard rather than the suite.
+  Losing is a **skip**, not an absence — it sets `passed`, so `commit_skips` writes it
+  to the medium's Skipped record and a re-scan does not offer it again; recording it as
+  "no answer yet" would hand the whole card back next time. `u` undoes, and that is not
+  a nicety: `1` and `2` are one key apart and every press eliminates a photo. Undo is a
+  **whole-bracket snapshot** rather than an incremental rewind — a bracket is one
+  session, so cloning it is nothing, and a decision touches `alive`, `met`, `queue` and
+  the round counter at once.
+  The brackets are **rebuilt, never resumed**, from the groups and the verdicts carried
   inside the `Tournament` itself (`carry`) rather than in a second copy beside it. That
-  one rule buys three behaviours free: switching the mode off and on resumes, correcting
-  a session boundary re-groups what is *left*, and a photo already in the library never
-  enters a comparison whose result could not be acted on.
+  one rule buys three behaviours free: switching the feature off and on resumes,
+  correcting a session boundary re-groups what is *left*, and a photo already in the
+  library never enters a comparison whose result could not be acted on.
   **Paired zooming is the reason it can replace a sharpness score at all**, and it only
   works because the crop comes off the *original*: scaling up a 256 px canonical preview
   would show big soft blocks, which is the exact opposite of the judgement being asked
@@ -441,25 +481,24 @@ single binary; the backend is fixed at compile time.
   ~34 MB a side) on one worker thread and `maple_import::preview::render_region` cuts the
   visible rectangle out of one at pane resolution — Rust renders to exactly the pane's
   pixel size rather than letting Slint scale, or a zoomed pixel would be a resampled
-  resample. The incumbent's decode carries forward, so a verdict costs one new decode.
-  Requests **coalesce** — a drag makes them faster than they can be served, so the queue
-  is drained to its newest entry per side, the same "re-prioritise by overwriting, never
-  by cancelling" trade `import_previews.rs` makes. There is **one** zoom and **one**
-  centre, in Rust, and both panes are drawn from them; two panes each keeping their own
-  and following each other would drift the first time a render was dropped. The centre
-  is *normalised* (`crop_for` takes `cx`/`cy` in 0..1), which is what keeps a portrait
-  and a landscape frame paired, and `clamp_center` reads **one** image rather than
-  reconciling both — near an edge the shorter frame simply stops instead of dragging the
-  other off whatever was being compared. Two smaller rules with visible consequences: a
-  new pair resets to fit (`PairView::fit`), because a zoom is a question about *these*
-  two frames; and a pane whose photo did **not** change is left alone, or `1` — the most
-  common keystroke — would drop the one thing being compared back to its placeholder and
-  redraw the identical crop a moment later. The placeholder itself is the canonical
-  preview inflated inline (~1 ms), because a raw's decode can take half a second and an
-  empty frame for that long on every verdict reads as broken. The zoom **survives inside
-  a session and is dropped between them**: twenty frames of one child in one room are
-  framed alike, so re-zooming onto the eyes nineteen times is the tedium the feature
-  exists to remove, while the next session is a different scene.
+  resample. Requests **coalesce** — a drag makes them faster than they can be served, so
+  the queue is drained to its newest entry per side, the same "re-prioritise by
+  overwriting, never by cancelling" trade `import_previews.rs` makes. There is **one**
+  zoom and **one** centre, in Rust, and both panes are drawn from them; two panes each
+  keeping their own and following each other would drift the first time a render was
+  dropped. The centre is *normalised* (`crop_for` takes `cx`/`cy` in 0..1), which is what
+  keeps a portrait and a landscape frame paired, and `clamp_center` reads **one** image
+  rather than reconciling both — near an edge the shorter frame simply stops instead of
+  dragging the other off whatever was being compared. Two smaller rules with visible
+  consequences: a new pair resets to fit (`PairView::fit`), because a zoom is a question
+  about *these* two frames; and a pane whose photo did **not** change is left alone, or
+  `1` would drop the one thing being compared back to its placeholder and redraw the
+  identical crop a moment later. The placeholder itself is the canonical preview inflated
+  inline (~1 ms), because a raw's decode can take half a second and an empty frame for
+  that long on every verdict reads as broken. The zoom **survives inside a session and is
+  dropped between them**: twenty frames of one child in one room are framed alike, so
+  re-zooming onto the eyes nineteen times is the tedium the feature exists to remove,
+  while the next session is a different scene.
   One trap worth knowing before hanging anything else off a `changed` handler here: the
   panes report their own pixel size, and *everything* on screen is rendered to that
   number, so a report that never arrives leaves both panes blank forever. It is reported
@@ -467,6 +506,31 @@ single binary; the backend is fixed at compile time.
   width`, **and** `pane_size` falls back to half the window when nothing has been
   reported — a slightly soft render until the real number lands is a better failure than
   a feature that does not draw.
+- **The zoom belongs to both views** (`wire_preview_zoom` in `maple-ui/src/import.rs`,
+  `ZoomSurface` in `import.slint`): a comparison and a single photo ask the same question
+  — is *this* frame sharp — so the single-photo view zooms with the same wheel, the same
+  `0`/`+`/`-`, and the same geometry (`crop_for`/`zoom_at`/`clamp_center`); the pointer,
+  the drag and the view's pixel size reach Rust through the one surface both views hang
+  over their picture. Sharing became the point the moment the tournament stopped being a
+  mode: the cursor walks in and out of sessions along one pass, so a zoom that lived only
+  in the panes disappeared whenever the user landed on a photo in no session — a sixth of
+  a real card, and the reading it invited was "the zoom is broken".
+  What is deliberately *not* shared is the state. The pair's zoom survives across a
+  session because twenty frames of one child are framed alike; the next photo along the
+  strip is a new question, so this one resets to fit on every navigation — which is also
+  what stops a walk through a card from holding a 34 MB decode of everything it passed.
+  At fit the feature costs nothing: `preview-photo` is the ordinary 1200 px render and no
+  original is opened. The first notch out of fit spawns the renderer, and from then until
+  the photo changes every frame on screen is a crop cut to the view's exact pixel size —
+  the same `PairRenderer`, one side of it asked for, its two-decode cache making a step
+  back to the previous photo free. Three smaller rules with visible consequences. The
+  canonical preview's own dimensions seed the geometry (`preview_src`), so the *first*
+  notch already zooms towards the pointer rather than the middle: only the aspect is used
+  and a 256 px copy has the same one. The fit render lands on a thread that cannot hold
+  the (`Rc`-based) context, so it reads `current-index` and `preview-zoom-level` back off
+  the window before painting — without that a slow 1200 px render drops over a crop the
+  user has already zoomed to. And a rotation *drops* the renderer instead of reusing it,
+  because the file has just been rewritten under the decode cached against its path.
 - **Import previews are inflated on demand** (`maple-ui/src/import_previews.rs`): a card
   of a few thousand photos will not fit in memory as decoded frames (~196 KB each) and
   almost none of them are on screen, so the browser holds the canonical WebPs and decodes
