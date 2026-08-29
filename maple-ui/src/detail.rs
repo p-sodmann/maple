@@ -365,7 +365,13 @@ fn wire_face_overlay(window: &DetailWindow, nav: &NavState) {
             let Some(bbox) = normalise_draw_box(geometry(&w), vx0, vy0, vx1, vy1) else {
                 return;
             };
-            if let Some(face_id) = insert_new_face(iid, bbox, &mut nav.faces.borrow_mut(), &nav.db) {
+            // Bind the insert's result to a `let` first: an `if let` scrutinee
+            // keeps its temporaries alive for the whole block (edition 2021),
+            // so the `borrow_mut()` guard would still be held when the body
+            // re-borrows `nav.faces` below — a BorrowError panic, and inside a
+            // Slint callback that is a non-unwinding abort.
+            let inserted = insert_new_face(iid, bbox, &mut nav.faces.borrow_mut(), &nav.db);
+            if let Some(face_id) = inserted {
                 let boxes = build_face_boxes(&nav.faces.borrow(), &nav.known_embeddings.borrow());
                 w.set_face_boxes(boxes);
                 // Immediately open the assignment panel for the new box.
