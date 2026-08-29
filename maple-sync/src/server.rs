@@ -420,10 +420,53 @@ fn signed_stream<F>(
 where
     F: FnOnce(&Ctx, &str, &mut tiny_http::Request) -> Result<Payload, ErrorBody>,
 {
-    let credential = credential(request)?;
-    verify(ctx, &credential, method, url, &[])?;
+    // Both rejections drain first — see `reject_streamed`. The sender is
+    // already writing a photograph into this socket, and answering without
+    // reading it closes the connection under a client that then reports a
+    // broken pipe instead of the error it was actually sent.
+    let credential = match credential(request) {
+        Ok(credential) => credential,
+        Err(error) => return Err(reject_streamed(request, error)),
+    };
+    if let Err(error) = verify(ctx, &credential, method, url, &[]) {
+        return Err(reject_streamed(request, error));
+    }
     let device_id = credential.device_id.clone();
     f(ctx, &device_id, request)
+}
+
+/// Answer a *streamed* request with an error, after consuming its body.
+///
+/// `tiny_http` closes the connection when a handler responds without reading
+/// the request body — and on this one route the body is a photograph the
+/// sender is still writing. So the client's write fails and it reports
+/// `io: Broken pipe` rather than the JSON error it was actually sent.
+///
+/// Which would be a cosmetic problem if the two meant the same thing to the
+/// caller, and they do not. `transfer::send_file` maps `NotFound` and
+/// `BadRequest` to "skip this one file, keep the link" and *everything else*
+/// to "the link is down" — so an ordinary per-file rejection came back
+/// unrecognisable, ended the whole pass, and put the servant into backoff.
+/// The next pass reached the same file and failed identically: sync stops
+/// dead at the first photo the master declines, with nothing in the log but a
+/// broken pipe and a growing retry delay.
+///
+/// Draining is bounded by the same cap the accepting path uses. Past that the
+/// connection does drop, which is the right answer to a peer sending more
+/// than the protocol allows — and unlike the rejections above, it is not a
+/// case a well-behaved client can reach.
+fn reject_streamed(request: &mut tiny_http::Request, error: ErrorBody) -> ErrorBody {
+    let mut body = std::io::Read::take(request.as_reader(), MAX_UPLOAD_BYTES);
+    match std::io::copy(&mut body, &mut std::io::sink()) {
+        Ok(drained) => {
+            tracing::debug!("sync server: drained {drained} bytes before answering {}", error.code)
+        }
+        // The sender gave up mid-body, or the socket died. Nothing to do —
+        // the error still goes out, and if the connection is gone it simply
+        // does not arrive.
+        Err(e) => tracing::debug!("sync server: could not drain a rejected upload: {e}"),
+    }
+    error
 }
 
 fn credential(request: &tiny_http::Request) -> Result<SignedRequest, ErrorBody> {
@@ -647,7 +690,10 @@ fn blob_upload(
     path: &str,
     raw: bool,
 ) -> Result<Payload, ErrorBody> {
-    let hash = blob_hash(path, route::BLOB_ORIG)?;
+    let hash = match blob_hash(path, route::BLOB_ORIG) {
+        Ok(hash) => hash,
+        Err(error) => return Err(reject_streamed(request, error)),
+    };
 
     let row = {
         let db = lock(&ctx.db);
@@ -657,16 +703,16 @@ fn blob_upload(
         // Not an error on the sender's part: it asked what was wanted, and
         // between then and now another servant may have supplied this very
         // photo. `NotFound` is the code that has it drop this file and keep
-        // the link.
-        return Err(ErrorBody::new(
-            ErrorCode::NotFound,
-            "nothing here is waiting for that hash",
+        // the link — which it can only read if the body is drained first.
+        return Err(reject_streamed(
+            request,
+            ErrorBody::new(ErrorCode::NotFound, "nothing here is waiting for that hash"),
         ));
     };
     if raw && row.raw_filename.is_none() {
-        return Err(ErrorBody::new(
-            ErrorCode::BadRequest,
-            "that photo has no companion here",
+        return Err(reject_streamed(
+            request,
+            ErrorBody::new(ErrorCode::BadRequest, "that photo has no companion here"),
         ));
     }
 

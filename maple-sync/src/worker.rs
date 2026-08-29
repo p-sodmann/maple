@@ -41,6 +41,24 @@
 //! credential does not travel with the record, so a machine advertising
 //! someone else's id gains nothing but a connection that fails its MAC.
 //!
+//! # Being woken, not just stopped
+//!
+//! The loop's sleep is a condvar wait over two flags rather than the
+//! `recv_timeout` on an `mpsc` channel it started as, because the pill grew a
+//! "Retry" button and the loop therefore has to be *woken* as well as
+//! stopped. A message on a bounded channel is the wrong shape for that twice
+//! over: a queued retry can occupy the slot a stop needs, so shutdown would
+//! block on a user's impatience, and `try_recv` **consumes** — so of the
+//! several places that poll for a stop mid-pass, exactly one could ever see
+//! it. Flags are idempotent and every reader sees them, and asking is a lock
+//! and a notify, which matters because the ask comes from the UI thread while
+//! a pass in flight can be a two-minute round trip.
+//!
+//! A retry skips the rest of the pending delay but does **not** reset the
+//! backoff schedule: that measures how long this endpoint has been failing,
+//! and clicking cannot be allowed to pin it at one second against a master
+//! that is genuinely down. A pass that *succeeds* resets it anyway.
+//!
 //! # Why an auth failure ends the thread
 //!
 //! §1.4: a rejected credential is not a network problem and will not fix
@@ -48,8 +66,7 @@
 //! than sleeping and trying again, so nothing keeps a dead credential warm.
 //! Re-pairing spawns a new worker.
 
-use std::sync::mpsc::{self, RecvTimeoutError, SyncSender, TryRecvError};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 
 use maple_db::Database;
@@ -135,9 +152,72 @@ const CATCHUP_INTERVAL: Duration = Duration::from_secs(2);
 /// answering the wrong question.
 const RELOCATE_DELAY: Duration = Duration::from_secs(1);
 
+/// The worker's two out-of-band requests, and the sleep they interrupt.
+///
+/// A pair of flags behind a condvar rather than the `mpsc` channel this used
+/// to be, for one reason: the loop now has to be *woken*, not only stopped.
+/// A message on a bounded channel is the wrong shape for that — a queued
+/// retry can occupy the slot a stop needs, so the shutdown path would block
+/// on a user's impatience — and `try_recv` *consumes*, so exactly one of the
+/// several places that poll for a stop can ever see one. Flags have neither
+/// problem: they are idempotent, every reader sees them, and
+/// [`Self::request`] never blocks, which matters because it is called from
+/// the UI thread.
+#[derive(Default)]
+struct ControlState {
+    stop: bool,
+    /// Set by [`SyncWorker::retry_now`]; cleared when a pass begins, so a
+    /// click that lands while a pass is already running is answered by that
+    /// pass rather than by a redundant second one.
+    retry_now: bool,
+}
+
+#[derive(Default)]
+struct Control {
+    state: Mutex<ControlState>,
+    wake: Condvar,
+}
+
+/// Why a sleep ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Wake {
+    Elapsed,
+    RetryNow,
+    Stop,
+}
+
+impl Control {
+    fn request(&self, f: impl FnOnce(&mut ControlState)) {
+        f(&mut lock(&self.state));
+        self.wake.notify_all();
+    }
+
+    fn stopping(&self) -> bool {
+        lock(&self.state).stop
+    }
+
+    /// Sleep for `dur`, returning early if the worker is asked to stop or to
+    /// try again now.
+    fn sleep(&self, dur: Duration) -> Wake {
+        let (mut state, timeout) = self
+            .wake
+            .wait_timeout_while(lock(&self.state), dur, |s| !s.stop && !s.retry_now)
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if state.stop {
+            return Wake::Stop;
+        }
+        if state.retry_now {
+            state.retry_now = false;
+            return Wake::RetryNow;
+        }
+        debug_assert!(timeout.timed_out());
+        Wake::Elapsed
+    }
+}
+
 /// A running servant loop. Dropping it stops the thread.
 pub struct SyncWorker {
-    stop: SyncSender<()>,
+    control: Arc<Control>,
     thread: Option<std::thread::JoinHandle<()>>,
 }
 
@@ -146,8 +226,22 @@ impl SyncWorker {
         self.stop_and_join();
     }
 
+    /// Run a pass now, instead of waiting out the pending retry delay.
+    ///
+    /// What the "Retry" button beside an offline pill calls. The backoff
+    /// schedule answers "how long has this endpoint been failing", and a user
+    /// who has just plugged the cable back in is telling us that question is
+    /// no longer the right one — so the pass runs immediately and, if it
+    /// works, `on_success` resets the schedule anyway.
+    ///
+    /// Never blocks and never joins: it is called from the UI thread, and a
+    /// pass in flight can be a two-minute round trip.
+    pub fn retry_now(&self) {
+        self.control.request(|s| s.retry_now = true);
+    }
+
     fn stop_and_join(&mut self) {
-        let _ = self.stop.send(());
+        self.control.request(|s| s.stop = true);
         if let Some(thread) = self.thread.take() {
             let _ = thread.join();
         }
@@ -178,7 +272,8 @@ struct PassOutcome {
 
 /// Start syncing with a master.
 pub fn spawn(config: WorkerConfig, deps: WorkerDeps) -> SyncWorker {
-    let (stop_tx, stop_rx) = mpsc::sync_channel(1);
+    let control = Arc::new(Control::default());
+    let worker_control = control.clone();
     let WorkerDeps {
         db,
         trust,
@@ -241,7 +336,11 @@ pub fn spawn(config: WorkerConfig, deps: WorkerDeps) -> SyncWorker {
                         message: "no address for the master yet".into(),
                     }))
                 } else {
-                    run_pass(&db, &trust, &status, &client, &config, &stop_rx)
+                    // Clearing here rather than in `sleep` is what makes a
+                    // click during a running pass a no-op: this pass is the
+                    // answer to it.
+                    worker_control.request(|s| s.retry_now = false);
+                    run_pass(&db, &trust, &status, &client, &config, &worker_control)
                 };
                 match pass {
                     Ok(outcome) => {
@@ -260,9 +359,8 @@ pub fn spawn(config: WorkerConfig, deps: WorkerDeps) -> SyncWorker {
                         } else {
                             config.interval
                         };
-                        match stop_rx.recv_timeout(wait) {
-                            Ok(_) | Err(RecvTimeoutError::Disconnected) => break,
-                            Err(RecvTimeoutError::Timeout) => {}
+                        if worker_control.sleep(wait) == Wake::Stop {
+                            break;
                         }
                     }
                     Err(PassError::Stopped) => break,
@@ -325,9 +423,18 @@ pub fn spawn(config: WorkerConfig, deps: WorkerDeps) -> SyncWorker {
                                     },
                                     Some(failure.to_string()),
                                 );
-                                match stop_rx.recv_timeout(delay) {
-                                    Ok(_) | Err(RecvTimeoutError::Disconnected) => break,
-                                    Err(RecvTimeoutError::Timeout) => {}
+                                match worker_control.sleep(delay) {
+                                    Wake::Stop => break,
+                                    // The user asked. Skip the rest of the
+                                    // delay; the schedule itself is left
+                                    // alone, so if this attempt fails too the
+                                    // next wait is the one it would have been
+                                    // — clicking cannot pin the retry at one
+                                    // second against a master that is down.
+                                    Wake::RetryNow => {
+                                        tracing::info!("sync worker: retrying now, by request")
+                                    }
+                                    Wake::Elapsed => {}
                                 }
                             }
                         }
@@ -340,7 +447,7 @@ pub fn spawn(config: WorkerConfig, deps: WorkerDeps) -> SyncWorker {
         .expect("failed to spawn sync worker thread");
 
     SyncWorker {
-        stop: stop_tx,
+        control,
         thread: Some(thread),
     }
 }
@@ -363,7 +470,7 @@ fn run_pass(
     status: &StatusCell,
     client: &SyncClient,
     config: &WorkerConfig,
-    stop_rx: &mpsc::Receiver<()>,
+    control: &Control,
 ) -> Result<PassOutcome, PassError> {
     let hello = client.hello()?;
     SyncClient::check_compatible(&hello)?;
@@ -387,7 +494,7 @@ fn run_pass(
     // ── Pull ────────────────────────────────────────────────────
     let mut seen = 0usize;
     for _ in 0..MAX_ROUNDS {
-        check_stop(stop_rx)?;
+        check_stop(control)?;
         let since = watermark(db, &config.master_device_id).0;
         let batch = client.pull(&key, since, config.max_revs, mode)?;
         if batch.next_rev <= since {
@@ -426,7 +533,7 @@ fn run_pass(
 
     // ── Push ────────────────────────────────────────────────────
     for _ in 0..MAX_ROUNDS {
-        check_stop(stop_rx)?;
+        check_stop(control)?;
         let since = watermark(db, &config.master_device_id).1;
         let batch = {
             let guard = lock(db);
@@ -472,14 +579,14 @@ fn run_pass(
     // row exists to be filled in, and can only be uploaded once the master
     // has a row to want it. On a first sync the two happen in the same pass,
     // in this order.
-    check_stop(stop_rx)?;
+    check_stop(control)?;
     let files = transfer::transfer(
         db,
         client,
         &key,
         mode,
         &config.layout,
-        &|| matches!(stop_rx.try_recv(), Ok(_) | Err(TryRecvError::Disconnected)),
+        &|| control.stopping(),
         &|done, total| {
             set_state(
                 status,
@@ -587,10 +694,11 @@ fn peer_key(trust: &Arc<Mutex<TrustStore>>, master_device_id: &str) -> Result<Pe
         })
 }
 
-fn check_stop(stop_rx: &mpsc::Receiver<()>) -> Result<(), PassError> {
-    match stop_rx.try_recv() {
-        Ok(_) | Err(TryRecvError::Disconnected) => Err(PassError::Stopped),
-        Err(TryRecvError::Empty) => Ok(()),
+fn check_stop(control: &Control) -> Result<(), PassError> {
+    if control.stopping() {
+        Err(PassError::Stopped)
+    } else {
+        Ok(())
     }
 }
 
@@ -636,5 +744,60 @@ fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     match mutex.lock() {
         Ok(guard) => guard,
         Err(poisoned) => poisoned.into_inner(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A retry request cuts a long sleep short.
+    ///
+    /// The whole of what the "Retry" button buys: the backoff schedule caps
+    /// at a minute, and a user who has just fixed the network should not
+    /// spend it watching a red pill.
+    #[test]
+    fn a_retry_request_ends_the_wait_early() {
+        let control = Arc::new(Control::default());
+        let asker = control.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(20));
+            asker.request(|s| s.retry_now = true);
+        });
+
+        let started = std::time::Instant::now();
+        assert_eq!(control.sleep(Duration::from_secs(60)), Wake::RetryNow);
+        assert!(started.elapsed() < Duration::from_secs(5), "it waited out the delay");
+        // Consumed, so the *next* wait is a real one rather than spinning.
+        assert!(!lock(&control.state).retry_now);
+    }
+
+    /// A stop always wins, and unlike the message it replaced it is not
+    /// consumed by whoever reads it first.
+    #[test]
+    fn stopping_is_latched_and_visible_to_every_reader() {
+        let control = Control::default();
+        control.request(|s| s.stop = true);
+        assert_eq!(control.sleep(Duration::from_secs(60)), Wake::Stop);
+        // The old `try_recv` handed the single stop message to one caller and
+        // left the rest seeing an empty channel. Every poll site has to see
+        // this one, or a pass carries on inside `transfer` after the loop has
+        // been told to quit.
+        assert!(control.stopping());
+        assert!(control.stopping());
+        assert!(check_stop(&control).is_err());
+    }
+
+    /// A retry asked for while a pass is already running is answered by that
+    /// pass, not by a second one queued behind it.
+    #[test]
+    fn a_retry_during_a_pass_does_not_queue_another() {
+        let control = Control::default();
+        control.request(|s| s.retry_now = true);
+        // What the loop does at the top of every pass.
+        control.request(|s| s.retry_now = false);
+        let started = std::time::Instant::now();
+        assert_eq!(control.sleep(Duration::from_millis(60)), Wake::Elapsed);
+        assert!(started.elapsed() >= Duration::from_millis(50));
     }
 }

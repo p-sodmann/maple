@@ -86,6 +86,17 @@ pub struct StatusDisplay {
     /// Whether the dot animates. Reserved for the states where something is
     /// actively in flight, so a still dot genuinely means "nothing happening".
     pub pulsing: bool,
+    /// Whether "try again now" is a thing the user can usefully ask for.
+    ///
+    /// True for exactly one state, and the exclusions are the point.
+    /// [`SyncState::Unauthorized`] looks like the state that most wants a
+    /// retry button and is the one place it would be a lie: the worker has
+    /// *returned* (see `worker`'s module docs), so there is no loop to wake,
+    /// and the credential will be just as dead next time. What that state
+    /// needs is re-pairing, which is what clicking the pill already offers.
+    /// `Connecting` and `Running` are already trying, and a master has no
+    /// worker at all — it is passive, and dials nobody.
+    pub retryable: bool,
 }
 
 /// The shared status cell. Written by the sync worker (P5), read by the
@@ -145,6 +156,7 @@ impl SyncStatus {
                 label: "Sync off".into(),
                 tone: StatusTone::Grey,
                 pulsing: false,
+                retryable: false,
             };
         }
 
@@ -153,21 +165,25 @@ impl SyncStatus {
                 label: "Sync off".into(),
                 tone: StatusTone::Grey,
                 pulsing: false,
+                retryable: false,
             },
             SyncState::Unauthorized => StatusDisplay {
                 label: "Re-pair required".into(),
                 tone: StatusTone::Red,
                 pulsing: false,
+                retryable: false,
             },
             SyncState::Offline { retry_secs } => StatusDisplay {
                 label: format!("Offline · retry {retry_secs}s"),
                 tone: StatusTone::Red,
                 pulsing: false,
+                retryable: true,
             },
             SyncState::Running { done, total } => StatusDisplay {
                 label: format!("Syncing {done}/{total}"),
                 tone: StatusTone::Green,
                 pulsing: true,
+                retryable: false,
             },
             // A master is passive: it does not connect to anything, it waits
             // to be connected to. "Connecting…" would be a lie, and so would
@@ -179,12 +195,14 @@ impl SyncStatus {
                         label: "Listening · no devices".into(),
                         tone: StatusTone::Amber,
                         pulsing: false,
+                        retryable: false,
                     }
                 } else {
                     StatusDisplay {
                         label: format!("{} {}", self.peers_online, plural_devices(self.peers_online)),
                         tone: StatusTone::Green,
                         pulsing: false,
+                        retryable: false,
                     }
                 }
             }
@@ -192,11 +210,13 @@ impl SyncStatus {
                 label: "Connecting…".into(),
                 tone: StatusTone::Amber,
                 pulsing: true,
+                retryable: false,
             },
             SyncState::Idle => StatusDisplay {
                 label: "Synced".into(),
                 tone: StatusTone::Green,
                 pulsing: false,
+                retryable: false,
             },
         }
     }
@@ -307,6 +327,22 @@ mod tests {
         }
     }
 
+    /// Only the state a retry can actually change offers one.
+    #[test]
+    fn only_offline_offers_a_retry() {
+        // Unauthorized is the trap: it is red, it looks stuck, and it is the
+        // one state where the worker has already returned — so a retry
+        // button there would be a control wired to nothing. Its answer is
+        // re-pairing, which is what clicking the pill offers.
+        assert!(servant(SyncState::Offline { retry_secs: 30 }).display().retryable);
+        assert!(!servant(SyncState::Unauthorized).display().retryable);
+        assert!(!servant(SyncState::Connecting).display().retryable);
+        assert!(!servant(SyncState::Idle).display().retryable);
+        assert!(!servant(SyncState::Running { done: 1, total: 9 }).display().retryable);
+        // And a master dials nobody, so there is nothing for it to retry.
+        assert!(!master(SyncState::Connecting, 0).display().retryable);
+    }
+
     #[test]
     fn master_mode_reads_differently_from_servant_mode() {
         // The three readings §1.3 gives a master: grey off, amber listening,
@@ -316,7 +352,8 @@ mod tests {
             StatusDisplay {
                 label: "Sync off".into(),
                 tone: StatusTone::Grey,
-                pulsing: false
+                pulsing: false,
+                retryable: false
             }
         );
         assert_eq!(
@@ -324,7 +361,8 @@ mod tests {
             StatusDisplay {
                 label: "Listening · no devices".into(),
                 tone: StatusTone::Amber,
-                pulsing: false
+                pulsing: false,
+                retryable: false
             }
         );
         assert_eq!(
@@ -332,7 +370,8 @@ mod tests {
             StatusDisplay {
                 label: "2 devices".into(),
                 tone: StatusTone::Green,
-                pulsing: false
+                pulsing: false,
+                retryable: false
             }
         );
     }

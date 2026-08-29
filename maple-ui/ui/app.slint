@@ -293,12 +293,23 @@ component SyncPill inherits Rectangle {
     // which is what makes the dot breathe. A pure-Slint animation would need
     // its own clock.
     in property <bool>   pulse-on: false;
+    // Whether this state is one the user can usefully ask to try again.
+    // Decided in Rust (`StatusDisplay::retryable`) rather than from the
+    // label here: "Re-pair required" is the state that most looks like it
+    // wants a retry and is the one where the worker has already exited.
+    in property <bool>   can-retry: false;
     callback clicked;
+    callback retry;
 
     height: 34px;
     border-radius: Theme.radius-btn;
     background: pill-ta.has-hover ? Theme.border.with-alpha(0.5) : transparent;
     animate background { duration: 100ms; }
+
+    // Declared before the layout, so the Retry button's own TouchArea sits
+    // *above* it and gets the click. Text and Rectangle do not capture
+    // pointer events, so everywhere else on the pill still reaches this one.
+    pill-ta := TouchArea { clicked => { root.clicked(); } }
 
     HorizontalLayout {
         padding-left: 8px;
@@ -325,9 +336,30 @@ component SyncPill inherits Rectangle {
             horizontal-stretch: 1;
             overflow: elide;
         }
+        // Offline says when it will try again; this is how the user says
+        // "now". Sized small and shown only when it can act, so the pill
+        // stays one 34 px row in every other state.
+        if root.can-retry: Rectangle {
+            width: 46px;
+            height: 22px;
+            horizontal-stretch: 0;
+            y: (parent.height - self.height) / 2;
+            border-radius: 6px;
+            border-width: 1px;
+            border-color: Theme.border;
+            background: retry-ta.has-hover ? Theme.surface : Theme.field;
+            animate background { duration: 100ms; }
+            Text {
+                text: "Retry";
+                color: Theme.ink-2;
+                font-size: 11px;
+                font-weight: 500;
+                horizontal-alignment: center;
+                vertical-alignment: center;
+            }
+            retry-ta := TouchArea { clicked => { root.retry(); } }
+        }
     }
-
-    pill-ta := TouchArea { clicked => { root.clicked(); } }
 }
 
 export component AppWindow inherits Window {
@@ -456,7 +488,9 @@ export component AppWindow inherits Window {
     in property <color>  sync-pill-color:   #8A837A;
     in property <bool>   sync-pill-pulsing: false;
     in property <bool>   sync-pill-pulse-on: false;
+    in property <bool>   sync-pill-can-retry: false;
     callback sync-pill-clicked;
+    callback sync-retry-clicked;
 
     callback settings-clicked;
     callback debug-clicked;
@@ -614,7 +648,9 @@ export component AppWindow inherits Window {
                     dot-color: root.sync-pill-color;
                     pulsing:   root.sync-pill-pulsing;
                     pulse-on:  root.sync-pill-pulse-on;
+                    can-retry: root.sync-pill-can-retry;
                     clicked => { root.sync-pill-clicked(); }
+                    retry   => { root.sync-retry-clicked(); }
                 }
                 Rectangle { height: 6px; }
 

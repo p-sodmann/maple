@@ -269,6 +269,40 @@ single binary; the backend is fixed at compile time.
   ("Hide Remote" in the library header) is the escape hatch, and is a filter on the
   *query* rather than on the model because the grid pages 500 rows at a time — filtering
   the model would leave the header count describing a different set from the tiles.
+- **A rejected upload has to be *answered***
+  (`server::reject_streamed`): `/blob/orig` is the one route whose body is a
+  photograph, and `signed_stream` hands the handler a request with its body
+  still unread. `tiny_http` closes the connection when a handler responds
+  without reading that body — so the sender, still writing, reported
+  `io: Broken pipe` instead of the JSON error it had actually been sent. Which
+  would be cosmetic if the two meant the same thing, and they do not:
+  `transfer::send_file` maps `NotFound`/`BadRequest` to "skip this one file,
+  keep the link" and *everything else* to "the link is down". So an ordinary
+  per-file rejection ended the whole pass, the servant went into backoff, and
+  the next pass reached the same photo and died identically — sync stopping
+  dead at the first file the master declined, with nothing in the log but a
+  broken pipe and a growing retry delay. Every early return on that route now
+  drains first. The existing refusal tests could not see it because they send a
+  handful of bytes, which fit in the socket buffer; a test needs a body larger
+  than that (`a_refused_upload_is_answered_rather_than_hung_up_on`). Transport
+  failures also name their route now — `io: Broken pipe` alone does not say
+  whether an upload was rejected or the network dropped, and the two want
+  opposite reactions.
+- **The worker is woken, not only stopped** (`worker::Control`): the sleep is a
+  condvar over a `stop`/`retry_now` flag pair rather than `recv_timeout` on an
+  `mpsc` channel, because the status pill grew a **Retry** button. A bounded
+  channel is the wrong shape twice: a queued retry can occupy the slot a stop
+  needs, so shutdown would block on a user's impatience, and `try_recv`
+  *consumes* — so of the several mid-pass stop checks exactly one could see a
+  stop. Asking never blocks and never joins, which is the point, since it comes
+  from the UI thread and a pass in flight can be a two-minute round trip
+  (`SyncSupervisor::retry_now`, deliberately not `restart`, which joins).
+  A retry skips the pending delay but does **not** reset the backoff schedule —
+  clicking must not pin the retry at one second against a master that is down.
+  The button appears for `SyncState::Offline` alone
+  (`StatusDisplay::retryable`); `Unauthorized` is the state that most looks
+  like it wants one and is the one where the worker has already returned, so
+  its answer is re-pairing.
 - **Repairs are binaries, not migrations** (`maple-db/src/repair.rs`,
   `cargo run -p maple-db --bin repair-companions -- <library.db> [--apply]`): a
   `user_version` step replays on every fresh database and may only touch SQL, and what a

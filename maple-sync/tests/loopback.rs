@@ -2304,6 +2304,57 @@ fn a_companion_found_after_the_photo_replicated_still_crosses() {
     );
 }
 
+/// A rejected upload comes back as its error code, not as a dead connection.
+///
+/// The existing refusal tests all send a handful of bytes, which fit in the
+/// socket buffer — so the master could answer without reading the body and
+/// the client never noticed. A *photograph* does not fit. The master closed
+/// the connection under a client still writing, which reported
+/// `io: Broken pipe` instead of the `NotFound` it had actually been sent —
+/// and `send_file` maps NotFound to "skip this file" but a transport error to
+/// "the link is down". So an ordinary per-file rejection ended the whole
+/// pass, the servant went into backoff, and the next pass reached the same
+/// file and died the same way: sync stopped dead at the first photo the
+/// master declined.
+#[test]
+fn a_refused_upload_is_answered_rather_than_hung_up_on() {
+    let clock = TestClock::new();
+    let master = Master::start(&clock, seeded(124));
+    let servant = Install::new("Laptop");
+    let client = client(&master, &servant, &clock, seeded(125));
+    let outcome = pair(&master, &servant, &client, &clock, "482107", "314159").unwrap();
+
+    // Never announced to the master, so nothing there is waiting for it.
+    // Big enough not to fit in a socket buffer, which is the whole point:
+    // the master answers long before the last byte is written.
+    let bytes = vec![0xA5u8; 4 * 1024 * 1024];
+    let hash = maple_import::hash_bytes(&bytes);
+    assert!(master.install.db().row_wanting(&hash).unwrap().is_none());
+
+    let failure = client
+        .upload_orig(&outcome.key, &hash, false, &mut &bytes[..])
+        .expect_err("the master wants nothing with that hash");
+    assert_eq!(
+        failure.code,
+        Some(ErrorCode::NotFound),
+        "the sender has to be able to read the reason: {failure}"
+    );
+    assert_eq!(
+        failure.kind,
+        FailureKind::Unreachable,
+        "one declined photo is not a broken pairing"
+    );
+
+    // And the link is still a link: the pass that met this file carries on.
+    client.hello().expect("the master is still answering");
+    let path = servant.import("laptop.jpg", b"a photo the master will want");
+    let wanted_hash = maple_import::content_hash(&path).unwrap();
+    sync_metadata(&master, &servant, &client, &outcome.key);
+    let moved = move_files(&servant, &client, &outcome.key, PeerMode::Partial);
+    assert_eq!(moved.uploaded, 1, "the next photo still crosses");
+    assert!(master.install.db().row_wanting(&wanted_hash).unwrap().is_none());
+}
+
 #[test]
 fn bytes_that_do_not_hash_to_what_they_were_sent_as_are_refused() {
     // The upload route verifies as it writes, which is the only reason it can

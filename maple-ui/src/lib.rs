@@ -253,7 +253,7 @@ pub fn run() -> anyhow::Result<()> {
     // Held for the life of `run`: a `slint::Timer` that is dropped stops, so
     // letting this handle fall out of scope would freeze the pill on whatever
     // it showed at startup.
-    let _sync_pill = sync_status::wire(&window, sync_status, maple_sync::now_ms);
+    let _sync_pill = sync_status::wire(&window, sync_status, sync.clone(), maple_sync::now_ms);
 
     // Starts the listener or the worker, per the stored role. After
     // `grid::register`, because a first pass can finish before `run()` does

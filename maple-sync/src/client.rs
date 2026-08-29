@@ -178,7 +178,7 @@ impl SyncClient {
             .get(&self.url(route::HELLO))
             .header(CLOSE.0, CLOSE.1)
             .call()
-            .map_err(to_failure)?;
+            .map_err(|e| to_failure(route::HELLO, e))?;
         decode(response)
     }
 
@@ -212,7 +212,7 @@ impl SyncClient {
             .header(CLOSE.0, CLOSE.1)
             .content_type("application/json")
             .send(&body[..])
-            .map_err(to_failure)?;
+            .map_err(|e| to_failure(route::PAIR_CLAIM, e))?;
         decode(response)
     }
 
@@ -324,7 +324,7 @@ impl SyncClient {
             // file crosses the wire in chunks rather than sitting in this
             // servant's memory beside the copy already on its disk.
             .send(ureq::SendBody::from_reader(body))
-            .map_err(to_failure)?;
+            .map_err(|e| to_failure(&path, e))?;
         decode(response)
     }
 
@@ -357,7 +357,7 @@ impl SyncClient {
             .header("Authorization", &credential.header())
             .header(CLOSE.0, CLOSE.1)
             .call()
-            .map_err(to_failure)?;
+            .map_err(|e| to_failure(path, e))?;
 
         let status = response.status().as_u16();
         if !(200..300).contains(&status) {
@@ -409,7 +409,7 @@ impl SyncClient {
             .header(CLOSE.0, CLOSE.1)
             .content_type("application/json")
             .send(&body[..])
-            .map_err(to_failure)?;
+            .map_err(|e| to_failure(path, e))?;
         decode(response)
     }
 
@@ -456,8 +456,15 @@ fn classify(status: u16, body: &str) -> SyncFailure {
 
 /// Transport-level failure: connection refused, DNS, timeout, TLS. Never an
 /// authentication problem — nothing got far enough to check a signature.
-fn to_failure(error: ureq::Error) -> SyncFailure {
-    SyncFailure::transport(error.to_string())
+///
+/// `route` is carried into the message because these are the failures with
+/// the least to go on. A worker log reading `io: Broken pipe (os error 32)`
+/// says nothing about *which* request broke, and the answer changes the
+/// diagnosis completely — a broken pipe on `/blob/orig` is a rejected upload
+/// whose body the master never read, while the same words on `/sync/pull`
+/// are a network that actually dropped.
+fn to_failure(route: &str, error: ureq::Error) -> SyncFailure {
+    SyncFailure::transport(format!("{route}: {error}"))
 }
 
 #[cfg(test)]

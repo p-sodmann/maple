@@ -204,6 +204,29 @@ impl SyncSupervisor {
             .map(|browser| browser.clone() as Arc<dyn DeviceSource>)
     }
 
+    /// Ask a sleeping worker to run a pass now rather than waiting out its
+    /// retry delay.
+    ///
+    /// Returns whether there was a worker to ask. `false` on a master (which
+    /// dials nobody), on an `Off` device, and — the case worth naming — after
+    /// an auth failure, where the worker has already returned: a rejected
+    /// credential is not something a retry fixes, and the pill's `retryable`
+    /// flag keeps the button off that state for the same reason.
+    ///
+    /// Deliberately *not* a `restart`, which would also be a way to get a
+    /// fresh pass. `restart` joins the worker thread, and a pass in flight
+    /// can be a two-minute round trip — on the UI thread, that is a frozen
+    /// window. Waking the existing one is a flag and a notify.
+    pub fn retry_now(&self) -> bool {
+        match self.worker.borrow().as_ref() {
+            Some(worker) => {
+                worker.retry_now();
+                true
+            }
+            None => false,
+        }
+    }
+
     /// Stop everything. Called when the app closes.
     pub fn stop(&self) {
         *self.worker.borrow_mut() = None;
