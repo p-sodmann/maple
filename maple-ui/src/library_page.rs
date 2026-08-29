@@ -52,10 +52,27 @@ pub fn wire_grid(window: &AppWindow, ctx: &AppCtx) {
     // count comes from a COUNT query rather than from the item model.
     ctx.grid.on_total_count({
         let w = ctx.window.clone();
+        let db = ctx.db.clone();
         move |total| {
-            if let Some(win) = w.upgrade() {
-                win.set_library_total_count(total.map_or(-1, |n| n as i32));
-            }
+            let Some(win) = w.upgrade() else { return };
+            win.set_library_total_count(total.map_or(-1, |n| n as i32));
+            // How many rows this device lists but cannot open. Recomputed
+            // here rather than once at startup because it is not static: a
+            // sync pass adds rows, and an upload from a servant removes them.
+            // Riding the count query that already runs per load keeps it to
+            // one extra `COUNT(*)` per page-zero load and needs no second
+            // notification path.
+            let remote: i64 = maple_db::lock_db(&db)
+                .remote_original_counts()
+                .unwrap_or_default()
+                .iter()
+                .map(|(_, n)| n)
+                .sum();
+            // Deliberately not reset when it reaches zero: the toggle simply
+            // stops being drawn, the filter is a no-op with nothing to hide,
+            // and if a later sync pass brings remote rows back the button
+            // returns still checked — which is what the user last asked for.
+            win.set_remote_count(remote as i32);
         }
     });
 

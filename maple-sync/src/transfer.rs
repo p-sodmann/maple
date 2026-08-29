@@ -118,14 +118,31 @@ impl LibraryLayout {
             .join(format!("{}.{suffix}", crate::protocol::route::hex(hash)))
     }
 
-    /// Move a staged blob into the library under this device's templates.
-    pub fn place(&self, staged: &Path, original_name: &str) -> anyhow::Result<PathBuf> {
-        maple_import::place_file(
+    /// Move a staged photo — and its companion raw, when one is staged — into
+    /// the library under this device's templates.
+    ///
+    /// One call for the pair, never one per file. `maple_import::place_pair`
+    /// carries the reason: the library scanner regroups from disk by
+    /// directory and stem, so a companion filed anywhere other than beside
+    /// its display file is not a companion at all but a second photograph,
+    /// and the scanner mints an `images` row for it that then replicates.
+    /// Deriving the companion's own destination could not guarantee
+    /// otherwise — the two blobs are staged under synthetic `<hash>.orig` /
+    /// `<hash>.raw` names, so the raw's own EXIF is unreadable and its date
+    /// came out as the moment it arrived.
+    pub fn place(
+        &self,
+        staged: &Path,
+        original_name: &str,
+        companion: Option<(&Path, &str)>,
+    ) -> anyhow::Result<(PathBuf, Option<PathBuf>)> {
+        maple_import::place_pair(
             staged,
             &self.library_dir,
             &self.folder_template,
             &self.filename_template,
             original_name,
+            companion,
         )
     }
 
@@ -311,12 +328,13 @@ fn commit(
     row: &MissingOriginal,
 ) -> anyhow::Result<()> {
     let guard = lock(db);
-    let placed = layout.place(&layout.staged_path(&row.hash, false), &row.filename)?;
     let staged_raw = layout.staged_path(&row.hash, true);
-    let placed_raw = match (&row.raw_filename, staged_raw.exists()) {
-        (Some(name), true) => Some(layout.place(&staged_raw, name)?),
+    let companion = match (&row.raw_filename, staged_raw.exists()) {
+        (Some(name), true) => Some((staged_raw.as_path(), name.as_str())),
         _ => None,
     };
+    let (placed, placed_raw) =
+        layout.place(&layout.staged_path(&row.hash, false), &row.filename, companion)?;
     guard.adopt_original(row.id, &placed, placed_raw.as_deref())?;
     drop(guard);
     layout.discard(&row.hash);

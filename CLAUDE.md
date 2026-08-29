@@ -49,6 +49,19 @@ block-tile=2,time-gap=1` adds a weighted vote, `--cut <engine>=<f>` overrides a
 threshold, `--time-points 1=0,60=0.5,600=0.85,3600=1` reshapes the time curve,
 `--max-outliers N` sets how many non-matching frames a session may absorb.
 
+### Repairing a library damaged by a fixed bug
+
+```sh
+cargo run --release -p maple-db --bin repair-companions -- <library.db>          # report
+cargo run --release -p maple-db --bin repair-companions -- <library.db> --apply  # fix
+```
+
+Finds photos whose companion raw is not beside its display file, moves it back, and
+deletes the duplicate `images` rows the 60-second scanner minted from the orphan
+(tombstoned first, so the delete replicates). Run it on **every** device with the app
+stopped — the scanner is what mints those rows, and one landing mid-repair puts a fresh
+ghost behind the one just removed. See `maple_db::repair`.
+
 ### Dependency updates
 
 ```sh
@@ -193,7 +206,7 @@ single binary; the backend is fixed at compile time.
   and `Partial` mean something. **Both directions are driven by the servant** — a master
   has no client and does not know how to reach a servant, so "the master fetches the
   servant's originals" (§3.8) is really the servant asking `POST /sync/wanted` and
-  uploading with `POST /blob/orig/{hash}`. Three rules that are easy to break:
+  uploading with `POST /blob/orig/{hash}`. Four rules that are easy to break:
   - **The receiver verifies.** A display file's hash is in the (signed) URL and is
     checked against the bytes before anything is written into a library. That content
     address is *why* the upload route can sign an empty body and stream a 100 MB raw to
@@ -208,11 +221,62 @@ single binary; the backend is fixed at compile time.
     two would take the path and leave `adopt_original` failing on the constraint. Bytes
     stage in `library_dir/.incoming` (hidden, so the scanner skips it) with no lock held;
     only the rename and the row update are locked.
+  - **A companion is placed relative to its display file, never derived**
+    (`maple_import::place_pair`). The library scanner regroups from *disk*, keyed on
+    `(directory, lowercased stem)` — so a RAF that does not sit beside its JPEG under a
+    matching stem is not a companion at all but a photograph no row claims, and the next
+    scan inserts a second `images` row for it, stamps it and replicates the ghost.
+    Deriving each file's destination separately cannot produce that invariant, only
+    approximate it, and it diverged three ways: the blob is staged as `<hash>.raw`, so
+    nothing could tell it was a raw container and its date fell back to the *arrival*
+    mtime (`{YYYY}/{MM}` then filed the two in different months); `{camera}` need not
+    match between a raw and its JPEG sibling; and `unique_dest_path` suffixes each file's
+    collision independently. So one call places both — one template context read from the
+    display file, one directory, and one stem chosen free for *both* extensions by
+    `unique_pair_path`. `exif_read::read_named` / `loadable_image_bytes_named` are the
+    other half: a staged blob's format comes from the sender's filename, which the caller
+    already holds, rather than from the synthetic name on disk. Sniffing containers would
+    have fixed only the date and left the other two divergences standing.
   Anything that reads `images.path` to *open a file* must filter `locality = 'local'` —
   the AI tagger, face tagger, perceptual hasher, metadata filler and restructure planner
   all do. `ServerDeps::on_change` is the master's equivalent of the servant worker's:
   a master polls nothing, so without it a photo a servant sent sits unseen until the app
   restarts. (The 60-second scanner still refreshes nothing — that gap predates sync.)
+  `Database::all_paths` returns **both** path columns and the scanner's "already known"
+  set unions them — a companion that ends up somewhere unexpected for any reason must
+  never look like a photograph nobody claims. And `Database::update_row` writes
+  `raw_path` when — and only when — the local row is `locality = 'remote'`: on a `local`
+  row it names this disk and a peer must not touch it, but on a `remote` row it is the
+  origin's own path, carried purely so this device knows the photo *has* a negative worth
+  asking for. Without that case it could only be learned at INSERT, so a servant that
+  acquired a companion after the photo first replicated left the master NULL forever and
+  `blob_upload` refused every `?raw=1` with BadRequest.
+- **The two ends of one link do not mean the same thing by a mode.** `PeerMode` is the
+  *servant's* choice and governs both directions (`worker::peer_mode`), and **Relay is
+  the pairing default on both sides** (`persist_pairing`, in `settings_window.rs` and
+  `server.rs` alike) — which means a freshly paired pair replicates all its metadata and
+  moves no photo file at all until someone clicks the chip. That is a defensible default
+  (it cannot fill a disk on its own) but it is not a *legible* one, and its consequence
+  lands on the machine that did not choose it: the master replicates every servant photo
+  as a `locality = 'remote'` row it can never fill, because a master runs no worker and
+  has no route back to a servant. So `PeerMode::explanation` states the consequence
+  rather than the disk usage, `pending_line` in `settings_window.rs` says what the mode
+  is costing *this* library — worded from the master's side as "change the mode on
+  <servant>", since no setting here can help — and the grid draws those rows as
+  "held on <device>" rather than as tiles that failed to load
+  (`grid::held_on`, `remote::NoMaster`, decided from `RemoteBlobs::has_master()` up front
+  rather than by waiting out a fetch that cannot succeed). `SearchQuery::local_only`
+  ("Hide Remote" in the library header) is the escape hatch, and is a filter on the
+  *query* rather than on the model because the grid pages 500 rows at a time — filtering
+  the model would leave the header count describing a different set from the tiles.
+- **Repairs are binaries, not migrations** (`maple-db/src/repair.rs`,
+  `cargo run -p maple-db --bin repair-companions -- <library.db> [--apply]`): a
+  `user_version` step replays on every fresh database and may only touch SQL, and what a
+  damaged library needs here is to *move files* and delete rows. So it reports by default,
+  applies only when asked, and is run per device. Two orderings inside it are
+  load-bearing: the ghost row is identified *by* the companion's current path, so it must
+  be found before the file moves; and it is tombstoned before the DELETE, or the peer
+  hands it straight back on the next pull and the repair has to be run forever.
 - **One preview, and everything reads it** (`maple-import/src/preview.rs`): a photo's
   pixels are wanted by four things — the tile, the sharpness score, the session
   signature, sometimes the embedder — and the obvious implementation gives each whatever

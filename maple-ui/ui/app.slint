@@ -353,6 +353,11 @@ export component AppWindow inherits Window {
     // comes from here; -1 while the count query is still running.
     in property <int>          library-total-count: -1;
     in-out property <bool>     date-view-on: false;
+    // "Hide Remote" — whether the library is showing only photos this device
+    // holds. The toggle appears at all only when there is something to hide
+    // (`remote-count` > 0), so a device with no peers never sees it.
+    in-out property <bool>     local-only-on: false;
+    in property <int>          remote-count: 0;
     in property <length>       library-cell-size: 160px;
     // Non-empty when the library grid is filtered to one person's photos
     // (set from the People page); shows "Photos of {name}" + a clear button
@@ -441,6 +446,7 @@ export component AppWindow inherits Window {
     callback toggle-ai;
     callback toggle-faces;
     callback toggle-date-view;
+    callback toggle-local-only;
     callback detect-faces-clicked;
     callback tag-faces-clicked;
 
@@ -932,6 +938,17 @@ export component AppWindow inherits Window {
                                 label: "By Date";
                                 checked: root.date-view-on;
                                 toggled => { root.toggle-date-view(); }
+                            }
+
+                            // Only shown when this library actually holds rows
+                            // whose files are on another device — on a master
+                            // paired with a relay servant that is every photo
+                            // the servant has, and nothing here can ever fetch
+                            // them.
+                            if root.remote-count > 0: TopBarToggle {
+                                label: "Hide Remote  " + root.remote-count;
+                                checked: root.local-only-on;
+                                toggled => { root.toggle-local-only(); }
                             }
                         }
                     }

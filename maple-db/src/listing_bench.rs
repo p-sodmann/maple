@@ -190,7 +190,7 @@ fn listing_bench() {
     eprintln!("\ncount_images: {ms:8.2} ms");
 
     for order in [SearchOrder::AddedDesc, SearchOrder::TakenDesc] {
-        let (from_where, mut params) = crate::all_from_where(crate::Entry::Index, None, None);
+        let (from_where, mut params) = crate::all_from_where(crate::Entry::Index, &Default::default());
         let order_by = crate::query::order_by_sql(order);
         let sql =
             format!("SELECT {} {from_where} {order_by} LIMIT ? OFFSET ?", crate::IMAGE_COLUMNS);
@@ -236,7 +236,7 @@ fn sql_cte(order_by: &str) -> String {
 /// The shipped listing: cover eligibility and stack size as correlated
 /// subqueries over `i` alone, no join to reach across.
 fn sql_correlated(order_by: &str) -> String {
-    let (from_where, _) = crate::all_from_where(crate::Entry::Index, None, None);
+    let (from_where, _) = crate::all_from_where(crate::Entry::Index, &Default::default());
     format!("SELECT {} {from_where} {order_by} LIMIT ? OFFSET ?", crate::IMAGE_COLUMNS)
 }
 
@@ -473,7 +473,7 @@ fn count_experiment() {
              GROUP BY s.id
          )";
 
-    let (shipped, _) = crate::all_from_where(crate::Entry::Index, None, None);
+    let (shipped, _) = crate::all_from_where(crate::Entry::Index, &Default::default());
     let order_by = crate::query::order_by_sql(SearchOrder::AddedDesc);
     let cols = crate::IMAGE_COLUMNS;
 
@@ -577,7 +577,7 @@ fn count_index_width_experiment() {
         conn.execute_batch(ddl).expect("idx");
         conn.execute_batch(IDX_TAKEN).expect("idx taken");
 
-        let (shipped, _) = crate::all_from_where(crate::Entry::Index, None, None);
+        let (shipped, _) = crate::all_from_where(crate::Entry::Index, &Default::default());
         let plain = format!("SELECT COUNT(*) {shipped}");
         let hinted = plain.replacen("FROM images i", "FROM images i NOT INDEXED", 1);
 
@@ -592,7 +592,7 @@ fn count_index_width_experiment() {
 
         // Filtered counts must not be collateral damage of the hint.
         for (fname, cid, pid) in [("collection", Some(1i64), None), ("person", None, Some(1i64))] {
-            let (fw, params) = crate::all_from_where(crate::Entry::Index, cid, pid);
+            let (fw, params) = crate::all_from_where(crate::Entry::Index, &crate::query::Filters { collection_id: cid, person_id: pid, local_only: false });
             let plain = format!("SELECT COUNT(*) {fw}");
             let hinted = plain.replacen("FROM images i", "FROM images i NOT INDEXED", 1);
             for (label, sql) in [("plain", &plain), ("NOT INDEXED", &hinted)] {

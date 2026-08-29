@@ -7,6 +7,7 @@
 //! re-marking them `present` when it reappears.
 
 mod embedding;
+mod repair;
 #[cfg(test)]
 mod listing_bench;
 mod scanner;
@@ -39,7 +40,9 @@ pub use session_dino::DinoEngine;
 pub use face_detector::{spawn_face_tagger, DetectedFace, FaceDetector, FaceTagger};
 pub use faces::{best_person_match, best_person_matches, cosine_similarity, FaceDetection, Person, PersonWithRep};
 pub use metadata::{extract_all_exif_tags, extract_metadata, spawn_metadata_filler, ImageMetadata};
+use query::Filters;
 pub use query::{SearchOrder, SearchQuery};
+pub use repair::{RepairReport, SplitCompanion};
 pub use scanner::{set_scanner_paused, LibraryChanged, LibraryScanner};
 pub use schema::SYNCED_TABLES;
 pub use sync::{ApplyReport, MissingOriginal, SyncBatch, SyncRow, Tombstone};
@@ -250,8 +253,9 @@ fn cascade_children(parent: &str) -> &'static [(&'static str, &'static str)] {
 type ImageHashCandidate = (i64, PathBuf, Option<[u8; 32]>);
 /// `(image_id, hash_blob, stack_id)` — returned by [`Database::images_with_hash_and_stack`].
 type ImageHashStackRow = (i64, Vec<u8>, Option<i64>);
-/// `(path, status, content_hash)` — returned by [`Database::all_paths`].
-type ImagePathStatusRow = (PathBuf, ImageStatus, Option<[u8; 32]>);
+/// `(path, status, content_hash, raw_path)` — returned by
+/// [`Database::all_paths`].
+pub(crate) type ImagePathStatusRow = (PathBuf, ImageStatus, Option<[u8; 32]>, Option<PathBuf>);
 
 pub struct Database {
     conn: Connection,
@@ -929,24 +933,15 @@ impl Database {
                     k,
                     query.limit,
                     query.offset,
-                    query.collection_id,
+                    &query.filters(),
                 )
             }
-            (Some(text), None) => self.search_images_text(
-                text,
-                query.limit,
-                query.offset,
-                query.collection_id,
-                query.person_id,
-                query.order,
-            ),
-            (None, _) => self.search_images_all(
-                query.limit,
-                query.offset,
-                query.collection_id,
-                query.person_id,
-                query.order,
-            ),
+            (Some(text), None) => {
+                self.search_images_text(text, query.limit, query.offset, &query.filters(), query.order)
+            }
+            (None, _) => {
+                self.search_images_all(query.limit, query.offset, &query.filters(), query.order)
+            }
         }
     }
 
@@ -962,17 +957,12 @@ impl Database {
         }
 
         let (from_where, params) = match &query.text {
-            Some(text) => match text_from_where(
-                text,
-                Entry::Table,
-                query.collection_id,
-                query.person_id,
-            ) {
+            Some(text) => match text_from_where(text, Entry::Table, &query.filters()) {
                 Some(parts) => parts,
                 // No usable tokens — the row query returns nothing, so does this.
                 None => return Ok(Some(0)),
             },
-            None => all_from_where(Entry::Table, query.collection_id, query.person_id),
+            None => all_from_where(Entry::Table, &query.filters()),
         };
         // The text query joins descriptions/faces and so can repeat a row per
         // match; `DISTINCT` mirrors its `SELECT DISTINCT`.
@@ -989,8 +979,7 @@ impl Database {
         &self,
         limit: Option<usize>,
         offset: Option<usize>,
-        collection_id: Option<i64>,
-        person_id: Option<i64>,
+        filters: &Filters,
         order: SearchOrder,
     ) -> anyhow::Result<Vec<LibraryImage>> {
         use rusqlite::types::Value;
@@ -998,7 +987,7 @@ impl Database {
         let limit = limit.unwrap_or(500) as i64;
         let offset = offset.unwrap_or(0) as i64;
 
-        let (from_where, mut params) = all_from_where(Entry::Index, collection_id, person_id);
+        let (from_where, mut params) = all_from_where(Entry::Index, filters);
         let order_by = crate::query::order_by_sql(order);
         let sql = format!(
             "SELECT {IMAGE_COLUMNS} {from_where} {order_by} LIMIT ? OFFSET ?"
@@ -1024,8 +1013,7 @@ impl Database {
         text: &str,
         limit: Option<usize>,
         offset: Option<usize>,
-        collection_id: Option<i64>,
-        person_id: Option<i64>,
+        filters: &Filters,
         order: SearchOrder,
     ) -> anyhow::Result<Vec<LibraryImage>> {
         use rusqlite::types::Value;
@@ -1033,9 +1021,7 @@ impl Database {
         let limit = limit.unwrap_or(500) as i64;
         let offset = offset.unwrap_or(0) as i64;
 
-        let Some((from_where, mut params)) =
-            text_from_where(text, Entry::Index, collection_id, person_id)
-        else {
+        let Some((from_where, mut params)) = text_from_where(text, Entry::Index, filters) else {
             return Ok(vec![]);
         };
 
@@ -1234,9 +1220,21 @@ impl Database {
         Ok(records)
     }
 
-    /// Return all `(path, status, hash)` triples for files this device
+    /// Return every `(path, status, hash, raw_path)` row for files this device
     /// actually holds — used by the scanner for reconciliation and thumbnail
     /// cache eviction.
+    ///
+    /// `raw_path` is returned so the scanner's "already known" set can contain
+    /// **both** columns. It never reconciles a companion's *status* — a photo
+    /// is one row and its display file is what says whether it is present —
+    /// but a companion missing from that set is a file no row appears to
+    /// claim, and the scanner inserts one of those as a new photograph. That
+    /// is not hypothetical: sync used to file a companion by re-deriving the
+    /// path template from a blob staged under a synthetic name, which put it
+    /// in a different month's folder from its display file and duplicated the
+    /// photo on the next scan. `maple_import::place_pair` closed that at the
+    /// source; this keeps a companion that ends up somewhere unexpected for
+    /// any *other* reason from being adopted as a second photo.
     ///
     /// Remote rows are excluded, and that filter is load-bearing rather than
     /// tidy: their `path` is the *origin* device's, so the scanner would find
@@ -1250,18 +1248,24 @@ impl Database {
     /// user, and `insert_image_with_raw` is `INSERT OR IGNORE`, so the worst
     /// case is a no-op.
     pub fn all_paths(&self) -> anyhow::Result<Vec<ImagePathStatusRow>> {
-        let mut stmt = self
-            .conn
-            .prepare("SELECT path, status, hash FROM images WHERE locality = 'local'")?;
+        let mut stmt = self.conn.prepare(
+            "SELECT path, status, hash, raw_path FROM images WHERE locality = 'local'",
+        )?;
         let rows = stmt
             .query_map([], |row| {
                 let path: String = row.get(0)?;
                 let status: String = row.get(1)?;
                 let hash_bytes: Vec<u8> = row.get(2)?;
-                Ok((path_from_db(path), ImageStatus::from_str(&status), hash_bytes))
+                let raw_path: Option<String> = row.get(3)?;
+                Ok((
+                    path_from_db(path),
+                    ImageStatus::from_str(&status),
+                    hash_bytes,
+                    raw_path.map(path_from_db),
+                ))
             })?
             .filter_map(|r| r.ok())
-            .map(|(p, s, h)| (p, s, h.try_into().ok()))
+            .map(|(p, s, h, raw)| (p, s, h.try_into().ok(), raw))
             .collect();
         Ok(rows)
     }
@@ -1610,19 +1614,21 @@ const IMAGE_COLUMNS: &str = "i.id, i.path, i.added_at, i.status,
 
 /// `AND` clauses (and their bound ids) for the optional collection/person
 /// filters, shared by the plain and text listings.
-fn filter_clauses(
-    collection_id: Option<i64>,
-    person_id: Option<i64>,
-) -> (String, Vec<rusqlite::types::Value>) {
+fn filter_clauses(f: &Filters) -> (String, Vec<rusqlite::types::Value>) {
     use rusqlite::types::Value;
 
     let mut sql = String::new();
     let mut params = Vec::new();
-    if let Some(cid) = collection_id {
+    if f.local_only {
+        // Unparameterised because it is not user input: `locality` has two
+        // values and this is one of them.
+        sql.push_str(" AND i.locality = 'local'");
+    }
+    if let Some(cid) = f.collection_id {
         sql.push_str(" AND i.id IN (SELECT image_id FROM collection_images WHERE collection_id = ?)");
         params.push(Value::Integer(cid));
     }
-    if let Some(pid) = person_id {
+    if let Some(pid) = f.person_id {
         sql.push_str(" AND i.id IN (SELECT image_id FROM face_detections WHERE person_id = ?)");
         params.push(Value::Integer(pid));
     }
@@ -1630,12 +1636,8 @@ fn filter_clauses(
 }
 
 /// `FROM … WHERE …` for an unfiltered (no text) listing, plus its params.
-fn all_from_where(
-    entry: Entry,
-    collection_id: Option<i64>,
-    person_id: Option<i64>,
-) -> (String, Vec<rusqlite::types::Value>) {
-    let (extra, params) = filter_clauses(collection_id, person_id);
+fn all_from_where(entry: Entry, f: &Filters) -> (String, Vec<rusqlite::types::Value>) {
+    let (extra, params) = filter_clauses(f);
     let sql = format!(
         "{}
          WHERE i.status = 'present'
@@ -1650,8 +1652,7 @@ fn all_from_where(
 fn text_from_where(
     text: &str,
     entry: Entry,
-    collection_id: Option<i64>,
-    person_id: Option<i64>,
+    f: &Filters,
 ) -> Option<(String, Vec<rusqlite::types::Value>)> {
     use rusqlite::types::Value;
 
@@ -1688,7 +1689,7 @@ fn text_from_where(
         .collect::<Vec<_>>()
         .join(" AND ");
 
-    let (extra, extra_params) = filter_clauses(collection_id, person_id);
+    let (extra, extra_params) = filter_clauses(f);
     let sql = format!(
         "{}
          LEFT JOIN ai_descriptions ad ON ad.image_id = i.id
@@ -1771,6 +1772,57 @@ mod tests {
 
     fn fake_hash(seed: u8) -> [u8; 32] {
         [seed; 32]
+    }
+
+    /// A library holding one photo of its own and one relayed from a peer.
+    fn library_with_a_remote_photo() -> (tempfile::TempDir, Database) {
+        let (dir, db) = tmp_db();
+        db.insert_image(&PathBuf::from("/photos/mine.jpg"), &fake_hash(1), 1024)
+            .unwrap();
+        db.conn
+            .execute(
+                "INSERT INTO images(path, hash, file_size, added_at, status, filename,
+                                    guid, rev, rev_dev, locality, origin_device, make)
+                 VALUES ('/workstation/theirs.jpg', ?1, 9, 100, 'present', 'theirs.jpg',
+                         'g-remote', 1, 'dev-master', 'remote', 'dev-master', 'Fujifilm')",
+                params![fake_hash(2).as_slice()],
+            )
+            .unwrap();
+        (dir, db)
+    }
+
+    /// "Hide Remote": a row whose bytes live on a device this one cannot ask
+    /// leaves the listing, the count and the text search together.
+    ///
+    /// Together is the point. The grid pages 500 rows at a time, so a filter
+    /// applied to the model instead of the query would leave the header count
+    /// describing a different set from the tiles, and searching would bring
+    /// the hidden photos straight back.
+    #[test]
+    fn local_only_hides_photos_this_device_does_not_hold() {
+        let (_dir, db) = library_with_a_remote_photo();
+
+        let all = SearchQuery::default();
+        assert_eq!(db.search_images(&all).unwrap().len(), 2);
+        assert_eq!(db.count_images(&all).unwrap(), Some(2));
+
+        let mine = SearchQuery::default().with_local_only(true);
+        let rows = db.search_images(&mine).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert!(!rows[0].locality.is_remote());
+        assert_eq!(db.count_images(&mine).unwrap(), Some(1));
+
+        // And the text path, which builds its WHERE clause separately.
+        let searched = SearchQuery::default().with_text("Fujifilm");
+        assert_eq!(db.search_images(&searched).unwrap().len(), 1);
+        assert!(db
+            .search_images(&searched.clone().with_local_only(true))
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            db.count_images(&searched.with_local_only(true)).unwrap(),
+            Some(0)
+        );
     }
 
     #[test]
@@ -2448,7 +2500,10 @@ mod tests {
     ) -> String {
         use rusqlite::types::Value;
 
-        let (from_where, mut params) = all_from_where(Entry::Index, collection_id, person_id);
+        let (from_where, mut params) = all_from_where(
+            Entry::Index,
+            &Filters { collection_id, person_id, local_only: false },
+        );
         let order_by = crate::query::order_by_sql(order);
         let sql = format!(
             "EXPLAIN QUERY PLAN \
@@ -2504,7 +2559,7 @@ mod tests {
         let (_dir, db) = tmp_db();
         insert_burst(&db, 25);
 
-        let (from_where, params) = all_from_where(Entry::Table, None, None);
+        let (from_where, params) = all_from_where(Entry::Table, &Filters::default());
         let mut stmt = db
             .conn
             .prepare(&format!("EXPLAIN QUERY PLAN SELECT COUNT(*) {from_where}"))

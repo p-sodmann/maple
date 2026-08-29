@@ -8,7 +8,7 @@
 
 use std::path::Path;
 
-use crate::{is_raw_format, loadable_image_bytes, ExifDateTime};
+use crate::{is_raw_format, loadable_image_bytes_named, ExifDateTime};
 
 /// What one EXIF pass yields.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -48,8 +48,25 @@ impl ExifContext {
 /// parsed directly (see [`crate::loadable_image_bytes`]), and the preview
 /// carries the same EXIF block.
 pub fn read(path: &Path) -> ExifContext {
-    let exif = if is_raw_format(path) {
-        let Ok(bytes) = loadable_image_bytes(path) else {
+    read_named(path, path)
+}
+
+/// Read EXIF from `path`, deciding whether it is a raw container from a
+/// *different* name than the one it currently sits under.
+///
+/// The seam sync needs. A downloaded blob is staged as `<hex-hash>.orig` —
+/// its extension says nothing about what is inside it — while the sender's
+/// own filename, which does, travelled beside it. Passing that name here is
+/// the difference between a RAF read as a raw container and a RAF handed to
+/// a JPEG parser, which returns nothing and sends the photo to the mtime
+/// fallback: filed under the day it arrived rather than the day it was taken.
+///
+/// Deliberately *not* container sniffing. The name is a fact the caller
+/// already holds; guessing from the bytes would be a second, weaker source of
+/// truth for something `is_raw_format` already decides everywhere else.
+pub fn read_named(path: &Path, name: &Path) -> ExifContext {
+    let exif = if is_raw_format(name) {
+        let Ok(bytes) = loadable_image_bytes_named(path, name) else {
             return ExifContext::default();
         };
         exif::Reader::new().read_from_container(&mut std::io::Cursor::new(bytes))

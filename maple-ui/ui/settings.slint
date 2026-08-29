@@ -18,7 +18,23 @@ export struct SyncPeerItem {
     device-id: string,
     name: string,
     mode: string,
+    // What this mode actually does, in words. Rendered under the chip rather
+    // than computed and dropped: Relay is the pairing default on both sides
+    // and moves no photo files in either direction, and a chip reading
+    // "Relay" says none of that.
     mode-hint: string,
+    // The consequence in this library right now — how many photos are stuck
+    // where, given the mode. Empty when there is nothing to report.
+    pending: string,
+    // Whether `pending` describes a backlog that will never drain on its own.
+    // Drawn in the warning colour, because the fix is a settings change and
+    // not waiting.
+    pending-stuck: bool,
+    // Whether clicking the chip means anything on *this* device. The mode is
+    // the servant's to choose and it reports it on every pull, which the
+    // master stores verbatim — so a master's chip is a readout, and letting it
+    // be clicked would change a value the next pull silently puts back.
+    mode-editable: bool,
     last-seen: string,
     online: bool,
 }
@@ -202,78 +218,118 @@ component SyncPeerRow inherits Rectangle {
     callback mode-cycled;
     callback unpair;
 
-    height: 44px;
+    height: peer-lines.preferred-height;
 
-    HorizontalLayout {
-        padding-left: 16px;
-        padding-right: 16px;
+    peer-lines := VerticalLayout {
         padding-top: 8px;
-        padding-bottom: 8px;
-        spacing: 10px;
+        padding-bottom: 10px;
+        spacing: 3px;
 
-        // Online dot
-        Rectangle {
-            width: 8px; height: 8px;
-            y: (parent.height - self.height) / 2;
-            border-radius: 4px;
-            background: root.peer.online ? Theme.success : Theme.ink-3;
-        }
-        Text {
-            text: root.peer.name;
-            color: Theme.ink;
-            font-size: 13px;
-            font-weight: 500;
-            vertical-alignment: center;
-            width: 130px;
-            overflow: elide;
-        }
-        // Mode chip — clicking cycles Full → Partial → Relay.
-        Rectangle {
-            width: 74px;
-            horizontal-stretch: 0;
-            border-radius: 6px;
-            border-width: 1px;
-            border-color: Theme.border;
-            background: mode-ta.has-hover ? Theme.border.with-alpha(0.6) : Theme.field;
-            y: (parent.height - self.height) / 2;
-            height: 26px;
-            animate background { duration: 100ms; }
-            Text {
-                text: root.peer.mode;
-                color: Theme.ink-2;
-                font-size: 12px;
-                horizontal-alignment: center;
-                vertical-alignment: center;
-            }
-            mode-ta := TouchArea { clicked => { root.mode-cycled(); } }
-        }
-        Text {
-            text: root.peer.last-seen;
-            color: Theme.ink-3;
-            font-size: 12px;
-            vertical-alignment: center;
-            horizontal-stretch: 1;
-            overflow: elide;
-        }
-        // Unpair ✕
-        Rectangle {
-            width: 26px; height: 26px;
-            horizontal-stretch: 0;
-            y: (parent.height - self.height) / 2;
-            border-radius: 6px;
-            background: unpair-ta.has-hover ? #e74c3c25 : transparent;
-            animate background { duration: 100ms; }
-            Path {
-                width: 10px; height: 10px;
-                x: (parent.width  - self.width)  / 2;
+        HorizontalLayout {
+            padding-left: 16px;
+            padding-right: 16px;
+            spacing: 10px;
+            height: 28px;
+
+            // Online dot
+            Rectangle {
+                width: 8px; height: 8px;
                 y: (parent.height - self.height) / 2;
-                viewbox-width: 24; viewbox-height: 24;
-                fill: transparent;
-                stroke: unpair-ta.has-hover ? #c0392b : Theme.ink-3;
-                stroke-width: 2.4px;
-                commands: "M6 6L18 18M18 6L6 18";
+                border-radius: 4px;
+                background: root.peer.online ? Theme.success : Theme.ink-3;
             }
-            unpair-ta := TouchArea { clicked => { root.unpair(); } }
+            Text {
+                text: root.peer.name;
+                color: Theme.ink;
+                font-size: 13px;
+                font-weight: 500;
+                vertical-alignment: center;
+                width: 130px;
+                overflow: elide;
+            }
+            // Mode chip. On a servant, clicking cycles Full → Partial → Relay.
+            // On a master it is a readout of what the servant chose — the
+            // servant sends its mode on every pull and the master stores it
+            // verbatim, so a click here would be undone within one interval.
+            Rectangle {
+                width: 74px;
+                horizontal-stretch: 0;
+                border-radius: 6px;
+                border-width: 1px;
+                border-color: Theme.border;
+                background: (root.peer.mode-editable && mode-ta.has-hover)
+                    ? Theme.border.with-alpha(0.6)
+                    : Theme.field;
+                y: (parent.height - self.height) / 2;
+                height: 26px;
+                animate background { duration: 100ms; }
+                Text {
+                    text: root.peer.mode;
+                    color: root.peer.mode-editable ? Theme.ink-2 : Theme.ink-3;
+                    font-size: 12px;
+                    horizontal-alignment: center;
+                    vertical-alignment: center;
+                }
+                mode-ta := TouchArea {
+                    enabled: root.peer.mode-editable;
+                    clicked => { root.mode-cycled(); }
+                }
+            }
+            Text {
+                text: root.peer.last-seen;
+                color: Theme.ink-3;
+                font-size: 12px;
+                vertical-alignment: center;
+                horizontal-stretch: 1;
+                overflow: elide;
+            }
+            // Unpair ✕
+            Rectangle {
+                width: 26px; height: 26px;
+                horizontal-stretch: 0;
+                y: (parent.height - self.height) / 2;
+                border-radius: 6px;
+                background: unpair-ta.has-hover ? #e74c3c25 : transparent;
+                animate background { duration: 100ms; }
+                Path {
+                    width: 10px; height: 10px;
+                    x: (parent.width  - self.width)  / 2;
+                    y: (parent.height - self.height) / 2;
+                    viewbox-width: 24; viewbox-height: 24;
+                    fill: transparent;
+                    stroke: unpair-ta.has-hover ? #c0392b : Theme.ink-3;
+                    stroke-width: 2.4px;
+                    commands: "M6 6L18 18M18 6L6 18";
+                }
+                unpair-ta := TouchArea { clicked => { root.unpair(); } }
+            }
+        }
+
+        // What the mode means, and what it is currently costing.
+        HorizontalLayout {
+            padding-left: 42px;
+            padding-right: 16px;
+            spacing: 6px;
+            Text {
+                text: root.peer.mode-hint;
+                color: Theme.ink-3;
+                font-size: 11.5px;
+                wrap: word-wrap;
+                horizontal-stretch: 1;
+            }
+        }
+
+        if root.peer.pending != "": HorizontalLayout {
+            padding-left: 42px;
+            padding-right: 16px;
+            Text {
+                text: root.peer.pending;
+                color: root.peer.pending-stuck ? #c0392b : Theme.ink-3;
+                font-size: 11.5px;
+                font-weight: root.peer.pending-stuck ? 600 : 400;
+                wrap: word-wrap;
+                horizontal-stretch: 1;
+            }
         }
     }
 }

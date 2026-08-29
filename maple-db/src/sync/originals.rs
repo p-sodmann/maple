@@ -106,6 +106,42 @@ impl Database {
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
     }
 
+    /// How many photos this device lists but does not hold, per origin
+    /// device.
+    ///
+    /// The count of tiles that cannot be loaded, which is the number a user
+    /// staring at a grid of grey squares actually wants. On a **master** it is
+    /// also a diagnosis: a master runs no worker and has no route to a
+    /// servant, so nothing on this machine will ever reduce it — only the
+    /// servant uploading will, and a servant in Relay mode never does.
+    ///
+    /// Grouped by `origin_device` rather than totalled, so the settings card
+    /// can put the number beside the peer it belongs to. A row with no
+    /// `origin_device` is grouped under `None`; that means a row this
+    /// installation marked remote without recording where it came from, which
+    /// nothing writes today.
+    pub fn remote_original_counts(&self) -> anyhow::Result<Vec<(Option<String>, i64)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT origin_device, COUNT(*) FROM images
+             WHERE locality = 'remote' AND status = 'present'
+             GROUP BY origin_device",
+        )?;
+        let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
+    /// How many photos this device holds itself.
+    ///
+    /// The other half of the sentence a relay servant needs to read: "N
+    /// photos here, none of them copied to the master".
+    pub fn local_original_count(&self) -> anyhow::Result<i64> {
+        Ok(self.conn.query_row(
+            "SELECT COUNT(*) FROM images WHERE locality = 'local' AND status = 'present'",
+            [],
+            |r| r.get(0),
+        )?)
+    }
+
     /// The lowest-id row waiting for this hash, or `None` if nothing here
     /// wants it.
     ///

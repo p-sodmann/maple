@@ -292,6 +292,27 @@ fn wire_toggles(window: &AppWindow, ctx: &AppCtx) {
         }
     });
 
+    // "Hide Remote": rows whose files live on a device this one cannot ask.
+    //
+    // A filter on the query rather than a filter on the model, so it survives
+    // paging — the grid loads 500 rows at a time, and hiding them per page
+    // would leave the count, the paging and the date groups all describing a
+    // different set from the one on screen.
+    window.on_toggle_local_only({
+        let w = ctx.window.clone();
+        let grid = ctx.grid.clone();
+        let current_query = ctx.current_query.clone();
+        let resync_selection = ctx.resync_selection.clone();
+        move || {
+            let Some(w) = w.upgrade() else { return };
+            let on = !w.get_local_only_on();
+            w.set_local_only_on(on);
+            current_query.borrow_mut().local_only = on;
+            grid.load(current_query.borrow().clone());
+            resync_selection();
+        }
+    });
+
     window.on_toggle_faces({
         let w = ctx.window.clone();
         let db = ctx.db.clone();

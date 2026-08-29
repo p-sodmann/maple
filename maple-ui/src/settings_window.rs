@@ -318,6 +318,13 @@ fn wire_sync(
                         return;
                     }
                 };
+                if guard.sync_role().unwrap_or_default() != SyncRole::Servant {
+                    // The chip is not clickable on a master, but the callback
+                    // is reachable from the markup and the write would look
+                    // like it took until the servant's next pull put it back.
+                    tracing::debug!("Ignoring a mode change on a master: the servant owns it");
+                    return;
+                }
                 if let Err(e) = guard.set_sync_peer_mode(&device_id, current.next()) {
                     tracing::error!("Failed to set peer mode: {e}");
                 }
@@ -594,26 +601,118 @@ fn populate_sync(
         Vec::new()
     });
     let now = maple_sync::now_ms();
+    // How many photos this library lists but cannot open, per peer, and how
+    // many it holds itself. Both are needed to say what a mode is costing:
+    // on a master the first number is the servant's photos it will never
+    // receive, and on a servant the second is its own photos that will never
+    // leave.
+    let remote_counts: std::collections::HashMap<String, i64> = guard
+        .remote_original_counts()
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|(device, n)| device.map(|d| (d, n)))
+        .collect();
+    let local_count = guard.local_original_count().unwrap_or(0);
     let items: Vec<SyncPeerItem> = peers
         .into_iter()
-        .map(|peer| SyncPeerItem {
-            device_id: SharedString::from(peer.device_id.clone()),
-            name: SharedString::from(peer.display_name()),
-            mode: SharedString::from(peer.mode.label()),
-            mode_hint: SharedString::from(peer.mode.explanation()),
-            last_seen: SharedString::from(match peer.last_seen_at {
-                Some(seen) => maple_sync::relative_time(now - seen),
-                None => "never".to_owned(),
-            }),
-            online: peer
-                .last_seen_at
-                .is_some_and(|seen| now - seen < ONLINE_WINDOW_MS),
+        .map(|peer| {
+            let held = remote_counts.get(&peer.device_id).copied().unwrap_or(0);
+            let (pending, stuck) =
+                pending_line(role, peer.mode, &peer.display_name(), held, local_count);
+            SyncPeerItem {
+                device_id: SharedString::from(peer.device_id.clone()),
+                name: SharedString::from(peer.display_name()),
+                mode: SharedString::from(peer.mode.label()),
+                mode_hint: SharedString::from(peer.mode.explanation()),
+                pending: SharedString::from(pending),
+                pending_stuck: stuck,
+                // See `SyncPeerItem::mode-editable`: on a master the column is
+                // a record of what the servant reported on its last pull, and
+                // `server::pull` overwrites it on the next one.
+                mode_editable: role == SyncRole::Servant,
+                last_seen: SharedString::from(match peer.last_seen_at {
+                    Some(seen) => maple_sync::relative_time(now - seen),
+                    None => "never".to_owned(),
+                }),
+                online: peer
+                    .last_seen_at
+                    .is_some_and(|seen| now - seen < ONLINE_WINDOW_MS),
+            }
         })
         .collect();
     window.set_sync_peers(slint::ModelRc::new(slint::VecModel::from(items)));
     drop(guard);
 
     let _ = sync;
+}
+
+/// The line under a peer that says what its mode is costing *here*, and
+/// whether that cost is a queue or a standstill.
+///
+/// The mode chip alone cannot say this, because the same three words mean
+/// different things on the two ends of one link:
+///
+/// - On a **servant**, the mode is the user's own choice and governs both
+///   directions. Relay means this device's photos never leave it — not a
+///   backlog that drains when the master wakes up, but a permanent state, so
+///   it is flagged rather than counted down.
+/// - On a **master**, the chip is a *record of what the servant chose* (the
+///   servant sends its mode on every pull and the master stores it), and no
+///   setting on this machine can change what arrives: a master runs no worker
+///   and has no route to a servant. So the master's line names the number of
+///   unloadable tiles and points at where the fix is.
+///
+/// Returns `(text, stuck)`; `stuck` is what draws it as a warning.
+fn pending_line(
+    role: SyncRole,
+    mode: maple_state::PeerMode,
+    peer_name: &str,
+    held_on_peer: i64,
+    local_photos: i64,
+) -> (String, bool) {
+    match role {
+        SyncRole::Master => {
+            if held_on_peer == 0 {
+                return (String::new(), false);
+            }
+            let plural = if held_on_peer == 1 { "photo" } else { "photos" };
+            if mode.moves_originals() {
+                (
+                    format!("{held_on_peer} {plural} still on {peer_name}, waiting to be sent."),
+                    false,
+                )
+            } else {
+                (
+                    format!(
+                        "{held_on_peer} {plural} listed here but held on {peer_name}, and none                          will arrive while it is in Relay. Change the mode on {peer_name}."
+                    ),
+                    true,
+                )
+            }
+        }
+        SyncRole::Servant => {
+            if mode.moves_originals() {
+                if held_on_peer == 0 {
+                    return (String::new(), false);
+                }
+                let plural = if held_on_peer == 1 { "photo" } else { "photos" };
+                (format!("{held_on_peer} {plural} still to come from {peer_name}."), false)
+            } else if local_photos > 0 {
+                let plural = if local_photos == 1 { "photo" } else { "photos" };
+                (
+                    format!(
+                        "None of this device's {local_photos} {plural} are copied to                          {peer_name}; it lists them as tiles it cannot open."
+                    ),
+                    true,
+                )
+            } else {
+                (String::new(), false)
+            }
+        }
+        // The card still lists peers with sync switched off; nothing is
+        // moving in either direction and saying so per-peer would be noise.
+        SyncRole::Off => (String::new(), false),
+    }
 }
 
 /// How recently a peer must have been seen to count as online. Two sync

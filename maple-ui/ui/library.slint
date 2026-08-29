@@ -20,6 +20,12 @@ export struct ThumbItem {
     name: string,
     loaded: bool,
     unsupported: bool,
+    // Non-empty when this photo's bytes live on a device this one cannot ask
+    // — the name of that device. Renders as a stated fact rather than as a
+    // tile that failed to load, which is what it looked like before: a master
+    // replicates a servant's metadata, holds none of its files, and has no
+    // route to go and get them.
+    held-on: string,
     stack-size: int,
     score: string,
     selected: bool,
@@ -60,12 +66,32 @@ component LibraryTile inherits Rectangle {
                 image-fit: cover;
             }
 
-            if !root.item.loaded && !root.item.unsupported: Text {
+            if !root.item.loaded && !root.item.unsupported && root.item.held-on == "": Text {
                 text: "…";
                 color: Theme.dim-fg;
                 font-size: 22px;
                 horizontal-alignment: center;
                 vertical-alignment: center;
+            }
+
+            if !root.item.loaded && root.item.held-on != "": VerticalLayout {
+                padding: 8px;
+                spacing: 4px;
+                alignment: center;
+                Text {
+                    text: "☁";
+                    color: Theme.dim-fg;
+                    font-size: 20px;
+                    horizontal-alignment: center;
+                }
+                Text {
+                    text: "held on\n" + root.item.held-on;
+                    color: Theme.dim-fg;
+                    font-size: 11px;
+                    horizontal-alignment: center;
+                    wrap: word-wrap;
+                    overflow: elide;
+                }
             }
 
             if root.item.unsupported: Text {

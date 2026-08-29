@@ -380,6 +380,10 @@ pub fn load_thumbs(
                         name: SharedString::from(name.as_str()),
                         loaded,
                         unsupported: !loaded,
+                        // This preview strip renders from thumbnails the
+                        // caller already resolved, so there is no "cannot
+                        // fetch" state to report.
+                        held_on: SharedString::default(),
                         stack_size: 0,
                         score: SharedString::default(),
                         selected: false,

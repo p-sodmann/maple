@@ -18,12 +18,14 @@ mod scan;
 pub mod session;
 pub mod sharpness;
 
-pub use copy::{copy_images, place_file, CopyResult, CopySummary};
+pub use copy::{copy_images, place_file, place_pair, CopyResult, CopySummary};
 pub use embed_cache::EmbeddingCache;
 pub use exif_date::ExifDateTime;
 pub use exif_read::ExifContext;
 pub use hash::{content_hash, hash_bytes};
-pub use image_source::{is_raw_format, loadable_image_bytes, raw_preview_supported};
+pub use image_source::{
+    is_raw_format, loadable_image_bytes, loadable_image_bytes_named, raw_preview_supported,
+};
 pub use loader::{apply_orientation, decode_image, decode_image_bytes};
 pub use path_template::{render_filename_stem, render_folder, TemplateContext};
 pub use preview_cache::{CachedPreview, PreviewCache, PreviewKey, PREVIEW_CACHE_FILE};

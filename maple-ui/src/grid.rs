@@ -867,6 +867,12 @@ fn decode_thumbs(
             scope.spawn(move || {
                 for (index, rec) in chunk {
                     let index = *index;
+                    // A row whose bytes are on a device this one cannot ask
+                    // keeps its "held on …" placeholder; dialling nothing to
+                    // find that out would spend a timeout per tile.
+                    if !held_on(rec, &blobs).is_empty() {
+                        continue;
+                    }
                     match load_thumbnail(rec, thumb_px, quality, &cache, &blobs) {
                         Ok((rgb, width, height)) => {
                             let _ = tx.send(GridMsg::Thumb { index, rgb, width, height });
@@ -888,6 +894,24 @@ fn decode_thumbs(
             });
         }
     });
+}
+
+/// The device a row's bytes sit on, when this one cannot go and get them.
+///
+/// Empty for everything else — including a relay servant's rows, which look
+/// exactly the same in the database but *are* fetchable, so they get the
+/// ordinary "…" and fill in a moment later.
+///
+/// Decided from the handle rather than from a failed fetch, which is the
+/// difference between a label and a timeout: on a master the answer is no and
+/// always will be, because a master runs no client and has no route to a
+/// servant. Anything that changes it — pairing, a role switch — goes through
+/// `SyncSupervisor::restart`, which is also what writes the handle.
+fn held_on(rec: &LibraryImage, blobs: &crate::remote::RemoteBlobs) -> String {
+    if !rec.locality.is_remote() || blobs.has_master() {
+        return String::new();
+    }
+    blobs.peer_name(rec.origin_device.as_deref())
 }
 
 /// Whether two readings of the same row would draw the same tile.
@@ -912,6 +936,7 @@ fn placeholder_item(rec: &LibraryImage, selected: bool) -> ThumbItem {
         name: SharedString::from(rec.meta.filename.as_deref().unwrap_or("…")),
         loaded: false,
         unsupported: false,
+        held_on: SharedString::from(held_on(rec, &crate::remote::blobs())),
         stack_size: rec.stack_size.unwrap_or(0) as i32,
         score: SharedString::from(score_caption(rec.search_hit.as_ref())),
         selected,

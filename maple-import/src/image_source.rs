@@ -95,8 +95,20 @@ pub fn raw_preview_supported(path: &Path) -> bool {
 /// The returned bytes are always a standard image format (JPEG/PNG) that
 /// gdk-pixbuf and the `image` crate can decode directly.
 pub fn loadable_image_bytes(path: &Path) -> anyhow::Result<Vec<u8>> {
-    let ext = ext_str(path);
-    if let Some(e) = ext.as_deref() {
+    loadable_image_bytes_named(path, path)
+}
+
+/// As [`loadable_image_bytes`], but the format is decided from `name` rather
+/// than from where the bytes happen to sit.
+///
+/// For a file staged under a synthetic name — sync stages every blob as
+/// `<hex-hash>.orig` — the extension on disk carries no information and the
+/// sender's filename carries all of it. Reading the staged path with the
+/// wrong handler hands a raw container to a JPEG parser, which fails
+/// silently: an empty EXIF context, and a photo filed under the day it
+/// arrived.
+pub fn loadable_image_bytes_named(path: &Path, name: &Path) -> anyhow::Result<Vec<u8>> {
+    if let Some(e) = ext_str(name).as_deref() {
         if let Some(handler) = HANDLERS.iter().find(|h| h.matches(e)) {
             return handler.extract_preview(path);
         }

@@ -464,21 +464,35 @@ impl Database {
     fn update_row(&self, row: &SyncRow, id: i64) -> anyhow::Result<()> {
         match row {
             SyncRow::Image(r) => {
-                // `status`, `path`, `raw_path`, `filename`, `locality` and
-                // `origin_device` are absent by design — they describe this
-                // machine's disk, not the photo. `exif_extracted` is set so
-                // the local metadata filler leaves the row alone.
+                // `status`, `path`, `filename`, `locality` and `origin_device`
+                // are absent by design — they describe this machine's disk,
+                // not the photo. `exif_extracted` is set so the local metadata
+                // filler leaves the row alone.
+                //
+                // `raw_path` is the one column that is *both*, and the `CASE`
+                // is which of the two this row is. On a `local` row it names a
+                // file on this disk and a peer must never overwrite it. On a
+                // `remote` row it is the origin's own path, carried purely so
+                // this device knows the photo **has** a companion worth asking
+                // for — and without this it could only ever be learned at
+                // INSERT. A servant that acquires a companion after the photo
+                // first replicated (the 60-second scanner finding a RAF copied
+                // in beside a JPEG) would then leave the master's row NULL
+                // forever, and `blob_upload` answers a `?raw=1` upload for such
+                // a row with BadRequest — so the negative could never cross,
+                // on any pass, with nothing in the logs but a refusal per try.
                 self.conn.execute(
                     "UPDATE images SET
                          hash = ?1, orientation = ?2, taken_at = ?3, make = ?4,
                          model = ?5, lens = ?6, focal_length = ?7, aperture = ?8,
                          iso = ?9, width = ?10, height = ?11,
-                         exif_extracted = 1, rev = ?12, rev_dev = ?13
-                     WHERE id = ?14",
+                         raw_path = CASE WHEN locality = 'remote' THEN ?12 ELSE raw_path END,
+                         exif_extracted = 1, rev = ?13, rev_dev = ?14
+                     WHERE id = ?15",
                     params![
                         r.hash.as_slice(), r.orientation, r.taken_at, r.make, r.model,
                         r.lens, r.focal_length, r.aperture, r.iso, r.width, r.height,
-                        r.stamp.rev, r.stamp.rev_dev, id
+                        r.origin_raw_path, r.stamp.rev, r.stamp.rev_dev, id
                     ],
                 )?;
             }

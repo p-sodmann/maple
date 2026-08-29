@@ -40,6 +40,12 @@ pub enum Source {
         /// Kept for the log line and the error text: a remote row's `path` is
         /// the master's, and is never opened here.
         origin_path: PathBuf,
+        /// What to call the device holding these bytes, for the one failure
+        /// that is not a failure: this device has no master to ask. On a
+        /// master that is permanent, so the honest message names the device
+        /// that does have the file rather than reporting a load error the
+        /// user could act on.
+        held_on: String,
     },
 }
 
@@ -59,8 +65,8 @@ pub fn load_full_image(source: Source, window: slint::Weak<DetailWindow>) {
         std::thread::spawn(move || {
             let _ = tx.send(match &source {
                 Source::Disk(path) => decode_to_rgb(path),
-                Source::Master { blobs, hash, origin_path } => {
-                    fetch_and_decode(blobs, hash, origin_path)
+                Source::Master { blobs, hash, origin_path, held_on } => {
+                    fetch_and_decode(blobs, hash, origin_path, held_on)
                 }
             });
         });
@@ -97,7 +103,20 @@ fn fetch_and_decode(
     blobs: &RemoteBlobs,
     hash: &[u8; 32],
     origin_path: &Path,
+    held_on: &str,
 ) -> Result<RgbBuf, String> {
+    // Asked before the raw check and before any request: on a master this is
+    // every remote row, permanently, and "no master to fetch from" wrapped in
+    // "could not load this photo" reads as a broken image rather than as the
+    // state it is.
+    if !blobs.has_master() {
+        let msg = format!(
+            "This photo is held on {held_on}. This device has a library entry \
+             for it but not the file, and no way to ask for it."
+        );
+        tracing::debug!("image_loader: {msg} ({})", origin_path.display());
+        return Err(msg);
+    }
     // `/blob/orig` serves the file *verbatim* — it has to, because P7 will
     // verify the BLAKE3 of what it downloads. For a raw original that means
     // sensor data, and the preview extractor that makes RAF viewable locally
@@ -115,6 +134,11 @@ fn fetch_and_decode(
     }
 
     let bytes = blobs.original(hash, false).map_err(|e| {
+        // The handle can be cleared between the check above and here — a role
+        // switch, an unpairing — so the same state gets the same words.
+        if e.downcast_ref::<crate::remote::NoMaster>().is_some() {
+            return format!("This photo is held on {held_on}, and this device cannot ask for it.");
+        }
         let msg = format!("Could not load this photo from the master: {e}");
         tracing::warn!("image_loader: {msg} ({})", origin_path.display());
         msg

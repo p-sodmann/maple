@@ -105,7 +105,12 @@ impl LibraryScanner {
             .expect("Failed to spawn library scanner thread");
     }
 
-    fn run_scan(&self) {
+    /// Reconcile the library directory against the database, once.
+    ///
+    /// Public so a test outside this crate can assert what a scan does *not*
+    /// do — the failure mode worth guarding is a file the scanner adopts as a
+    /// photograph nobody claimed, and that only shows up by running one.
+    pub fn run_scan(&self) {
         if PAUSED.load(Ordering::SeqCst) {
             tracing::debug!("Library scan skipped: paused for a restructure");
             return;
@@ -123,9 +128,18 @@ impl LibraryScanner {
         tracing::info!("Library scan: reconciling {}", dir.display());
 
         // ── 1. Load all DB records ───────────────────────────────
-        let db_records: Vec<(PathBuf, ImageStatus, Option<[u8; 32]>)> =
+        let db_records: Vec<crate::ImagePathStatusRow> =
             crate::lock_db(&self.db).all_paths().unwrap_or_default();
-        let db_path_set: HashSet<&PathBuf> = db_records.iter().map(|(p, _, _)| p).collect();
+        // Both path columns, deliberately. A row's *status* is decided by its
+        // display file alone (step 3 below), but a companion this library
+        // already claims must never look like a file nobody claims — step 4
+        // inserts one of those as a photograph of its own, and since a raw
+        // groups as its own `ImageGroup` the duplicate then stamps and
+        // replicates. See `Database::all_paths`.
+        let db_path_set: HashSet<&PathBuf> = db_records
+            .iter()
+            .flat_map(|(path, _, _, raw)| std::iter::once(path).chain(raw.as_ref()))
+            .collect();
 
         // ── 2. Scan library directory, skipping internal subdirs ──
         let groups = match scan_grouped_excluding(dir, EXCLUDED_DIRS) {
@@ -140,7 +154,7 @@ impl LibraryScanner {
 
         // ── 3. Reconcile DB records against disk ─────────────────
         let mut restatused = 0usize;
-        for (path, status, hash) in &db_records {
+        for (path, status, hash, _) in &db_records {
             let on_disk = found_map.contains_key(path);
             match (on_disk, status) {
                 (false, ImageStatus::Present) => {
@@ -342,6 +356,46 @@ mod tests {
             )
             .expect("row");
         assert_eq!(status, "missing");
+    }
+
+    /// A companion this library already claims is never adopted as a photo of
+    /// its own — even when it is nowhere near its display file.
+    ///
+    /// `place_pair` makes that separation impossible for a *newly* transferred
+    /// photo, but a library that already diverged (or a user who moved a file
+    /// by hand) still has orphans on disk, and the scanner regroups from disk
+    /// by directory and stem: a lone RAF is its own `ImageGroup`. Building the
+    /// known set from `path` alone left the second row nothing to collide
+    /// with, so the scanner minted it, `insert_image_with_raw` stamped it, and
+    /// sync replicated the ghost to every peer.
+    #[test]
+    fn an_orphaned_companion_is_not_adopted_as_a_second_photo() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let library = dir.path().join("library");
+        std::fs::create_dir_all(library.join("2019/07")).expect("month");
+        std::fs::create_dir_all(library.join("2026/08")).expect("other month");
+
+        // The shape a diverged transfer leaves behind: one row, two files,
+        // two directories.
+        let display = library.join("2019/07/DSCF0001.JPG");
+        let raw = library.join("2026/08/DSCF0001.RAF");
+        std::fs::write(&display, b"\xff\xd8\xffthe display file").expect("write");
+        std::fs::write(&raw, b"the negative").expect("write");
+
+        let db = Database::open(&dir.path().join("library.db")).expect("open");
+        let hash = content_hash(&display).expect("hash");
+        db.insert_image_with_raw(&display, &hash, 4, Some(&raw))
+            .expect("insert");
+        let db = Arc::new(Mutex::new(db));
+
+        LibraryScanner::new(db.clone(), library.clone(), None).run_scan();
+        LibraryScanner::new(db.clone(), library, None).run_scan();
+
+        assert_eq!(
+            db.lock().unwrap().count().unwrap(),
+            1,
+            "the companion is already spoken for; it is not a new photograph"
+        );
     }
 
     /// A scanner whose change hook counts its calls.

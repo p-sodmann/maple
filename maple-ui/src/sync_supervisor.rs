@@ -150,6 +150,18 @@ impl SyncSupervisor {
         let settings = maple_state::Settings::load();
         let role = {
             let db = maple_db::lock_db(&self.db);
+            // Published for *every* role, unlike the master handle above. A
+            // master never fetches anything, but its grid is the one full of
+            // rows it can only label: `images.origin_device` is a device id,
+            // and the name beside it lives in `sync_peers`, which the grid's
+            // decode threads cannot reach.
+            self.blobs.set_peer_names(
+                db.list_sync_peers()
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|peer| (peer.device_id.clone(), peer.display_name()))
+                    .collect(),
+            );
             db.sync_role().unwrap_or(SyncRole::Off)
         };
 

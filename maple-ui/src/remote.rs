@@ -22,6 +22,19 @@
 //! a device this machine no longer has a key for, and every remote thumbnail
 //! would fail slowly instead of failing immediately.
 //!
+//! # A master has no master
+//!
+//! `restart` sets the handle only for a servant, so on a master every fetch
+//! fails — correctly, and permanently: a master runs no client and has no
+//! route back to a servant behind a NAT (see `maple_sync::worker`). But a
+//! master paired with a servant still *replicates that servant's metadata*,
+//! so its grid holds a `remote` row for every photo the servant has, and
+//! nothing on the master will ever fill one in. Failing those with a generic
+//! error read as "the image is broken"; [`NoMaster`] and [`RemoteBlobs::peer_name`]
+//! are what let the grid say "held on Laptop" instead, and the fix for the
+//! underlying emptiness is on the servant — it has to be in a mode that
+//! uploads.
+//!
 //! # What it deliberately does not do
 //!
 //! Originals are never written to disk. That is the relay contract (§3.6):
@@ -29,9 +42,30 @@
 //! and full-res pixels live in memory for as long as the detail window shows
 //! them.
 
+use std::collections::HashMap;
 use std::sync::{Arc, LazyLock, Mutex};
 
 use maple_sync::{PeerKey, SyncClient, SyncFailure};
+
+/// Why a remote fetch failed before it was even attempted.
+///
+/// A distinct type rather than another `anyhow!` string because the UI has to
+/// *render* this one. It is not a transient network failure that a later
+/// scroll might resolve: this device has no master to ask, which on a master
+/// is permanent (a master runs no client and has no route to a servant) and
+/// on an unpaired device lasts until the user pairs. The grid draws a
+/// "held on …" placeholder for it instead of a broken tile, and the caller
+/// recognises it with `downcast_ref::<NoMaster>()`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NoMaster;
+
+impl std::fmt::Display for NoMaster {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("this device has no master to fetch photos from")
+    }
+}
+
+impl std::error::Error for NoMaster {}
 
 /// The master to fetch from, when there is one.
 struct Source {
@@ -49,12 +83,51 @@ struct Source {
 #[derive(Clone)]
 pub struct RemoteBlobs {
     source: Arc<Mutex<Option<Source>>>,
+    /// What this device calls each paired device, `device_id` → display name.
+    ///
+    /// Kept beside the master handle because it has the same shape of problem
+    /// and the same one instance per process: the grid's decode threads own an
+    /// `Arc` and nothing else, and a tile that says "held on Laptop" needs the
+    /// name behind `images.origin_device`, which lives in `sync_peers`.
+    /// Written by
+    /// [`SyncSupervisor::restart`](crate::sync_supervisor::SyncSupervisor::restart),
+    /// which already reads that table — so it goes stale only if a peer is
+    /// renamed mid-session, and the next restart refreshes it.
+    peer_names: Arc<Mutex<HashMap<String, String>>>,
 }
 
 impl RemoteBlobs {
     fn new() -> Self {
         Self {
             source: Arc::new(Mutex::new(None)),
+            peer_names: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
+
+    /// Whether there is a master to fetch from at all.
+    ///
+    /// Asked *before* a fetch, not after one fails: on a master the answer is
+    /// no and always will be, so dialling and waiting would spend a network
+    /// timeout to learn something already known.
+    pub fn has_master(&self) -> bool {
+        lock(&self.source).is_some()
+    }
+
+    /// Record what this device calls each paired device.
+    pub fn set_peer_names(&self, names: HashMap<String, String>) {
+        *lock(&self.peer_names) = names;
+    }
+
+    /// What to call the device a remote row came from.
+    ///
+    /// Falls back to the raw device id, and then to "another device": a row
+    /// whose origin is unknown still has to say *something*, and a blank
+    /// placeholder is the failure this exists to replace.
+    pub fn peer_name(&self, device_id: Option<&str>) -> String {
+        let names = lock(&self.peer_names);
+        match device_id {
+            Some(id) => names.get(id).cloned().unwrap_or_else(|| id.to_owned()),
+            None => "another device".to_owned(),
         }
     }
 
@@ -93,9 +166,7 @@ impl RemoteBlobs {
     {
         let (client, key, device_id) = {
             let guard = lock(&self.source);
-            let source = guard
-                .as_ref()
-                .ok_or_else(|| anyhow::anyhow!("no master to fetch from"))?;
+            let source = guard.as_ref().ok_or(NoMaster)?;
             (
                 source.client.clone(),
                 source.key.clone(),

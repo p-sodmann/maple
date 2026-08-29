@@ -699,12 +699,19 @@ fn blob_upload(
     // the adoption to fail on the constraint. See `crate::transfer`.
     let placed = {
         let db = lock(&ctx.db);
-        let placed = ctx.layout.place(&staged, &row.filename).map_err(internal)?;
         let staged_raw = ctx.layout.staged_path(&hash, true);
-        let placed_raw = match (&row.raw_filename, staged_raw.exists()) {
-            (Some(name), true) => Some(ctx.layout.place(&staged_raw, name).map_err(internal)?),
+        let companion = match (&row.raw_filename, staged_raw.exists()) {
+            (Some(name), true) => Some((staged_raw.as_path(), name.as_str())),
             _ => None,
         };
+        // One call for the pair: a companion filed anywhere but beside its
+        // display file, under the same stem, is a second photograph as far as
+        // this master's own library scanner is concerned. See
+        // `maple_import::place_pair`.
+        let (placed, placed_raw) = ctx
+            .layout
+            .place(&staged, &row.filename, companion)
+            .map_err(internal)?;
         db.adopt_original(row.id, &placed, placed_raw.as_deref())
             .map_err(internal)?;
         placed

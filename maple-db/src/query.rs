@@ -56,9 +56,42 @@ pub struct SearchQuery {
     /// Row ordering.  Ignored by hybrid (semantic) search, which is ranked
     /// by relevance instead.
     pub order: SearchOrder,
+    /// Hide rows whose bytes live on another device (`locality = 'remote'`).
+    ///
+    /// A master paired with a relay servant replicates every one of that
+    /// servant's photos as metadata and receives none of the files, so its
+    /// grid fills with tiles it can never load — a master runs no worker and
+    /// has no route to a servant, so nothing on that machine can fetch them.
+    /// This is how a user gets their own library back while the peer is in a
+    /// mode that sends nothing. Off by default: the rows are real library
+    /// entries and hiding them by default would be its own surprise.
+    pub local_only: bool,
+}
+
+/// The `WHERE`-clause half of a [`SearchQuery`] — everything that narrows
+/// *which rows*, with nothing about paging, ordering or ranking.
+///
+/// Carried as one value rather than as three positional arguments because
+/// every listing path needs all of them and they are easy to transpose: two
+/// `Option<i64>` and a `bool` next to a `limit`/`offset` pair is exactly the
+/// signature that silently filters by the wrong thing.
+#[derive(Default, Clone, Copy, Debug)]
+pub(crate) struct Filters {
+    pub collection_id: Option<i64>,
+    pub person_id: Option<i64>,
+    pub local_only: bool,
 }
 
 impl SearchQuery {
+    /// The row-narrowing half of this query.
+    pub(crate) fn filters(&self) -> Filters {
+        Filters {
+            collection_id: self.collection_id,
+            person_id: self.person_id,
+            local_only: self.local_only,
+        }
+    }
+
     /// Filter by free text.  Whitespace-separated tokens are ANDed together
     /// as prefix matches (e.g. `"nikon 50"` → rows where every token
     /// appears in at least one indexed field, as a prefix).
@@ -79,6 +112,12 @@ impl SearchQuery {
 
     pub fn with_offset(mut self, offset: usize) -> Self {
         self.offset = Some(offset);
+        self
+    }
+
+    /// Restrict the listing to photos this device actually holds.
+    pub fn with_local_only(mut self, local_only: bool) -> Self {
+        self.local_only = local_only;
         self
     }
 

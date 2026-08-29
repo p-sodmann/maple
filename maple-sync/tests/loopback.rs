@@ -118,9 +118,19 @@ impl Install {
     /// on the transfer and not on the template renderer, which has its own
     /// tests in `maple-import`.
     fn layout(&self) -> maple_sync::LibraryLayout {
+        self.layout_under("")
+    }
+
+    /// The same, under a real folder template.
+    ///
+    /// Worth one test on its own: a flat destination makes "the companion
+    /// went where the display file went" true by construction, and the bug
+    /// that shipped was precisely the two files being sent to *different*
+    /// folders. See `a_companion_lands_beside_its_photo_under_a_real_template`.
+    fn layout_under(&self, folder_template: &str) -> maple_sync::LibraryLayout {
         maple_sync::LibraryLayout {
             library_dir: self.library_dir(),
-            folder_template: String::new(),
+            folder_template: folder_template.into(),
             filename_template: "{original}".into(),
         }
     }
@@ -162,6 +172,11 @@ struct Master {
 
 impl Master {
     fn start(clock: &TestClock, rng: SharedRandom) -> Self {
+        Self::start_filing_under(clock, rng, "")
+    }
+
+    /// A master that files what it receives under `folder_template`.
+    fn start_filing_under(clock: &TestClock, rng: SharedRandom, folder_template: &str) -> Self {
         let install = Install::new("Workstation");
         install
             .db()
@@ -203,7 +218,7 @@ impl Master {
                 rng,
                 thumbs: thumbs.clone(),
                 render_thumb,
-                layout: install.layout(),
+                layout: install.layout_under(folder_template),
                 on_change: {
                     let changes = changes.clone();
                     Arc::new(move || {
@@ -2088,6 +2103,204 @@ fn a_companion_raw_travels_with_the_photo_it_belongs_to() {
     assert!(
         master.changes.load(Ordering::Relaxed) > 0,
         "the master's own grid has to be told a photo landed — it polls nothing"
+    );
+}
+
+/// Every photo file under a library, relative to it and `/`-separated, so an
+/// assertion can name a folder the template built.
+fn photo_paths_in(dir: &std::path::Path) -> Vec<String> {
+    fn walk(dir: &std::path::Path, root: &std::path::Path, out: &mut Vec<String>) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.filter_map(|e| e.ok()) {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if name.starts_with('.') {
+                continue; // `.incoming`, and anything else internal
+            }
+            let path = entry.path();
+            if path.is_dir() {
+                walk(&path, root, out);
+            } else {
+                let relative = path.strip_prefix(root).unwrap_or(&path);
+                out.push(
+                    relative
+                        .components()
+                        .map(|c| c.as_os_str().to_string_lossy().into_owned())
+                        .collect::<Vec<_>>()
+                        .join("/"),
+                );
+            }
+        }
+    }
+    let mut out = Vec::new();
+    walk(dir, dir, &mut out);
+    out.sort();
+    out
+}
+
+/// The smallest JPEG carrying a `DateTimeOriginal`, so a folder template has
+/// a real capture date to render — which is the whole point of the test
+/// below. Mirrors `maple_import::copy`'s own fixture.
+fn jpeg_taken_on(stamp: &str) -> Vec<u8> {
+    let mut date = stamp.as_bytes().to_vec();
+    date.push(0);
+    let entry = |tag: u16, kind: u16, count: u32, value: u32| {
+        let mut e = tag.to_le_bytes().to_vec();
+        e.extend_from_slice(&kind.to_le_bytes());
+        e.extend_from_slice(&count.to_le_bytes());
+        e.extend_from_slice(&value.to_le_bytes());
+        e
+    };
+    let ifd = |e: Vec<u8>| {
+        let mut ifd = 1u16.to_le_bytes().to_vec();
+        ifd.extend_from_slice(&e);
+        ifd.extend_from_slice(&0u32.to_le_bytes());
+        ifd
+    };
+    let mut tiff = b"II".to_vec();
+    tiff.extend_from_slice(&42u16.to_le_bytes());
+    tiff.extend_from_slice(&8u32.to_le_bytes());
+    tiff.extend_from_slice(&ifd(entry(0x8769, 4, 1, 26)));
+    tiff.extend_from_slice(&ifd(entry(0x9003, 2, date.len() as u32, 44)));
+    tiff.extend_from_slice(&date);
+    let mut app1 = b"Exif\0\0".to_vec();
+    app1.extend_from_slice(&tiff);
+    let mut jpeg = vec![0xFF, 0xD8, 0xFF, 0xE1];
+    jpeg.extend_from_slice(&((app1.len() + 2) as u16).to_be_bytes());
+    jpeg.extend_from_slice(&app1);
+    jpeg.extend_from_slice(&[0xFF, 0xD9]);
+    jpeg
+}
+
+/// The bug the flat-destination tests could not see.
+///
+/// With a real `{YYYY}/{MM}` template the two halves of one photo were filed
+/// *independently*: the JPEG's own EXIF sent it to the month it was taken,
+/// while the RAF — staged under a synthetic `<hash>.raw` name, so nothing
+/// could tell it was a raw container — parsed as having no date at all and
+/// landed under the month it arrived. The database still linked them; the
+/// disk did not. And since the library scanner regroups by directory and
+/// stem, the orphaned RAF was a photograph no row claimed, so the next scan
+/// inserted a second `images` row for it — which then stamped and replicated
+/// back to the servant.
+#[test]
+fn a_companion_lands_beside_its_photo_under_a_real_template() {
+    let clock = TestClock::new();
+    let master = Master::start_filing_under(&clock, seeded(120), "{YYYY}/{MM}");
+    let servant = Install::new("Laptop");
+    let client = client(&master, &servant, &clock, seeded(121));
+    let outcome = pair(&master, &servant, &client, &clock, "482107", "314159").unwrap();
+
+    // Taken in 2019; arriving today. A template that reads the two files
+    // separately cannot put them in the same folder.
+    let display = servant.library_dir().join("DSCF0001.JPG");
+    let raw = servant.library_dir().join("DSCF0001.RAF");
+    let jpeg = jpeg_taken_on("2019:07:04 10:11:12");
+    std::fs::write(&display, &jpeg).unwrap();
+    std::fs::write(&raw, b"a raw container this build has no reader for").unwrap();
+    let hash = maple_import::content_hash(&display).unwrap();
+    servant
+        .db()
+        .insert_image_with_raw(&display, &hash, jpeg.len() as u64, Some(&raw))
+        .unwrap();
+
+    sync_metadata(&master, &servant, &client, &outcome.key);
+    let moved = move_files(&servant, &client, &outcome.key, PeerMode::Partial);
+    assert_eq!(moved.uploaded, 1);
+
+    let library = master.install.library_dir();
+    assert_eq!(
+        photo_paths_in(&library),
+        vec!["2019/07/DSCF0001.JPG", "2019/07/DSCF0001.RAF"],
+        "the companion follows its display file, capture date and all"
+    );
+
+    // Said structurally, because that is the property the scanner depends on
+    // and the literal paths above are only one instance of it.
+    let placed = master.install.db().blob_path(&hash, false).unwrap().unwrap();
+    let placed_raw = master.install.db().blob_path(&hash, true).unwrap().unwrap();
+    assert_eq!(placed.parent(), placed_raw.parent(), "same directory");
+    assert_eq!(placed.file_stem(), placed_raw.file_stem(), "same stem");
+
+    // And so the master's own scanner has nothing to adopt: one photograph on
+    // disk, one row, and no ghost minted from the orphaned negative.
+    let before = master.install.db().count().unwrap();
+    maple_db::LibraryScanner::new(master.install.db.clone(), library.clone(), None).run_scan();
+    assert_eq!(
+        master.install.db().count().unwrap(),
+        before,
+        "a scan after a companion transfer must insert nothing"
+    );
+    assert_eq!(before, 1, "one photo is one row");
+}
+
+/// A companion the servant only acquires *after* the photo first replicated
+/// still crosses.
+///
+/// `Database::update_row` used to write every replicated column except
+/// `raw_path`, which was set on INSERT and never again — reasonable-looking,
+/// since `path` and `filename` beside it really are machine-local. But on a
+/// `remote` row `raw_path` is not this machine's anything: it is the origin's
+/// path, carried only so this device knows the photo *has* a negative worth
+/// asking for. So a master that first heard about a JPEG on its own stayed
+/// NULL forever, and `blob_upload` answers a `?raw=1` upload for such a row
+/// with BadRequest — the raw was refused on every pass, permanently, with a
+/// warning per attempt and nothing else to show for it.
+#[test]
+fn a_companion_found_after_the_photo_replicated_still_crosses() {
+    let clock = TestClock::new();
+    let master = Master::start(&clock, seeded(122));
+    let servant = Install::new("Laptop");
+    let client = client(&master, &servant, &clock, seeded(123));
+    let outcome = pair(&master, &servant, &client, &clock, "482107", "314159").unwrap();
+
+    // First the JPEG alone — as if the RAF had not been copied off the card
+    // yet, or the scanner had not got to it.
+    let display = servant.library_dir().join("DSCF0001.JPG");
+    std::fs::write(&display, b"the embedded preview").unwrap();
+    let hash = maple_import::content_hash(&display).unwrap();
+    servant.db().insert_image(&display, &hash, 20).unwrap();
+    sync_metadata(&master, &servant, &client, &outcome.key);
+    assert_eq!(
+        master.install.db().originals_to_fetch(10).unwrap()[0].raw_filename,
+        None,
+        "the master cannot know about a companion nobody has mentioned"
+    );
+
+    // Now the negative turns up beside it and the servant records it — which
+    // is exactly what its own 60-second scanner does.
+    let raw = servant.library_dir().join("DSCF0001.RAF");
+    let negative = b"the raw negative";
+    std::fs::write(&raw, negative).unwrap();
+    let image_id = servant.db().image_id_for_path(&display).unwrap().unwrap();
+    servant.db().set_raw_path(image_id, &raw).expect("record the companion");
+    // `set_raw_path` does not stamp, deliberately — `raw_path` is where *this*
+    // machine keeps its copy, and every device discovers its own. So the fact
+    // travels the way any machine-local column does: carried along by the next
+    // edit that *is* replicated. Orientation stands in for that here; a real
+    // library gets one from a rotation, an EXIF fill or a metadata edit.
+    servant
+        .db()
+        .update_image_hash_and_orientation(image_id, &hash, 6)
+        .expect("some later replicated edit");
+
+    sync_metadata(&master, &servant, &client, &outcome.key);
+    assert_eq!(
+        master.install.db().originals_to_fetch(10).unwrap()[0].raw_filename.as_deref(),
+        Some("DSCF0001.RAF"),
+        "an update has to be able to teach the master about a companion"
+    );
+
+    let moved = move_files(&servant, &client, &outcome.key, PeerMode::Partial);
+    assert_eq!(moved.uploaded, 1);
+    assert_eq!(
+        photos_in(&master.install.library_dir()),
+        vec!["DSCF0001.JPG", "DSCF0001.RAF"]
+    );
+    assert_eq!(
+        std::fs::read(master.install.library_dir().join("DSCF0001.RAF")).unwrap(),
+        negative
     );
 }
 

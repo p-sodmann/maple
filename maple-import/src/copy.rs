@@ -174,6 +174,9 @@ where
 /// The `{counter}` token renders as 1: there is no batch here, only ever one
 /// file. A template that leans entirely on it collides, and
 /// [`unique_dest_path`] resolves that the same way it does for an import.
+///
+/// A photo **with a companion raw must not use this twice**; see
+/// [`place_pair`].
 pub fn place_file(
     staged: &Path,
     destination: &Path,
@@ -181,14 +184,76 @@ pub fn place_file(
     filename_template: &str,
     original_name: &str,
 ) -> anyhow::Result<PathBuf> {
+    let (dest, _) = place_pair(
+        staged,
+        destination,
+        folder_template,
+        filename_template,
+        original_name,
+        None,
+    )?;
+    Ok(dest)
+}
+
+/// Place a display file and, in the same call, its companion raw **beside
+/// it**: same directory, same stem, only the extension differing.
+///
+/// This is [`place_file`] plus the one invariant a companion has to satisfy,
+/// and it exists because deriving the companion's own destination cannot
+/// produce that invariant — only approximate it. The library scanner
+/// regroups from *disk*, by directory and stem, so a RAF that does not sit
+/// beside its JPEG under a matching stem is not a companion at all: it is a
+/// photograph the scanner has never seen, and it inserts a second `images`
+/// row for it, which then replicates to every peer.
+///
+/// Two files placed independently diverge for at least three reasons, and
+/// each of them was reachable:
+///
+/// - **The date.** A staged blob has a synthetic name, so the template
+///   context was read from a raw container by an EXIF path that recognises
+///   raws *by extension* — it read nothing, fell back to the file's mtime,
+///   and filed the companion under the month it arrived while the display
+///   file went under the month it was taken.
+/// - **The camera.** `{camera}` comes from `Make`/`Model`, and a raw's
+///   embedded preview need not carry the same strings its JPEG sibling does.
+/// - **The collision suffix.** [`unique_dest_path`] appends `_1` to whichever
+///   of the two happens to collide, independently of the other.
+///
+/// So the pair is placed together: one template context, read from the
+/// display file, one target directory, and one stem chosen free for *both*
+/// extensions at once. `companion` is `(staged path, sender's file name)`;
+/// only the name's extension is used, since the stem is the display file's by
+/// construction.
+///
+/// Both files are **moved**, display file first. A companion that cannot be
+/// moved is an error, and the caller's contract (`transfer::commit`,
+/// `server::blob_upload`) is to clear staging and try the whole photo again
+/// on the next pass rather than adopt half of it.
+pub fn place_pair(
+    staged: &Path,
+    destination: &Path,
+    folder_template: &str,
+    filename_template: &str,
+    original_name: &str,
+    companion: Option<(&Path, &str)>,
+) -> anyhow::Result<(PathBuf, Option<PathBuf>)> {
     let original = Path::new(original_name);
     let original_stem = original
         .file_stem()
         .and_then(|s| s.to_str())
         .unwrap_or("file");
     let extension = original.extension().and_then(|e| e.to_str()).unwrap_or("");
+    let companion_ext = companion
+        .map(|(_, name)| Path::new(name))
+        .and_then(|name| name.extension())
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_owned();
 
-    let ctx = crate::exif_read::read(staged);
+    // Read against the *sender's* name, not the staged one: a blob staged as
+    // `<hash>.orig` tells `is_raw_format` nothing, and a raw handed to the
+    // JPEG parser yields an empty context and the arrival-time fallback.
+    let ctx = crate::exif_read::read_named(staged, original);
     let (datetime, camera) = (ctx.datetime, ctx.camera);
     let datetime = datetime.or_else(|| mtime_fallback(staged));
     let ctx = TemplateContext {
@@ -208,21 +273,40 @@ pub fn place_file(
 
     let stem = path_template::render_filename_stem(filename_template, &ctx);
     let stem = if stem.is_empty() { original_stem.to_owned() } else { stem };
-    let dest = unique_dest_path(&stem, extension, &target_dir);
+    let wanted_companion = companion.map(|_| companion_ext.as_str());
+    let (dest, companion_dest) =
+        unique_pair_path(&stem, extension, wanted_companion, &target_dir);
 
-    if std::fs::rename(staged, &dest).is_err() {
-        // Different filesystems, most likely. Copy first and only then drop
-        // the staged file, so a failure here leaves the caller's bytes intact
-        // rather than losing a download that has already been verified.
-        std::fs::copy(staged, &dest).map_err(|e| {
-            anyhow::anyhow!("failed to place {} at {}: {e}", staged.display(), dest.display())
-        })?;
-        if let Err(e) = std::fs::remove_file(staged) {
-            tracing::warn!("could not remove staged file {}: {e}", staged.display());
-        }
-    }
+    move_into_place(staged, &dest)?;
     tracing::info!("Placed {} → {}", original_name, dest.display());
-    Ok(dest)
+
+    let companion_dest = match (companion, companion_dest) {
+        (Some((staged_raw, raw_name)), Some(raw_dest)) => {
+            move_into_place(staged_raw, &raw_dest)?;
+            tracing::info!("Placed companion {} → {}", raw_name, raw_dest.display());
+            Some(raw_dest)
+        }
+        _ => None,
+    };
+    Ok((dest, companion_dest))
+}
+
+/// Move `staged` to `dest`, falling back to copy-and-remove across
+/// filesystems.
+fn move_into_place(staged: &Path, dest: &Path) -> anyhow::Result<()> {
+    if std::fs::rename(staged, dest).is_ok() {
+        return Ok(());
+    }
+    // Different filesystems, most likely. Copy first and only then drop the
+    // staged file, so a failure here leaves the caller's bytes intact rather
+    // than losing a download that has already been verified.
+    std::fs::copy(staged, dest).map_err(|e| {
+        anyhow::anyhow!("failed to place {} at {}: {e}", staged.display(), dest.display())
+    })?;
+    if let Err(e) = std::fs::remove_file(staged) {
+        tracing::warn!("could not remove staged file {}: {e}", staged.display());
+    }
+    Ok(())
 }
 
 /// Fall back to the file's mtime when no EXIF date is available.
@@ -270,10 +354,199 @@ fn unique_dest_path(stem: &str, extension: &str, destination: &Path) -> PathBuf 
     destination.join(file_name(stem))
 }
 
+/// Pick one stem that is free for a display file **and** its companion.
+///
+/// The pair version of [`unique_dest_path`], and the reason that one cannot
+/// simply be called twice: resolving each collision separately can hand the
+/// two files different suffixes, which is exactly the divergence
+/// [`place_pair`] exists to make impossible. A stem is a candidate only when
+/// *neither* name is taken, so a stray `DSCF0001.RAF` sitting alone still
+/// pushes an arriving pair to `DSCF0001_1.JPG` + `DSCF0001_1.RAF` and keeps
+/// them together.
+fn unique_pair_path(
+    stem: &str,
+    extension: &str,
+    companion_ext: Option<&str>,
+    destination: &Path,
+) -> (PathBuf, Option<PathBuf>) {
+    let Some(companion_ext) = companion_ext else {
+        return (unique_dest_path(stem, extension, destination), None);
+    };
+
+    let name = |stem: &str, ext: &str| -> PathBuf {
+        destination.join(if ext.is_empty() {
+            stem.to_owned()
+        } else {
+            format!("{stem}.{ext}")
+        })
+    };
+    let free = |candidate: &str| -> Option<(PathBuf, PathBuf)> {
+        let display = name(candidate, extension);
+        let companion = name(candidate, companion_ext);
+        // `display != companion` guards the degenerate case of a sender whose
+        // two files differ only in case, or not at all: placing both would
+        // otherwise mean the second overwriting the first.
+        (display != companion && !display.exists() && !companion.exists())
+            .then_some((display, companion))
+    };
+
+    if let Some(pair) = free(stem) {
+        return (pair.0, Some(pair.1));
+    }
+    for n in 1..u32::MAX {
+        if let Some(pair) = free(&format!("{stem}_{n}")) {
+            return (pair.0, Some(pair.1));
+        }
+    }
+    // Extremely unlikely fallback.
+    (name(stem, extension), Some(name(stem, companion_ext)))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::fs;
+
+    /// The smallest JPEG that carries a `DateTimeOriginal`.
+    ///
+    /// Built rather than checked in as a fixture because the *only* thing
+    /// under test is the date: a real photo would make these tests depend on
+    /// a binary nobody can read in a diff. Little-endian TIFF, IFD0 holding
+    /// one pointer to an Exif IFD, which holds one ASCII tag.
+    fn jpeg_taken_on(stamp: &str) -> Vec<u8> {
+        assert_eq!(stamp.len(), 19, "EXIF stamps are `YYYY:MM:DD HH:MM:SS`");
+        let mut date = stamp.as_bytes().to_vec();
+        date.push(0);
+
+        let entry = |tag: u16, kind: u16, count: u32, value: u32| {
+            let mut e = Vec::new();
+            e.extend_from_slice(&tag.to_le_bytes());
+            e.extend_from_slice(&kind.to_le_bytes());
+            e.extend_from_slice(&count.to_le_bytes());
+            e.extend_from_slice(&value.to_le_bytes());
+            e
+        };
+        let ifd = |e: Vec<u8>| {
+            let mut ifd = 1u16.to_le_bytes().to_vec();
+            ifd.extend_from_slice(&e);
+            ifd.extend_from_slice(&0u32.to_le_bytes()); // no next IFD
+            ifd
+        };
+
+        let mut tiff = b"II".to_vec();
+        tiff.extend_from_slice(&42u16.to_le_bytes());
+        tiff.extend_from_slice(&8u32.to_le_bytes()); // IFD0 starts here
+        // IFD0 is 18 bytes at offset 8, so the Exif IFD begins at 26 and its
+        // one out-of-line value at 44.
+        tiff.extend_from_slice(&ifd(entry(0x8769, 4, 1, 26))); // ExifIFDPointer
+        tiff.extend_from_slice(&ifd(entry(0x9003, 2, date.len() as u32, 44)));
+        tiff.extend_from_slice(&date);
+
+        let mut app1 = b"Exif\0\0".to_vec();
+        app1.extend_from_slice(&tiff);
+        let mut jpeg = vec![0xFF, 0xD8, 0xFF, 0xE1];
+        jpeg.extend_from_slice(&((app1.len() + 2) as u16).to_be_bytes());
+        jpeg.extend_from_slice(&app1);
+        jpeg.extend_from_slice(&[0xFF, 0xD9]);
+        jpeg
+    }
+
+    #[test]
+    fn the_test_jpeg_really_carries_its_date() {
+        // If this ever stops holding, every assertion below about *where* a
+        // photo files silently starts testing the mtime fallback instead.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("a.jpg");
+        fs::write(&path, jpeg_taken_on("2019:07:04 10:11:12")).unwrap();
+        let ctx = crate::exif_read::read(&path);
+        assert_eq!(ctx.datetime.map(|d| (d.year, d.month)), Some((2019, 7)));
+    }
+
+    /// A companion follows its display file into whatever folder the template
+    /// sent that one to — which is the whole invariant, and the one that was
+    /// broken: staged as `<hash>.raw`, a RAF was handed to the JPEG parser,
+    /// read as having no date at all, and filed under the month it arrived.
+    #[test]
+    fn place_pair_files_a_companion_beside_its_display_file() {
+        let staged_dir = tempfile::tempdir().unwrap();
+        let lib = tempfile::tempdir().unwrap();
+
+        // Staged the way sync stages: synthetic names, no extension anyone
+        // could learn a format from.
+        let display = staged_dir.path().join("abcdef.orig");
+        let raw = staged_dir.path().join("abcdef.raw");
+        fs::write(&display, jpeg_taken_on("2019:07:04 10:11:12")).unwrap();
+        fs::write(&raw, b"not a parseable raw container").unwrap();
+
+        let (placed, placed_raw) = place_pair(
+            &display,
+            lib.path(),
+            "{YYYY}/{MM}",
+            "{original}",
+            "DSCF0001.JPG",
+            Some((raw.as_path(), "DSCF0001.RAF")),
+        )
+        .unwrap();
+        let placed_raw = placed_raw.expect("the companion was placed");
+
+        assert_eq!(placed, lib.path().join("2019/07/DSCF0001.JPG"));
+        assert_eq!(placed_raw, lib.path().join("2019/07/DSCF0001.RAF"));
+        assert_eq!(placed.parent(), placed_raw.parent());
+        assert_eq!(placed.file_stem(), placed_raw.file_stem());
+        assert!(!display.exists() && !raw.exists(), "both are moved");
+    }
+
+    /// A collision moves *both* names, together. Resolving each file's
+    /// collision on its own would give the pair different suffixes, which is
+    /// the same divergence by another route.
+    #[test]
+    fn place_pair_keeps_one_stem_across_a_collision() {
+        let staged_dir = tempfile::tempdir().unwrap();
+        let lib = tempfile::tempdir().unwrap();
+        // Only the JPEG name is taken; the RAF name is free.
+        fs::write(lib.path().join("DSCF0001.JPG"), b"already here").unwrap();
+
+        let display = staged_dir.path().join("abcdef.orig");
+        let raw = staged_dir.path().join("abcdef.raw");
+        fs::write(&display, b"the display file").unwrap();
+        fs::write(&raw, b"the negative").unwrap();
+
+        let (placed, placed_raw) = place_pair(
+            &display,
+            lib.path(),
+            "",
+            "{original}",
+            "DSCF0001.JPG",
+            Some((raw.as_path(), "DSCF0001.RAF")),
+        )
+        .unwrap();
+
+        assert_eq!(placed, lib.path().join("DSCF0001_1.JPG"));
+        assert_eq!(
+            placed_raw.unwrap(),
+            lib.path().join("DSCF0001_1.RAF"),
+            "the companion follows the display file's suffix, free name or not"
+        );
+        assert_eq!(fs::read(lib.path().join("DSCF0001.JPG")).unwrap(), b"already here");
+    }
+
+    /// A raw with no JPEG beside it is its own display file, and sync stages
+    /// it as `<hash>.orig` — so the format has to come from the sender's name
+    /// or the capture date is lost and the photo files under the day it
+    /// arrived.
+    #[test]
+    fn a_staged_blob_is_read_as_the_format_its_sender_named() {
+        let staged_dir = tempfile::tempdir().unwrap();
+        let staged = staged_dir.path().join("abcdef.orig");
+        fs::write(&staged, jpeg_taken_on("2019:07:04 10:11:12")).unwrap();
+
+        let ctx = crate::exif_read::read_named(&staged, Path::new("DSCF0001.JPG"));
+        assert_eq!(ctx.datetime.map(|d| (d.year, d.month)), Some((2019, 7)));
+        // And the staged name on its own tells nobody anything, which is
+        // precisely why the sender's has to be carried.
+        let blind = crate::exif_read::read(&staged);
+        assert_eq!(blind, ctx, "a .orig JPEG still parses as a JPEG");
+    }
 
     #[test]
     fn copy_images_to_destination() {

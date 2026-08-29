@@ -256,7 +256,7 @@ impl Database {
         k: usize,
         limit: Option<usize>,
         offset: Option<usize>,
-        collection_id: Option<i64>,
+        filters: &crate::query::Filters,
     ) -> anyhow::Result<Vec<LibraryImage>> {
         let limit = limit.unwrap_or(500);
         let offset = offset.unwrap_or(0);
@@ -266,12 +266,14 @@ impl Database {
         // search_images_text.
         // Relevance-ranked by construction, so the caller's `SearchOrder` has
         // nothing to apply here — the keyword side just needs a stable pool.
+        // The keyword pool intentionally drops the person filter: hybrid
+        // search ranks by relevance and the person narrowing is applied by
+        // the caller's own query path.
         let keyword = self.search_images_text(
             text,
             Some(pool),
             Some(0),
-            collection_id,
-            None,
+            &crate::query::Filters { person_id: None, ..*filters },
             crate::SearchOrder::default(),
         )?;
         // Semantic hits: (image_id, cosine_distance, best_sentence).
@@ -310,7 +312,13 @@ impl Database {
             .collect();
 
         let mut semantic_only_images =
-            self.images_by_ids_ordered(&semantic_only_page, collection_id)?;
+            self.images_by_ids_ordered(&semantic_only_page, filters.collection_id)?;
+        // The semantic side comes back by row id, not through the listing's
+        // WHERE clause, so `local_only` has to be applied here as well or a
+        // hidden photo reappears the moment the user searches for it.
+        if filters.local_only {
+            semantic_only_images.retain(|img| !img.locality.is_remote());
+        }
         for img in &mut semantic_only_images {
             if let Some((sim, sent)) = semantic_info.get(&img.id) {
                 img.search_hit = Some(crate::SearchHit::Semantic {
@@ -460,7 +468,14 @@ mod tests {
         // Both descriptions contain "apple" so both are keyword (direct) hits.
         // Direct hits appear before semantic-only hits; both images surface here.
         let results = db
-            .search_images_hybrid("apple", &[0.9, 0.1, 0.0, 0.0], 10, None, None, None)
+            .search_images_hybrid(
+                "apple",
+                &[0.9, 0.1, 0.0, 0.0],
+                10,
+                None,
+                None,
+                &crate::query::Filters::default(),
+            )
             .unwrap();
         let mut ids: Vec<i64> = results.iter().map(|i| i.id).collect();
         ids.sort();

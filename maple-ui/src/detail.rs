@@ -674,11 +674,20 @@ fn show_record(window: &DetailWindow, nav: &NavState) {
 /// the message is easier to diagnose than a silent blank.
 fn full_image_source(rec: &LibraryImage) -> image_loader::Source {
     match (rec.locality.is_remote(), rec.hash) {
-        (true, Some(hash)) => image_loader::Source::Master {
-            blobs: crate::remote::blobs(),
-            hash,
-            origin_path: rec.path.clone(),
-        },
+        (true, Some(hash)) => {
+            let blobs = crate::remote::blobs();
+            // Resolved here, on the UI thread, because this is where
+            // `origin_device` is in hand; the loader threads carry only the
+            // handle. Same rule the grid tile uses, so the two views never
+            // disagree about whether a photo is fetchable.
+            let held_on = blobs.peer_name(rec.origin_device.as_deref());
+            image_loader::Source::Master {
+                blobs,
+                hash,
+                origin_path: rec.path.clone(),
+                held_on,
+            }
+        }
         _ => image_loader::Source::Disk(rec.path.clone()),
     }
 }

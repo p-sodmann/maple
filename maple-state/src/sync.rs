@@ -114,13 +114,37 @@ impl PeerMode {
         }
     }
 
-    /// One line explaining what this mode does to disk usage.
+    /// What this mode *does*, in the words of what the user will see.
+    ///
+    /// Deliberately not a description of disk usage. Relay is the pairing
+    /// default on both sides, and its earlier line ("No originals stored
+    /// here; loaded on demand") described only half of it: the half about
+    /// this device. The other half is that nothing leaves this device either,
+    /// so the master lists every photo here as a tile it can never open —
+    /// a master runs no worker and has no route back to a servant, so there
+    /// is nothing on that machine that could ever fill them in. A mode whose
+    /// consequence is invisible reads as a bug in whichever machine shows it.
     pub fn explanation(self) -> &'static str {
         match self {
-            Self::Full => "Every photo stored on both machines.",
-            Self::Partial => "This device's photos are pushed; the rest stay remote.",
-            Self::Relay => "No originals stored here; loaded on demand.",
+            Self::Full => {
+                "Every photo is copied both ways. Both machines hold every original."
+            }
+            Self::Partial => {
+                "This device's photos are copied to the master.                  The master's own stay remote here, loaded on demand."
+            }
+            Self::Relay => {
+                "No photos are copied, either way. This device's photos stay only here,                  and the master lists them as tiles it cannot open."
+            }
         }
+    }
+
+    /// Whether this mode moves any photo files at all.
+    ///
+    /// `false` for [`Relay`](Self::Relay), which is what makes a servant's
+    /// pending uploads a permanent backlog rather than a queue — worth
+    /// flagging rather than counting down.
+    pub fn moves_originals(self) -> bool {
+        !matches!(self, Self::Relay)
     }
 
     /// Next mode in the cycle, for a click-to-change control.
