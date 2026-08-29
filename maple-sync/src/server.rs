@@ -348,9 +348,9 @@ fn handle(ctx: &Ctx, mut request: tiny_http::Request) {
             })
         }
         ("POST", p) if p.starts_with(route::BLOB_ORIG) => {
-            let (p, raw) = (p.to_owned(), wants_raw(&url));
+            let (p, raw, ext) = (p.to_owned(), wants_raw(&url), raw_ext(&url));
             signed_stream(ctx, &mut request, &method, &url, move |ctx, _dev, request| {
-                blob_upload(ctx, request, &p, raw)
+                blob_upload(ctx, request, &p, raw, ext.as_deref())
             })
         }
         _ => Err(ErrorBody::new(
@@ -382,6 +382,18 @@ fn wants_raw(url: &str) -> bool {
     url.split_once('?')
         .map(|(_, query)| query.split('&').any(|p| p == "raw=1"))
         .unwrap_or(false)
+}
+
+/// The `ext=` parameter on a companion upload: what to file the raw as.
+///
+/// Sanitised by [`route::sanitise_ext`] rather than trusted — it becomes part
+/// of a filename on this disk, and the sender is a peer.
+fn raw_ext(url: &str) -> Option<String> {
+    url.split_once('?')?
+        .1
+        .split('&')
+        .find_map(|p| p.strip_prefix("ext="))
+        .and_then(route::sanitise_ext)
 }
 
 /// Read the body, verify the signature over it, then run `f`.
@@ -689,6 +701,7 @@ fn blob_upload(
     request: &mut tiny_http::Request,
     path: &str,
     raw: bool,
+    ext: Option<&str>,
 ) -> Result<Payload, ErrorBody> {
     let hash = match blob_hash(path, route::BLOB_ORIG) {
         Ok(hash) => hash,
@@ -710,10 +723,48 @@ fn blob_upload(
         ));
     };
     if raw && row.raw_filename.is_none() {
-        return Err(reject_streamed(
-            request,
-            ErrorBody::new(ErrorCode::BadRequest, "that photo has no companion here"),
-        ));
+        // This row has never heard of a companion, and the sender is holding
+        // one. Believe it: `origin_raw_path` only arrived with P7, so a row
+        // replicated by an earlier build is NULL and *nothing will ever fix
+        // it* — `update_row` carries the origin's value, but only when
+        // something else re-stamps the row, and a photograph nobody edits
+        // again is never re-stamped. Refusing here meant the negative could
+        // not cross on any pass, ever, and the servant re-offered it once
+        // every pass forever.
+        //
+        // This does relax "only a row that is already waiting can be filled
+        // in" (see `crate::transfer`) by one notch: a paired peer can now
+        // attach a companion to a photo whose row did not declare one. The
+        // blast radius is unchanged — `row_wanting` still gates it to a row
+        // this library already replicated and is missing bytes for, and a
+        // companion's bytes were *already* unverifiable and taken on the
+        // pairing's word. An `images.raw_hash` column is what would close
+        // both, and that is a schema change.
+        let Some(ext) = ext else {
+            return Err(reject_streamed(
+                request,
+                ErrorBody::new(
+                    ErrorCode::BadRequest,
+                    "a companion for a photo with none recorded must name its extension",
+                ),
+            ));
+        };
+        let noted = {
+            let db = lock(&ctx.db);
+            db.note_remote_companion(row.id, ext).map_err(internal)?
+        };
+        if !noted {
+            // Lost a race with another servant filling the same row in.
+            // Its companion is as good as this one.
+            return Err(reject_streamed(
+                request,
+                ErrorBody::new(ErrorCode::NotFound, "that photo is no longer waiting"),
+            ));
+        }
+        tracing::info!(
+            "sync server: {} has a companion after all, filing it as .{ext}",
+            row.filename
+        );
     }
 
     let staged = ctx.layout.staged_path(&hash, raw);

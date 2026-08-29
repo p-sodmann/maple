@@ -2304,6 +2304,102 @@ fn a_companion_found_after_the_photo_replicated_still_crosses() {
     );
 }
 
+/// A companion crosses to a master whose row never heard of one.
+///
+/// The state a real pair of installations is in: `origin_raw_path` arrived
+/// with P7, so every row the master replicated on an earlier build has
+/// `raw_path` NULL. `update_row` carries the origin's value now, but only
+/// when something *else* re-stamps the row — and a photograph nobody edits
+/// again is never re-stamped. So the master refused the negative on every
+/// pass, forever, one `bad_request: that photo has no companion here` per
+/// pass, and the RAF simply never crossed.
+///
+/// The sender is the authority: it is holding the file and offering it. Only
+/// the extension is taken from it, because the receiver files a companion
+/// beside its display file under that file's stem.
+#[test]
+fn a_companion_crosses_even_when_the_masters_row_never_heard_of_one() {
+    let clock = TestClock::new();
+    let master = Master::start(&clock, seeded(126));
+    let servant = Install::new("Laptop");
+    let client = client(&master, &servant, &clock, seeded(127));
+    let outcome = pair(&master, &servant, &client, &clock, "482107", "314159").unwrap();
+
+    let jpeg = b"the embedded preview";
+    let negative = b"the raw negative";
+    let display = servant.library_dir().join("DSCF6170.JPG");
+    let raw = servant.library_dir().join("DSCF6170.RAF");
+    std::fs::write(&display, jpeg).unwrap();
+    std::fs::write(&raw, negative).unwrap();
+    let hash = maple_import::content_hash(&display).unwrap();
+
+    // Build the row the field arrives at, by the cheapest route rather than
+    // the historical one: replicate the photo while the servant still knows
+    // of no companion, then record one *without* a stamp — which is what
+    // `set_raw_path` does, and therefore something no later metadata pass
+    // will ever carry. A real library gets here by upgrading: its master's
+    // rows predate `origin_raw_path` entirely.
+    servant.db().insert_image(&display, &hash, jpeg.len() as u64).unwrap();
+    sync_metadata(&master, &servant, &client, &outcome.key);
+    let image_id = servant.db().image_id_for_path(&display).unwrap().unwrap();
+    servant.db().set_raw_path(image_id, &raw).unwrap();
+
+    sync_metadata(&master, &servant, &client, &outcome.key);
+    assert_eq!(
+        master.install.db().originals_to_fetch(10).unwrap()[0].raw_filename,
+        None,
+        "the state this test exists for: the master cannot learn it by metadata"
+    );
+
+    let moved = move_files(&servant, &client, &outcome.key, PeerMode::Partial);
+    assert_eq!(moved.uploaded, 1);
+    assert_eq!(
+        photos_in(&master.install.library_dir()),
+        vec!["DSCF6170.JPG", "DSCF6170.RAF"],
+        "the negative crossed anyway"
+    );
+    assert_eq!(
+        std::fs::read(master.install.library_dir().join("DSCF6170.RAF")).unwrap(),
+        negative
+    );
+    let raw_path = master
+        .install
+        .db()
+        .blob_path(&hash, true)
+        .unwrap()
+        .expect("and the row points at it");
+    assert!(raw_path.starts_with(master.install.library_dir()), "{raw_path:?}");
+}
+
+/// A companion for a photo this library is not waiting for is still refused,
+/// and so is one whose extension would escape the library directory.
+#[test]
+fn learning_about_a_companion_cannot_be_used_to_place_a_file_anywhere() {
+    let clock = TestClock::new();
+    let master = Master::start(&clock, seeded(128));
+    let servant = Install::new("Laptop");
+    let client = client(&master, &servant, &clock, seeded(129));
+    let outcome = pair(&master, &servant, &client, &clock, "482107", "314159").unwrap();
+
+    // Nothing here is waiting for this hash, companion or not. `row_wanting`
+    // is the gate that did not move.
+    let failure = client
+        .upload_orig(&outcome.key, &[0x42u8; 32], true, Some("raf"), &mut &b"bytes"[..])
+        .expect_err("no row wants it");
+    assert_eq!(failure.code, Some(ErrorCode::NotFound));
+
+    // And an extension that is really a path is not an extension.
+    let too_long = "a".repeat(9);
+    for hostile in ["../../etc", "r/f", "raf.", "", &too_long] {
+        assert_eq!(
+            maple_sync::protocol::route::sanitise_ext(hostile),
+            None,
+            "{hostile:?} must not become part of a filename"
+        );
+    }
+    assert_eq!(maple_sync::protocol::route::sanitise_ext(".RAF").as_deref(), Some("RAF"));
+}
+
 /// A rejected upload comes back as its error code, not as a dead connection.
 ///
 /// The existing refusal tests all send a handful of bytes, which fit in the
@@ -2332,7 +2428,7 @@ fn a_refused_upload_is_answered_rather_than_hung_up_on() {
     assert!(master.install.db().row_wanting(&hash).unwrap().is_none());
 
     let failure = client
-        .upload_orig(&outcome.key, &hash, false, &mut &bytes[..])
+        .upload_orig(&outcome.key, &hash, false, None, &mut &bytes[..])
         .expect_err("the master wants nothing with that hash");
     assert_eq!(
         failure.code,
@@ -2371,7 +2467,7 @@ fn bytes_that_do_not_hash_to_what_they_were_sent_as_are_refused() {
     assert!(master.install.db().row_wanting(&hash).unwrap().is_some());
 
     let failure = client
-        .upload_orig(&outcome.key, &hash, false, &mut &b"something else entirely"[..])
+        .upload_orig(&outcome.key, &hash, false, None, &mut &b"something else entirely"[..])
         .expect_err("the master must not take these");
     assert_eq!(failure.code, Some(ErrorCode::BadRequest));
     assert_eq!(
@@ -2406,7 +2502,7 @@ fn a_master_will_not_take_a_blob_nothing_here_is_waiting_for() {
     let contents = b"a photo the master has never heard of";
     let hash: [u8; 32] = blake3::hash(contents).into();
     let failure = client
-        .upload_orig(&outcome.key, &hash, false, &mut &contents[..])
+        .upload_orig(&outcome.key, &hash, false, None, &mut &contents[..])
         .expect_err("unsolicited");
     assert_eq!(failure.code, Some(ErrorCode::NotFound));
     assert!(photos_in(&master.install.library_dir()).is_empty());
@@ -2421,7 +2517,7 @@ fn an_unpaired_machine_cannot_upload_anything() {
     let stranger = maple_sync::PeerKey::from_bytes([9u8; 32]);
 
     let failure = client
-        .upload_orig(&stranger, &[0x11u8; 32], false, &mut &b"bytes"[..])
+        .upload_orig(&stranger, &[0x11u8; 32], false, None, &mut &b"bytes"[..])
         .expect_err("no key for this device");
     assert_eq!(failure.code, Some(ErrorCode::Unauthorized));
     assert!(photos_in(&master.install.library_dir()).is_empty());

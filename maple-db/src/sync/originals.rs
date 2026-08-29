@@ -172,6 +172,58 @@ impl Database {
             .optional()?)
     }
 
+    /// Record that a photo this device is waiting for has a companion raw,
+    /// when its own row never heard of one.
+    ///
+    /// The gap this closes: `origin_raw_path` arrived with P7, so a row
+    /// replicated by an earlier build has `raw_path` NULL — and nothing will
+    /// ever fix it on its own. `update_row` carries the origin's value now,
+    /// but only when something *else* re-stamps the row, and a photograph
+    /// nobody edits again is never re-stamped. So the row stays NULL, the
+    /// upload route refuses every `?raw=1` for it, and the negative can never
+    /// cross. Permanently, and once per sync pass forever.
+    ///
+    /// The sender is the authority here — it is holding the file and offering
+    /// it — so an upload is itself the news that a companion exists. Only the
+    /// extension is taken from it: the file is filed beside its display file
+    /// under the display file's stem
+    /// (`maple_import::place_pair`), so this records the name it *will* have
+    /// locally rather than pretending to know the origin's path.
+    ///
+    /// Narrow on purpose. `locality = 'remote'` and `raw_path IS NULL` mean
+    /// this can only ever fill in a blank on a row already waiting for its
+    /// bytes: it cannot repoint a companion this device holds, and it cannot
+    /// touch a local photo. Not stamped — the origin already knows, and where
+    /// this device keeps its copy is its own business.
+    pub fn note_remote_companion(&self, id: i64, ext: &str) -> anyhow::Result<bool> {
+        // Read-then-write rather than one clever `UPDATE`: the stem is a
+        // string operation SQLite expresses only as a nest of `rtrim`/
+        // `replace` that nobody can review, and the predicate below is the
+        // part that has to be right.
+        let filename: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT filename FROM images
+                 WHERE id = ?1 AND locality = 'remote' AND raw_path IS NULL",
+                params![id],
+                |r| r.get(0),
+            )
+            .optional()?;
+        let Some(filename) = filename else {
+            return Ok(false);
+        };
+        let stem = Path::new(&filename)
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or(&filename);
+        let changed = self.conn.execute(
+            "UPDATE images SET raw_path = ?2
+             WHERE id = ?1 AND locality = 'remote' AND raw_path IS NULL",
+            params![id, format!("{stem}.{ext}")],
+        )?;
+        Ok(changed > 0)
+    }
+
     /// Record that this device now holds the file for `id`, at `path`.
     ///
     /// Every path column is rewritten together, because after this call they

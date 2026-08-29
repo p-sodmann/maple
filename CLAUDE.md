@@ -215,7 +215,19 @@ single binary; the backend is fixed at compile time.
     `images.raw_hash` column would close that.
   - **Only a row that is already waiting can be filled in.** `Database::row_wanting`
     gates every upload, so a paired peer can complete a photo this library already
-    replicated the metadata of and cannot invent, replace or misplace one.
+    replicated the metadata of and cannot invent, replace or misplace one. The
+    companion's *existence* is the one thing that gate no longer requires the row to
+    already know (`Database::note_remote_companion`): `origin_raw_path` arrived with
+    P7, so a row replicated by an earlier build has `raw_path` NULL — and nothing
+    fixes it, because `update_row` carries the origin's value only when something
+    *else* re-stamps the row and a photograph nobody edits again is never re-stamped.
+    Refusing meant `bad_request: that photo has no companion here` once per pass,
+    forever, and a negative that could not cross on any pass. The sender is the
+    authority (it is holding the file and offering it), so an upload is itself the
+    news; only the **extension** is taken from it, carried as `?raw=1&ext=RAF` and
+    validated by `route::sanitise_ext` because it becomes part of a filename here.
+    `row_wanting` still gates the row, and companion bytes were *already* unverifiable
+    and taken on the pairing's word — an `images.raw_hash` column is what closes both.
   - **Rename and adopt happen under one database lock.** The 60-second scanner inserts
     any file no row claims and `images.path` is UNIQUE, so a scan landing between the
     two would take the path and leave `adopt_original` failing on the constraint. Bytes

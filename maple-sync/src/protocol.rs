@@ -100,6 +100,46 @@ pub mod route {
         out
     }
 
+    /// The upload URL for a **companion raw**, naming the extension it should
+    /// be filed under.
+    ///
+    /// The receiver files a companion beside its display file under the
+    /// display file's stem (`maple_import::place_pair`), so the extension is
+    /// the *only* thing it needs from the sender's filename — and it is
+    /// something the receiver cannot otherwise know when its own row has
+    /// never heard of the companion. See `server::blob_upload`.
+    ///
+    /// Backwards compatible in both directions: the parameter sits in the
+    /// signed path, which both sides sign identically, and a master that does
+    /// not read it behaves exactly as it did before.
+    pub fn blob_upload_raw(hash: &[u8; 32], ext: &str) -> String {
+        let mut out = blob(BLOB_ORIG, hash, true);
+        if let Some(ext) = sanitise_ext(ext) {
+            out.push_str("&ext=");
+            out.push_str(&ext);
+        }
+        out
+    }
+
+    /// A file extension safe to put in a URL and to build a filename from.
+    ///
+    /// ASCII alphanumeric only, and short. It becomes part of a path on the
+    /// receiving machine, so anything else — a separator, a dot, a percent
+    /// escape — is refused rather than escaped: no real raw format needs one,
+    /// and the failure of getting it wrong is a peer choosing where a file
+    /// lands.
+    ///
+    /// Case is **preserved**. Normalising it would be safety theatre — the
+    /// alphanumeric test is what makes this safe — and it would file a
+    /// Fujifilm negative as `DSCF6170.raf` beside its own `DSCF6170.JPG`,
+    /// where the path that already knew the companion's name keeps `.RAF`.
+    /// Two spellings of one rule is how they drift.
+    pub fn sanitise_ext(ext: &str) -> Option<String> {
+        let ext = ext.trim().trim_start_matches('.');
+        (!ext.is_empty() && ext.len() <= 8 && ext.chars().all(|c| c.is_ascii_alphanumeric()))
+            .then(|| ext.to_owned())
+    }
+
     /// A hash as it appears in a URL or a `wanted` list.
     pub fn hex(hash: &[u8; 32]) -> String {
         let mut out = String::with_capacity(64);

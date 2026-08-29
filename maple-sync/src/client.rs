@@ -295,14 +295,21 @@ impl SyncClient {
     /// The exception is `raw = true`: the schema hashes the display file, not
     /// its companion, so there is nothing to check a raw upload against. See
     /// [`crate::transfer`].
+    /// `ext` is the companion's file extension, and is read only when `raw`
+    /// is set. It is what lets a master file a negative for a photo its own
+    /// row never heard of one for — see `server::blob_upload`.
     pub fn upload_orig(
         &self,
         key: &PeerKey,
         hash: &[u8; 32],
         raw: bool,
+        ext: Option<&str>,
         body: &mut dyn std::io::Read,
     ) -> Result<UploadResponse, SyncFailure> {
-        let path = route::blob(route::BLOB_ORIG, hash, raw);
+        let path = match (raw, ext) {
+            (true, Some(ext)) => route::blob_upload_raw(hash, ext),
+            _ => route::blob(route::BLOB_ORIG, hash, raw),
+        };
         let credential = SignedRequest::sign_with(
             key,
             self.device_id.clone(),

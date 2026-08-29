@@ -435,7 +435,14 @@ fn send_file(
             return Ok(Err(format!("could not open {}: {e}", path.display())));
         }
     };
-    match client.upload_orig(key, hash, raw, &mut file) {
+    // The companion's extension travels with it: the master files a raw
+    // beside its display file under that file's stem, so the extension is the
+    // only part of this name it needs — and the only way it can learn one for
+    // a photo whose row predates `origin_raw_path`.
+    let ext = raw
+        .then(|| path.extension().and_then(|e| e.to_str()))
+        .flatten();
+    match client.upload_orig(key, hash, raw, ext, &mut file) {
         Ok(response) => Ok(Ok(response)),
         Err(failure)
             if matches!(
