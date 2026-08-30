@@ -149,7 +149,7 @@ impl DetectionModel for ScrfdDetector {
             let likely: Vec<usize> = scores
                 .iter()
                 .enumerate()
-                .filter(|(_, &s)| s >= SCORE_THRESH)
+                .filter(|&(_, &s)| s >= SCORE_THRESH)
                 .map(|(i, _)| i)
                 .collect();
 
@@ -225,7 +225,7 @@ impl DetectionModel for ScrfdDetector {
             };
 
             // ── Debug: save the 112×112 RGB crop as PNG ────────────────────
-            if let (Some(ref dir), Some(ref crop_img)) = (&self.debug_dir, &resized_crop) {
+            if let (Some(dir), Some(crop_img)) = (&self.debug_dir, &resized_crop) {
                 if let Err(e) = std::fs::create_dir_all(dir) {
                     warn!(dir = %dir.display(), "could not create aligned_faces dir: {e}");
                 } else {
@@ -239,7 +239,7 @@ impl DetectionModel for ScrfdDetector {
             }
 
             // ── Optional ArcFace embedding ─────────────────────────────────
-            let embedding = if let (Some(ref mut embedder), Some(ref crop_img)) =
+            let embedding = if let (Some(embedder), Some(crop_img)) =
                 (&mut self.embedder, &resized_crop)
             {
                 // Build [112, 112, 3] BGR f32 array for the embedder.

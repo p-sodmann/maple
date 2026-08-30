@@ -268,8 +268,8 @@ impl LibraryGrid {
     /// Clears the grid immediately, cancels any in-progress previous load,
     /// resets paging to page 0, and fetches the first page.
     pub fn load(&self, query: SearchQuery) {
-        let gen = self.generation.get() + 1;
-        self.generation.set(gen);
+        let gen_id = self.generation.get() + 1;
+        self.generation.set(gen_id);
 
         // Drop the previous poller (stops it) and clear the grid. A fresh
         // load starts with no pre-selection intent — callers that want it
@@ -335,8 +335,8 @@ impl LibraryGrid {
         // `append_page` would refuse it and stop paging. Orphaning it costs
         // one re-fetch — `want` is untouched, so `fetch_next_page` at the end
         // of `apply_refresh` asks for it again.
-        let gen = self.generation.get() + 1;
-        self.generation.set(gen);
+        let gen_id = self.generation.get() + 1;
+        self.generation.set(gen_id);
         *self.timer.borrow_mut() = None;
         self.polling.set(false);
         self.active_pages.set(0);
@@ -357,7 +357,7 @@ impl LibraryGrid {
             let _ = tx.send(GridMsg::PageDone);
         });
 
-        self.start_poller(gen);
+        self.start_poller(gen_id);
     }
 
     /// Reconcile freshly-read rows against what is on screen.
@@ -455,7 +455,7 @@ impl LibraryGrid {
         let Some(tx) = self.tx.borrow().clone() else {
             return;
         };
-        let gen = self.generation.get();
+        let gen_id = self.generation.get();
         let cache = self.cache.clone();
         let quality = self.quality;
         let thumb_px = self.thumb_px.get();
@@ -465,7 +465,7 @@ impl LibraryGrid {
             decode_thumbs(&tx, &work, thumb_px, quality, &cache);
             let _ = tx.send(GridMsg::PageDone);
         });
-        self.start_poller(gen);
+        self.start_poller(gen_id);
     }
 
     /// Ask the grid to have at least `rows` items loaded.
@@ -492,7 +492,7 @@ impl LibraryGrid {
             return;
         };
 
-        let gen = self.generation.get();
+        let gen_id = self.generation.get();
         let query = self.query.borrow().clone().with_limit(PAGE_SIZE).with_offset(offset);
         let db = self.db.clone();
         let cache = self.cache.clone();
@@ -526,13 +526,13 @@ impl LibraryGrid {
             let _ = tx.send(GridMsg::PageDone);
         });
 
-        self.start_poller(gen);
+        self.start_poller(gen_id);
     }
 
-    /// Start the UI-thread poller for generation `gen`, unless one is
+    /// Start the UI-thread poller for generation `gen_id`, unless one is
     /// already running. It stops itself once every page worker has finished,
     /// and is restarted by the next `fetch_next_page()`.
-    fn start_poller(&self, gen: u64) {
+    fn start_poller(&self, gen_id: u64) {
         if self.polling.get() {
             return;
         }
@@ -547,7 +547,7 @@ impl LibraryGrid {
             // this timer (which stops it) before starting the replacement,
             // so this is belt and braces; it deliberately does *not* stop
             // `slot`, which by now holds the *new* load's poller.
-            if grid.generation.get() != gen {
+            if grid.generation.get() != gen_id {
                 return;
             }
 

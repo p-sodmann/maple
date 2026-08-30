@@ -365,9 +365,10 @@ fn wire_face_overlay(window: &DetailWindow, nav: &NavState) {
             let Some(bbox) = normalise_draw_box(geometry(&w), vx0, vy0, vx1, vy1) else {
                 return;
             };
-            // Bind the insert's result to a `let` first: an `if let` scrutinee
-            // keeps its temporaries alive for the whole block (edition 2021),
-            // so the `borrow_mut()` guard would still be held when the body
+            // Bind the insert's result to a `let` first: an `if let`
+            // scrutinee's temporaries live to the end of the success block
+            // (edition 2024's rescoping only shortens them before `else`), so
+            // the `borrow_mut()` guard would still be held when the body
             // re-borrows `nav.faces` below — a BorrowError panic, and inside a
             // Slint callback that is a non-unwinding abort.
             let inserted = insert_new_face(iid, bbox, &mut nav.faces.borrow_mut(), &nav.db);
